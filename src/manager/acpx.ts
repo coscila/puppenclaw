@@ -3988,7 +3988,8 @@ export class AcpxSessionManager implements ISessionManager {
     warning?: string;
   } {
     const profile = reasoningProfileFor(session);
-    if (session.effort == null) {
+    const requested = session.effort ?? (profile === "qwen-3.8" ? "medium" : undefined);
+    if (requested == null) {
       return {
         session: {
           ...session,
@@ -3996,25 +3997,25 @@ export class AcpxSessionManager implements ISessionManager {
         }
       };
     }
-    const resolution = resolveReasoningMode(session, session.effort);
+    const resolution = resolveReasoningMode(session, requested);
     if (resolution == null) {
-      if (profile === "claude" && session.effort === "ultracode") {
+      if (profile === "claude" && requested === "ultracode") {
         throw new PuppenclawError(
           "UNAVAILABLE_REASONING_MODE",
           "Claude Ultracode is exposed as a future workflow capability, but the current ACP boundary cannot safely execute its approval, progress, background-run, and multiplexing lifecycle.",
           {
             profile,
-            requested: session.effort,
+            requested,
             accepted: acceptedReasoningModes(profile)
           }
         );
       }
       throw new PuppenclawError(
         "UNSUPPORTED_REASONING_MODE",
-        `Reasoning mode "${session.effort}" is not supported by the ${profile} profile.`,
+        `Reasoning mode "${requested}" is not supported by the ${profile} profile.`,
         {
           profile,
-          requested: session.effort,
+          requested,
           accepted: acceptedReasoningModes(profile)
         }
       );
@@ -4022,6 +4023,7 @@ export class AcpxSessionManager implements ISessionManager {
     return {
       session: {
         ...session,
+        effort: requested,
         reasoningProfile: resolution.profile,
         effectiveEffort: resolution.effective,
         runtimeEffort: resolution.runtimeValue

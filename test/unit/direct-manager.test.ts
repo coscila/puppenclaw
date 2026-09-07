@@ -1700,6 +1700,71 @@ describe("AcpxSessionManager", () => {
     expect(disabledArgs).toContain('model_reasoning_effort="minimal"');
   });
 
+  it.each([undefined, "none", "low", "medium", "xhigh"] as const)(
+    "passes Local LLM effort %s to the native Codex runtime and preserves it on continuation",
+    async (effort) => {
+      const workspaceDir = await createTempDir("puppenclaw-local-llm-reasoning-");
+      const codexCommand = await resolveFakeCodexPermissionCommand(workspaceDir);
+      const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+      const manager = new AcpxSessionManager({
+        config: makeConfig({ agentCommands: { codex: codexCommand } }),
+        logger: {
+          info() {},
+          warn() {},
+          error() {},
+          debug() {}
+        },
+        store,
+        outputRouter
+      });
+      const expectedEffort = effort ?? "medium";
+      const started = await manager.start({
+        agent: "codex",
+        name: "local-llm-reasoning-demo",
+        directory: workspaceDir,
+        task: "Use the selected local model reasoning level.",
+        ...(effort != null ? { effort } : {}),
+        contextFiles: [],
+        modelProvider: {
+          id: "local-llm",
+          kind: "codex-openai-compatible",
+          model: "chat",
+          reasoningProfile: "qwen-3.8"
+        }
+      });
+      const startArgs = JSON.parse(
+        await readFile(join(workspaceDir, ".fake-codex-permission-args-0.json"), "utf8")
+      ) as string[];
+      const expectedSession = {
+        effort: expectedEffort,
+        effectiveEffort: expectedEffort,
+        runtimeEffort: expectedEffort,
+        reasoningProfile: "qwen-3.8"
+      };
+      expect(startArgs).toContain(`model_reasoning_effort="${expectedEffort}"`);
+      expect((started.details as { session: SessionInfo }).session).toMatchObject(expectedSession);
+      expect(JSON.parse(
+        await readFile(join(workspaceDir, ".fake-codex-permission-env-0.json"), "utf8")
+      )).toMatchObject({ modelProviderModel: "chat" });
+
+      const continued = await manager.send({
+        name: "local-llm-reasoning-demo",
+        message: "Continue with the same reasoning level.",
+        ultrathink: true,
+        contextFiles: []
+      });
+      const continuationArgs = JSON.parse(
+        await readFile(join(workspaceDir, ".fake-codex-permission-args-1.json"), "utf8")
+      ) as string[];
+      expect(continuationArgs).toContain(`model_reasoning_effort="${expectedEffort}"`);
+      expect((continued.details as { session: SessionInfo }).session).toMatchObject(expectedSession);
+      expect(await readFile(
+        join(workspaceDir, ".fake-codex-permission-prompt-1.txt"),
+        "utf8"
+      )).not.toContain("Use a high-effort reasoning pass for this reply.");
+    }
+  );
+
   it("preserves leading and whitespace-only assistant text chunks", async () => {
     const workspaceDir = await createTempDir("puppenclaw-whitespace-");
     const acpxCommand = await resolveWhitespaceFakeAcpxCommand(workspaceDir);

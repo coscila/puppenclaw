@@ -92,19 +92,29 @@ export const REASONING_CAPABILITIES = {
     },
     {
       id: "qwen-3.8",
-      label: "Qwen 3.8",
+      label: "Local LLM",
       modes: [
+        {
+          id: "none",
+          label: "Off",
+          kind: "thinking",
+          description: "Disable thinking."
+        },
         { id: "low", label: "Low", kind: "effort" },
-        { id: "medium", label: "Medium", kind: "effort" },
+        {
+          id: "medium",
+          label: "Medium",
+          kind: "effort",
+          description: "The local model's default reasoning tier."
+        },
         {
           id: "xhigh",
           label: "XHigh",
           kind: "effort",
-          description: "The Qwen 3.8 server's default and deepest reasoning tier."
+          description: "The local model's deepest reasoning tier."
         }
       ],
       aliases: [
-        { id: "none", effective: "low" },
         { id: "minimal", effective: "low" },
         { id: "high", effective: "xhigh" },
         { id: "max", effective: "xhigh" },
@@ -274,11 +284,13 @@ export function resolveReasoningMode(
 
   if (profile === "qwen-3.8") {
     const effective =
-      requested === "none" || requested === "minimal" || requested === "low"
-        ? "low"
-        : requested === "medium"
-          ? "medium"
-          : "xhigh";
+      requested === "none"
+        ? "none"
+        : requested === "minimal" || requested === "low"
+          ? "low"
+          : requested === "medium"
+            ? "medium"
+            : "xhigh";
     return {
       profile,
       requested,
@@ -286,7 +298,7 @@ export function resolveReasoningMode(
       runtimeValue: effective,
       ...(requested !== effective
         ? {
-            warning: `Qwen 3.8 reasoning mode "${requested}" maps to its effective "${effective}" tier.`
+            warning: `Local LLM reasoning mode "${requested}" maps to its effective "${effective}" tier.`
           }
         : {})
     };

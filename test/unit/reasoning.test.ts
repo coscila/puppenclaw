@@ -193,7 +193,7 @@ describe("reasoning profiles", () => {
   });
 
   it.each([
-    ["none", "low"],
+    ["none", "none"],
     ["minimal", "low"],
     ["low", "low"],
     ["medium", "medium"],
@@ -227,13 +227,13 @@ describe("reasoning profiles", () => {
     }
   });
 
-  it("advertises the three selectable Qwen 3.8 effort modes", () => {
+  it("advertises the four selectable Local LLM effort modes", () => {
     const qwen = REASONING_CAPABILITIES.profiles.find(
       (profile) => profile.id === "qwen-3.8"
     );
-    expect(qwen?.modes.map((mode) => mode.id)).toEqual(["low", "medium", "xhigh"]);
+    expect(qwen?.label).toBe("Local LLM");
+    expect(qwen?.modes.map((mode) => mode.id)).toEqual(["none", "low", "medium", "xhigh"]);
     expect(qwen?.aliases.map((alias) => alias.id)).toEqual([
-      "none",
       "minimal",
       "high",
       "max",
