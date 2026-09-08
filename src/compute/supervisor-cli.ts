@@ -91,6 +91,11 @@ async function main(): Promise<void> {
   const stdout = await open(stdoutPath, "a");
   const stderr = await open(stderrPath, "a");
   try {
+    if (terminalReason === "cancelled") {
+      const completedAt = new Date().toISOString();
+      await writeState({ state: "cancelled", completedAt, lastHeartbeatAt: completedAt });
+      return;
+    }
     const launch = computeSandboxLaunch(spec);
     child = spawn(launch.command, launch.args, {
       cwd: spec.cwd,
@@ -152,9 +157,11 @@ async function main(): Promise<void> {
       state:
         terminalReason === "cancelled"
           ? "cancelled"
-          : outcome.code === 0
-            ? "succeeded"
-            : "failed",
+          : terminalReason === "wall_time"
+            ? "failed"
+            : outcome.code === 0
+              ? "succeeded"
+              : "failed",
       exitCode: outcome.code,
       failureCode:
         terminalReason === "wall_time"
