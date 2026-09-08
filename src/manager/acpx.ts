@@ -5,6 +5,7 @@ import { basename, dirname, extname, join, resolve as resolvePath } from "node:p
 import { fileURLToPath } from "node:url";
 
 import { SessionStore } from "../shared/store.js";
+import { requiresFreshClaudeTranscript } from "../shared/model-compatibility.js";
 import { UsageLedgerStore } from "../shared/usage-ledger.js";
 import { hasNonzeroUsage, normalizeCodexUsage, normalizeUsage } from "../shared/usage.js";
 import { DEFAULT_MAX_SESSIONS } from "../shared/schema.js";
@@ -1718,6 +1719,7 @@ export class AcpxSessionManager implements ISessionManager {
             directory,
             ...((params.model ?? session.model) ? { model: params.model ?? session.model } : {}),
             ...(session.runtimeEffort != null ? { effort: session.runtimeEffort } : {}),
+            ...(session.agent === "claude" ? { ultracode: session.effort === "ultracode" } : {}),
             ...((params.modelProvider ?? session.modelProvider)
               ? { modelProvider: params.modelProvider ?? session.modelProvider }
               : {})
@@ -1925,6 +1927,7 @@ export class AcpxSessionManager implements ISessionManager {
             ...(effectiveSession.runtimeEffort != null
               ? { effort: effectiveSession.runtimeEffort }
               : {}),
+            ...(effectiveSession.agent === "claude" ? { ultracode: effectiveSession.effort === "ultracode" } : {}),
             ...(effectiveSession.modelProvider != null
               ? { modelProvider: effectiveSession.modelProvider }
               : {})
@@ -2272,6 +2275,7 @@ export class AcpxSessionManager implements ISessionManager {
                 tolerateModelRejection: true,
                 ...(session.model != null ? { model: session.model } : {}),
                 ...(session.runtimeEffort != null ? { effort: session.runtimeEffort } : {}),
+                ...(session.agent === "claude" ? { ultracode: session.effort === "ultracode" } : {}),
                 ...(session.modelProvider != null ? { modelProvider: session.modelProvider } : {})
               });
             }
@@ -3999,17 +4003,6 @@ export class AcpxSessionManager implements ISessionManager {
     }
     const resolution = resolveReasoningMode(session, requested);
     if (resolution == null) {
-      if (profile === "claude" && requested === "ultracode") {
-        throw new PuppenclawError(
-          "UNAVAILABLE_REASONING_MODE",
-          "Claude Ultracode is exposed as a future workflow capability, but the current ACP boundary cannot safely execute its approval, progress, background-run, and multiplexing lifecycle.",
-          {
-            profile,
-            requested,
-            accepted: acceptedReasoningModes(profile)
-          }
-        );
-      }
       throw new PuppenclawError(
         "UNSUPPORTED_REASONING_MODE",
         `Reasoning mode "${requested}" is not supported by the ${profile} profile.`,
@@ -4114,6 +4107,13 @@ export class AcpxSessionManager implements ISessionManager {
 
     if (supportsCodexRefresh && session.modelProvider == null) {
       await this.closeLegacyRuntimeForProviderRefresh(session);
+    }
+
+    if (supportsClaudeRefresh && requiresFreshClaudeTranscript(session.modelProvider?.model ?? session.model, requestedProvider.model)) {
+      throw new PuppenclawError(
+        "MODEL_TRANSCRIPT_INCOMPATIBLE",
+        "This model change requires a fresh runner session rehydrated from visible conversation only; native Fable thinking cannot be resumed by another generation."
+      );
     }
 
     return {
@@ -4270,6 +4270,7 @@ export class AcpxSessionManager implements ISessionManager {
     directory: string;
     model?: string;
     effort?: EffortLevel;
+    ultracode?: boolean;
     modelProvider?: ModelProviderConfig;
     /** Re-send config options even when they match the last applied values. */
     forceApply?: boolean;
@@ -4358,6 +4359,28 @@ export class AcpxSessionManager implements ISessionManager {
       this.rememberAppliedRuntimeConfig(params.name, {
         model: modelApplied ? requestedModel : null
       });
+    }
+    // A successful versioned config request is the capability handshake. Never
+    // send a workflow prompt to an adapter that only understands effort levels.
+    if (params.agent === "claude" && (params.ultracode === true || params.model?.startsWith("claude-fable-"))) {
+      try {
+        await this.runControlCommand({
+          args: this.buildVerbArgs(params.agent, params.directory, [
+            "set", "ocsl_workflow_v1", params.ultracode ? "ultracode" : "off", "--session", params.name
+          ]),
+          cwd: params.directory,
+          ...(runtimeEnv != null ? { env: runtimeEnv } : {})
+        });
+      } catch (error) {
+        if (createdRuntime) {
+          await this.runControlCommand({
+            args: this.buildVerbArgs(params.agent, params.directory, ["sessions", "close", params.name]),
+            cwd: params.directory,
+            ...(runtimeEnv != null ? { env: runtimeEnv } : {})
+          }).catch(() => undefined);
+        }
+        throw new PuppenclawError("UNAVAILABLE_REASONING_MODE", "The selected Claude runtime does not support the required native workflow protocol.", { cause: ensureError(error).message });
+      }
     }
     if (params.effort != null && params.effort !== appliedRuntimeConfig?.effort) {
       const effortConfigId = params.agent === "claude" ? "effort" : "reasoning_effort";

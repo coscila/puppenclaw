@@ -1555,10 +1555,12 @@ describe("AcpxSessionManager", () => {
     expect(await readFile(settingPath("claude-reasoning-fork"), "utf8")).toBe("xhigh\n");
   });
 
-  it("rejects Claude Ultracode before creating an ACP runtime", async () => {
+  it("rejects Claude Ultracode before dispatch when the adapter lacks workflow support", async () => {
     const workspaceDir = await createTempDir("puppenclaw-claude-ultracode-");
     const acpxCommand = await resolveFakeAcpxCommand();
     const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    await mkdir(join(workspaceDir, ".fake-acpx-state"), { recursive: true });
+    await writeFile(join(workspaceDir, ".fake-acpx-state", "reject-workflow-set"), "1");
     const manager = new AcpxSessionManager({
       config: makeConfig({ acpxCommand }),
       logger: {
@@ -1589,6 +1591,29 @@ describe("AcpxSessionManager", () => {
         "utf8"
       )
     ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("keeps native Ultracode across resume and fork and clears it for standard/max", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-fable-workflow-");
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const manager = new AcpxSessionManager({ config: makeConfig({ acpxCommand: await resolveFakeAcpxCommand() }), logger: { info() {}, warn() {}, error() {}, debug() {} }, store, outputRouter });
+    const provider = { id: "fable", kind: "claude-code" as const, model: "claude-fable-5-1" };
+    await manager.start({ agent: "claude", name: "workflow", directory: workspaceDir, task: "Begin", effort: "ultracode", model: provider.model, modelProviderId: provider.id, modelProvider: provider, contextFiles: [] });
+    const setting = (name: string, key: string) => readFile(join(workspaceDir, ".fake-acpx-state", `${name}.${key}.setting`), "utf8");
+    expect(await setting("workflow", "ocsl_workflow_v1")).toBe("ultracode\n");
+    expect(await setting("workflow", "effort")).toBe("xhigh\n");
+    await manager.resume({ name: "workflow" });
+    expect(await setting("workflow", "ocsl_workflow_v1")).toBe("ultracode\n");
+    await manager.fork({ source: "workflow", target: "workflow-fork" });
+    expect(await setting("workflow-fork", "ocsl_workflow_v1")).toBe("ultracode\n");
+    for (const effort of ["max", "high", "ultracode"] as const) {
+      await manager.send({ name: "workflow", message: "Continue", effort, contextFiles: [] });
+      expect(await setting("workflow", "ocsl_workflow_v1")).toBe(effort === "ultracode" ? "ultracode\n" : "off\n");
+      expect(await setting("workflow", "effort")).toBe(`${effort === "ultracode" ? "xhigh" : effort}\n`);
+    }
+    await expect(manager.send({ name: "workflow", message: "Use Opus", modelProviderId: "fable", modelProvider: { ...provider, model: "claude-opus-5" }, contextFiles: [] })).rejects.toMatchObject({ code: "MODEL_TRANSCRIPT_INCOMPATIBLE" });
+    expect(store.getSession("workflow")?.model).toBe("claude-fable-5-1");
+    expect(await setting("workflow", "model")).toBe("claude-fable-5-1\n");
   });
 
   it("uses Codex's native reasoning_effort ACP setting", async () => {

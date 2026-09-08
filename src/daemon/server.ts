@@ -293,6 +293,7 @@ export async function createDaemonServer(params: {
       ownerLease: true
     },
     reasoning: REASONING_CAPABILITIES,
+    claudeWorkflows: { version: 1, runtimeVerified: true, configId: "ocsl_workflow_v1" },
     maxSessions: {
       min: 1,
       max: 100,

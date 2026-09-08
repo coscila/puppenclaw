@@ -87,16 +87,16 @@ describe("reasoning profiles", () => {
     });
   });
 
-  it("exposes Claude Ultracode as an unavailable workflow capability", () => {
-    expect(resolveReasoningMode({ agent: "claude" }, "ultracode")).toBeNull();
+  it("exposes Claude Ultracode as a runtime-verified workflow capability", () => {
+    expect(resolveReasoningMode({ agent: "claude" }, "ultracode")).toMatchObject({ effective: "xhigh", runtimeValue: "xhigh", requested: "ultracode" });
     const claude = REASONING_CAPABILITIES.profiles.find(
       (profile) => profile.id === "claude"
     );
     expect(claude?.modes.find((mode) => mode.id === "ultracode")).toMatchObject({
       kind: "workflow",
-      selectable: false,
-      availability: "blocked-by-acp",
-      defaultAdapterSupport: "unavailable"
+      selectable: true,
+      availability: "requires-workflow-adapter-v1",
+      defaultAdapterSupport: "runtime-verified"
     });
   });
 
@@ -109,7 +109,7 @@ describe("reasoning profiles", () => {
   );
 
   it.each([
-    ["claude", ["low", "medium", "high", "xhigh", "max", "ultra"]],
+    ["claude", ["low", "medium", "high", "xhigh", "max", "ultra", "ultracode"]],
     ["codex", ["low", "medium", "high", "xhigh", "max", "ultra"]],
     [
       "glm-5.2",

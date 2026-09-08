@@ -295,7 +295,7 @@ value against the selected provider rather than assuming that every backend uses
 
 | Provider profile | Canonical controls                               | Compatibility behavior                                                                                                            |
 | ---------------- | ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
-| Claude Code      | `low`, `medium`, `high`, `xhigh`, `max`          | Legacy `ultra` maps to `max`. `ultracode` is exposed separately as an unavailable workflow capability; it is not an effort alias. |
+| Claude Code      | `low`, `medium`, `high`, `xhigh`, `max`          | Legacy `ultra` maps to `max`. `ultracode` requires a native workflow adapter exposing `ocsl_workflow_v1`; it uses xhigh plus real workflow orchestration, never a max alias. |
 | Codex            | `low`, `medium`, `high`, `xhigh`, `max`, `ultra` | The selected tier is forwarded to the runtime.                                                                                    |
 | GLM-5.2          | `none` (shown as Off), `high`, `max`             | `minimal` maps to Off; `low` and `medium` map to High; `xhigh`, `ultra`, and `ultracode` map to Max.                              |
 

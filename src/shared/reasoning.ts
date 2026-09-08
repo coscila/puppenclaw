@@ -37,7 +37,8 @@ const CLAUDE_MODES = new Set<ReasoningMode>([
   "high",
   "xhigh",
   "max",
-  "ultra"
+  "ultra",
+  "ultracode"
 ]);
 const CODEX_MODES = new Set<ReasoningMode>([
   "low",
@@ -68,11 +69,11 @@ export const REASONING_CAPABILITIES = {
           id: "ultracode",
           label: "Ultracode",
           kind: "workflow",
-          selectable: false,
-          availability: "blocked-by-acp",
-          defaultAdapterSupport: "unavailable",
+          selectable: true,
+          availability: "requires-workflow-adapter-v1",
+          defaultAdapterSupport: "runtime-verified",
           description:
-            "Claude Code xhigh reasoning with automatic dynamic-workflow orchestration. It is exposed for capability discovery but cannot be selected until ACP supports its approval, progress, background-run, and multiplexing lifecycle."
+            "Claude Code xhigh reasoning with native dynamic-workflow orchestration. Requires the versioned workflow adapter; unsupported runtimes fail before a prompt is dispatched."
         }
       ],
       aliases: [{ id: "ultra", effective: "max", deprecated: true }]
@@ -250,6 +251,10 @@ export function resolveReasoningMode(
   const accepted = modesForProfile(profile);
   if (!accepted.has(requested)) {
     return null;
+  }
+
+  if (profile === "claude" && requested === "ultracode") {
+    return { profile, requested, effective: "xhigh", runtimeValue: "xhigh" };
   }
 
   if (profile === "claude" && requested === "ultra") {

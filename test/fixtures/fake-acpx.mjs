@@ -240,6 +240,10 @@ if (
     emitError("SIM_MODEL_REJECT", `Simulated model rejection: unknown model ${value}`);
     process.exit(1);
   }
+  if (key === "ocsl_workflow_v1" && existsSync(join(stateDir, "reject-workflow-set"))) {
+    emitError("SIM_WORKFLOW_REJECT", "unknown config option ocsl_workflow_v1");
+    process.exit(1);
+  }
   writeFileSync(settingFile(name, key), `${value}\n`, "utf8");
   emitJson(
     `{"status":"set","session":"${jsonEscape(name)}","key":"${jsonEscape(
