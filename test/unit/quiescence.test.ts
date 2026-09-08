@@ -904,7 +904,7 @@ describe("session quiescence", () => {
     await manager.purge({ name: "retry-close" });
     await manager.releaseQuiescence({ name: "retry-close", epoch: 1 });
     expect(store.getActiveQuiescenceEpoch("retry-close")).toBeNull();
-  });
+  }, 10000);
 
   it("exposes authenticated daemon proofs and exact typed lifecycle errors", async () => {
     const workspaceDir = await createTempDir("puppenclaw-quiescence-http-");

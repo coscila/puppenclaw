@@ -425,5 +425,5 @@ describe("account-scoped daemon cleanup", () => {
     } finally {
       await app.close();
     }
-  });
+  }, 10000);
 });

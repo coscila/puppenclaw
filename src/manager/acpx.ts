@@ -310,6 +310,10 @@ const RECONNECT_HISTORY_POLL_MS = 750;
 const MAX_ACTIVE_TURN_OUTPUT_CHARS = 120_000;
 const MAX_CODEX_EVENT_TEXT_CHARS = 6_000;
 const QUIESCENCE_CONTROL_TIMEOUT_MS = 1_000;
+// Cold sandbox/Node startup can exceed one second. Allow each close protocol
+// command to start, while keeping the entire runtime closure bounded.
+const QUIESCENCE_RUNTIME_COMMAND_TIMEOUT_MS = 5_000;
+const QUIESCENCE_RUNTIME_TIMEOUT_MS = 15_000;
 const QUIESCENCE_DRAIN_TIMEOUT_MS = 4_000;
 const QUIESCENCE_POLL_MS = 25;
 const ACTIVE_TURN_CHECKPOINT_MS = 5_000;
@@ -3454,6 +3458,9 @@ export class AcpxSessionManager implements ISessionManager {
     options: { locallyTrackedTurn?: boolean } = {}
   ): Promise<void> {
     const oneShotRuntime = this.usesOneShotRuntime(session);
+    const closureDeadline = Date.now() + QUIESCENCE_RUNTIME_TIMEOUT_MS;
+    const controlTimeout = () =>
+      Math.max(1, Math.min(QUIESCENCE_RUNTIME_COMMAND_TIMEOUT_MS, closureDeadline - Date.now()));
     const locallyTrackedTurn =
       options.locallyTrackedTurn ??
       (this.activeTurns.has(session.name) || this.activeTurnProcesses.has(session.name));
@@ -3467,7 +3474,7 @@ export class AcpxSessionManager implements ISessionManager {
         session.name
       ]),
       cwd: session.directory,
-      timeoutMs: QUIESCENCE_CONTROL_TIMEOUT_MS,
+      timeoutMs: controlTimeout(),
       ...(runtimeEnv != null ? { env: runtimeEnv } : {})
     }).catch((error) => {
       this.deps.logger.debug(
@@ -3504,7 +3511,7 @@ export class AcpxSessionManager implements ISessionManager {
       ]),
       cwd: session.directory,
       allowNoSession: true,
-      timeoutMs: QUIESCENCE_CONTROL_TIMEOUT_MS,
+      timeoutMs: controlTimeout(),
       ...(runtimeEnv != null ? { env: runtimeEnv } : {})
     }).catch((error) => {
       this.deps.logger.debug(
@@ -3512,13 +3519,16 @@ export class AcpxSessionManager implements ISessionManager {
       );
     });
 
-    const deadline = Date.now() + QUIESCENCE_CONTROL_TIMEOUT_MS;
+    const deadline = Math.min(
+      closureDeadline,
+      Date.now() + QUIESCENCE_RUNTIME_COMMAND_TIMEOUT_MS
+    );
     while (Date.now() < deadline) {
       const status = await this.getRuntimeStatus({
         name: session.name,
         agent: session.agent,
         directory: session.directory,
-        timeoutMs: QUIESCENCE_CONTROL_TIMEOUT_MS,
+        timeoutMs: Math.max(1, Math.min(controlTimeout(), deadline - Date.now())),
         ...(session.modelProvider != null ? { modelProvider: session.modelProvider } : {})
       }).catch(() => ({ exists: true }));
       if (!status.exists) {
@@ -4963,6 +4973,23 @@ export class AcpxSessionManager implements ISessionManager {
       });
       const recoveredOutput = delayedOutput ?? outputChunks.join("").trim();
       if (recoveredOutput.length > 0) {
+        // Claude can persist a synthetic authentication diagnostic before its
+        // transport asks to reconnect. That is not a delayed model answer.
+        // Match the native diagnostic prefix, not ordinary prose discussing
+        // OAuth credentials, then reuse the standard safe provider error.
+        const recoveredFailure =
+          params.session.agent === "claude" && /^Failed to authenticate:/u.test(recoveredOutput.trim())
+            ? classifyProviderFailure({ agent: "claude", message: recoveredOutput })
+            : null;
+        if (recoveredFailure != null) {
+          await this.deps.outputRouter.onError(
+            params.session.name,
+            new PuppenclawError(recoveredFailure.code, recoveredFailure.message),
+            { code: recoveredFailure.code, retryable: recoveredFailure.retryable }
+          );
+          this.completeActiveTurnOutput(params.session.name);
+          return failedProviderTurn(recoveredFailure);
+        }
         this.deps.logger.info(
           `Recovered delayed ACPX assistant output for ${params.session.name}.`
         );
