@@ -2,50 +2,18 @@
 
 import { open, readFile } from "node:fs/promises";
 import { spawn, type ChildProcess } from "node:child_process";
+import type { Writable } from "node:stream";
 
 import { computeJobSpecZod, computeJobRecordZod, type ComputeJobRecord } from "./types.js";
 import { readProcessStartTicks, readProcessUsage } from "./process.js";
 import { writeJsonFileAtomic } from "../shared/utils.js";
+import { computeSandboxLaunch } from "./sandbox.js";
 
 function arg(name: string): string {
   const index = process.argv.indexOf(name);
   const value = index >= 0 ? process.argv[index + 1] : undefined;
   if (!value) throw new Error(`Missing ${name}.`);
   return value;
-}
-
-function bubblewrapCommand(spec: ReturnType<typeof computeJobSpecZod.parse>): {
-  command: string;
-  args: string[];
-} {
-  if (spec.executor !== "bubblewrap-local") {
-    throw new Error(`Executor ${spec.executor} is not implemented.`);
-  }
-  return {
-    command: "bwrap",
-    args: [
-      "--die-with-parent",
-      "--new-session",
-      "--unshare-all",
-      "--share-net",
-      "--ro-bind",
-      "/",
-      "/",
-      "--dev",
-      "/dev",
-      "--proc",
-      "/proc",
-      "--tmpfs",
-      "/tmp",
-      "--bind",
-      spec.cwd,
-      spec.cwd,
-      "--chdir",
-      spec.cwd,
-      "--",
-      ...spec.command
-    ]
-  };
 }
 
 async function main(): Promise<void> {
@@ -105,20 +73,17 @@ async function main(): Promise<void> {
   const stdout = await open(stdoutPath, "a");
   const stderr = await open(stderrPath, "a");
   try {
-    const launch = bubblewrapCommand(spec);
+    const launch = computeSandboxLaunch(spec);
     child = spawn(launch.command, launch.args, {
       cwd: spec.cwd,
-      env: {
-        ...process.env,
-        ...spec.env,
-        OMP_NUM_THREADS: spec.env.OMP_NUM_THREADS ?? String(spec.resources.cpuCores),
-        OPENBLAS_NUM_THREADS: spec.env.OPENBLAS_NUM_THREADS ?? String(spec.resources.cpuCores),
-        MKL_NUM_THREADS: spec.env.MKL_NUM_THREADS ?? String(spec.resources.cpuCores)
-      },
+      env: launch.env,
       detached: false,
-      stdio: ["ignore", stdout.fd, stderr.fd],
+      stdio: ["ignore", stdout.fd, stderr.fd, "pipe"],
       windowsHide: true
     });
+    const environmentPipe = child.stdio[3] as Writable;
+    environmentPipe.on("error", () => { /* A fail-closed launcher may exit before reading. */ });
+    environmentPipe.end(launch.serializedEnv);
     const startedAt = new Date().toISOString();
     await writeState({
       state: "running",

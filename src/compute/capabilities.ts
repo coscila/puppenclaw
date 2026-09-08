@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { computeSandboxAvailable } from "./sandbox.js";
 
 export type ComputeExecutorCapability = {
   id: "bubblewrap-local" | "rootless-docker" | "slurm" | "htcondor" | "psij";
@@ -21,7 +22,8 @@ let cachedCapabilities: ComputeExecutorCapability[] | null = null;
 export function computeExecutorCapabilities(params: {
   hasAllowedRoots: boolean;
 }): ComputeExecutorCapability[] {
-  if (cachedCapabilities && params.hasAllowedRoots) return cachedCapabilities;
+  const trustedSandbox = computeSandboxAvailable();
+  if (cachedCapabilities && params.hasAllowedRoots && trustedSandbox) return cachedCapabilities;
   const bubblewrap = commandWorks("bwrap", [
     "--unshare-all",
     "--share-net",
@@ -51,11 +53,13 @@ export function computeExecutorCapabilities(params: {
   const capabilities: ComputeExecutorCapability[] = [
     {
       id: "bubblewrap-local",
-      available: params.hasAllowedRoots && bubblewrap,
+      available: params.hasAllowedRoots && bubblewrap && trustedSandbox,
       hardLimits: false,
       reason: !params.hasAllowedRoots
         ? "No compute workspace roots are configured."
-        : bubblewrap
+        : !trustedSandbox
+          ? "A trusted controller-owned compute sandbox launcher and Bubblewrap policy are required."
+          : bubblewrap
           ? "Filesystem and process isolation are available; CPU and memory are metered but not cgroup-hard-limited."
           : "Bubblewrap is not installed or cannot run."
     },
@@ -71,6 +75,6 @@ export function computeExecutorCapabilities(params: {
     { id: "htcondor", available: false, hardLimits: true, reason: "HTCondor adapter is not configured." },
     { id: "psij", available: false, hardLimits: true, reason: "PSI/J adapter is not configured." }
   ];
-  if (params.hasAllowedRoots) cachedCapabilities = capabilities;
+  if (params.hasAllowedRoots && trustedSandbox) cachedCapabilities = capabilities;
   return capabilities;
 }
