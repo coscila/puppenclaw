@@ -1616,6 +1616,19 @@ export class AcpxSessionManager implements ISessionManager {
       const requestedSkills = validateSkillNames(params.skills ?? []);
       const existing = this.deps.store.getSession(params.name);
       if (existing != null) {
+        if (
+          existing.agent === "claude" &&
+          [params.model, params.modelProvider?.model].some((model) =>
+            model != null && requiresFreshClaudeTranscript(
+              existing.modelProvider?.model ?? existing.model, model
+            )
+          )
+        ) {
+          throw new PuppenclawError(
+            "MODEL_TRANSCRIPT_INCOMPATIBLE",
+            "This model change requires a fresh runner session rehydrated from visible conversation only; native Fable thinking cannot be resumed by another generation."
+          );
+        }
         if (existing.agent !== params.agent) {
           throw new PuppenclawError(
             "SESSION_CONFLICT",

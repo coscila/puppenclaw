@@ -1612,6 +1612,9 @@ describe("AcpxSessionManager", () => {
       expect(await setting("workflow", "effort")).toBe(`${effort === "ultracode" ? "xhigh" : effort}\n`);
     }
     await expect(manager.send({ name: "workflow", message: "Use Opus", modelProviderId: "fable", modelProvider: { ...provider, model: "claude-opus-5" }, contextFiles: [] })).rejects.toMatchObject({ code: "MODEL_TRANSCRIPT_INCOMPATIBLE" });
+    for (const modelRequest of [{ model: "claude-opus-5" }, { modelProvider: { ...provider, model: "claude-opus-5" } }]) {
+      await expect(manager.start({ agent: "claude", name: "workflow", directory: workspaceDir, task: "Use Opus", contextFiles: [], ...modelRequest })).rejects.toMatchObject({ code: "MODEL_TRANSCRIPT_INCOMPATIBLE" });
+    }
     expect(store.getSession("workflow")?.model).toBe("claude-fable-5-1");
     expect(await setting("workflow", "model")).toBe("claude-fable-5-1\n");
   });
