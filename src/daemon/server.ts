@@ -13,6 +13,8 @@ import { REASONING_CAPABILITIES } from "../shared/reasoning.js";
 import { PuppenclawError } from "../shared/errors.js";
 import { SessionStore } from "../shared/store.js";
 import { UsageLedgerStore } from "../shared/usage-ledger.js";
+import { TurnStatisticsStore } from "../statistics/store.js";
+import { TurnStatisticsRecorder } from "../statistics/recorder.js";
 import { ComputeRuntime } from "../compute/runtime.js";
 import { computeJobSpecZod } from "../compute/types.js";
 import { ResourceMonitor } from "../resources/monitor.js";
@@ -144,12 +146,19 @@ export async function createDaemonServer(params: {
     let usageLedger: UsageLedgerStore | undefined;
     let computeRuntime: ComputeRuntime | undefined;
     let resourceMonitor: ResourceMonitor | undefined;
+    let statistics: TurnStatisticsRecorder | undefined;
     try {
       orchestratorStore = await OrchestratorStore.open(join(params.dataDir, "orchestrator"));
       usageLedger = await UsageLedgerStore.open(join(params.dataDir, "usage"));
       computeRuntime = await ComputeRuntime.open({
         dataDir: params.dataDir,
         config: params.config
+      });
+      const statisticsStore = await TurnStatisticsStore.open(join(params.dataDir, "statistics"));
+      statisticsStore.recoverInterrupted();
+      statistics = new TurnStatisticsRecorder(statisticsStore, {
+        listComputeJobs: () => computeRuntime?.listActiveJobs() ?? [],
+        warn: (code) => logger.warn(code)
       });
       resourceMonitor = await ResourceMonitor.open({
         dataDir: params.dataDir,
@@ -170,7 +179,8 @@ export async function createDaemonServer(params: {
         logger,
         store,
         outputRouter,
-        ledger: usageLedger
+        ledger: usageLedger,
+        statistics
       });
       await manager.reconcilePersistedSessions();
       const orchestrator = new OrchestratorRuntime({
@@ -189,12 +199,14 @@ export async function createDaemonServer(params: {
         usageLedger,
         computeRuntime,
         resourceMonitor,
+        statistics,
         outputRouter,
         manager,
         orchestrator
       };
     } catch (error) {
       resourceMonitor?.close();
+      await statistics?.close();
       computeRuntime?.close();
       usageLedger?.close();
       orchestratorStore?.close();
@@ -207,6 +219,7 @@ export async function createDaemonServer(params: {
     usageLedger,
     computeRuntime,
     resourceMonitor,
+    statistics,
     outputRouter,
     manager,
     orchestrator
@@ -240,6 +253,7 @@ export async function createDaemonServer(params: {
       terminalReplayRetention: 64,
       turnKeyRetention: 4096
     },
+    conversationStatistics: { version: 1, durable: true, cursorUpdates: true, contextRequired: true, cpuCoverage: "partial" },
     sessionModelProviderRefresh: true,
     interactionModes: ["plan", "execute"],
     codexTurnPolicy: {
@@ -335,6 +349,7 @@ export async function createDaemonServer(params: {
 
   app.addHook("onClose", async () => {
     resourceMonitor.close();
+    await statistics.close();
     computeRuntime.close();
     orchestratorStore.close();
     usageLedger.close();
@@ -476,6 +491,16 @@ export async function createDaemonServer(params: {
   app.get("/resources", async () =>
     ok(jsonToolResult(await resourceMonitor.snapshot(), "Resource usage"))
   );
+
+  app.get("/statistics/turns", async (request, reply) => {
+    const query = request.query as { cursor?: string; limit?: string };
+    try {
+      return ok(jsonToolResult(statistics.store.page(query.cursor ?? "0", query.limit == null ? 100 : Number(query.limit)), "Conversation turn statistics"));
+    } catch (error) {
+      if (!(error instanceof RangeError)) throw error;
+      return reply.code(400).send({ code: "INVALID_STATISTICS_CURSOR", message: "Invalid statistics cursor or limit." });
+    }
+  });
 
   app.get("/resources/history", async (request, reply) => {
     const query = request.query as {

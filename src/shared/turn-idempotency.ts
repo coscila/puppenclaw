@@ -61,12 +61,13 @@ export function fingerprintStartRequest(params: StartParams): string {
     // This is the exact v1 shape used before account-scoped ownership existed.
     // Its digest is durable protocol state and must keep replaying after an
     // upgrade instead of becoming a different request.
-    return fingerprint(legacyRequest);
+    return fingerprint(params.statisticsContext == null ? legacyRequest : { ...legacyRequest, version: 3, statisticsContext: params.statisticsContext });
   }
   return fingerprint({
     ...legacyRequest,
     version: 2,
-    ownerKey: params.ownerKey
+    ownerKey: params.ownerKey,
+    ...(params.statisticsContext != null ? { version: 3, statisticsContext: params.statisticsContext } : {})
   });
 }
 
@@ -82,6 +83,7 @@ export function fingerprintSendRequest(params: SendParams): string {
     interactionMode: params.interactionMode ?? null,
     modelProviderId: params.modelProviderId ?? null,
     modelProvider: canonicalProvider(params.modelProvider),
-    contextFiles: (params.contextFiles ?? []).map((entry) => entry.trim())
+    contextFiles: (params.contextFiles ?? []).map((entry) => entry.trim()),
+    ...(params.statisticsContext != null ? { version: 2, statisticsContext: params.statisticsContext } : {})
   });
 }

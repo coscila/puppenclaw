@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { SessionStore } from "../shared/store.js";
 import { requiresFreshClaudeTranscript } from "../shared/model-compatibility.js";
 import { UsageLedgerStore } from "../shared/usage-ledger.js";
+import type { TurnStatisticsRecorder } from "../statistics/recorder.js";
 import { hasNonzeroUsage, normalizeCodexUsage, normalizeUsage } from "../shared/usage.js";
 import { DEFAULT_MAX_SESSIONS } from "../shared/schema.js";
 import { ensureError, PuppenclawError } from "../shared/errors.js";
@@ -1568,6 +1569,7 @@ export class AcpxSessionManager implements ISessionManager {
       store: SessionStore;
       outputRouter: OutputRouter;
       ledger?: UsageLedgerStore;
+      statistics?: TurnStatisticsRecorder;
     }
   ) {}
 
@@ -1598,6 +1600,32 @@ export class AcpxSessionManager implements ISessionManager {
     }
   }
 
+  private async withStatisticsTurn(params: StartParams | SendParams, run: () => Promise<ToolResult>): Promise<ToolResult> {
+    if (params.statisticsContext == null) return await run();
+    const statistics = this.deps.statistics;
+    if (statistics == null) throw new PuppenclawError("STATISTICS_UNAVAILABLE", "This runner does not support durable conversation statistics.");
+    const stored = this.deps.store.getSession(params.name);
+    const agent = "agent" in params ? params.agent : stored?.agent;
+    if (agent == null) throw new PuppenclawError("NO_SESSION", "Unknown statistics session.");
+    const turnId = statistics.admit(params.statisticsContext, {
+      name: params.name, agent,
+      model: ("model" in params ? params.model : undefined) ?? params.modelProvider?.model ?? stored?.model,
+      modelProviderId: params.modelProviderId ?? stored?.modelProviderId
+    }, params.turnKey);
+    this.activeTurnIds.set(params.name, turnId);
+    try {
+      const result = await run();
+      await statistics.settle(params.name, "completed");
+      return result;
+    } catch (error) {
+      const stopped = this.stopRequests.has(params.name) || this.deps.store.getSession(params.name)?.state === "stopped";
+      await statistics.settle(params.name, stopped ? "cancelled" : "failed");
+      throw error;
+    } finally {
+      if (this.activeTurnIds.get(params.name) === turnId) this.activeTurnIds.delete(params.name);
+    }
+  }
+
   async start(params: StartParams): Promise<ToolResult> {
     return await this.runSessionTurn(
       params.name,
@@ -1610,7 +1638,7 @@ export class AcpxSessionManager implements ISessionManager {
             turnKey: params.turnKey,
             requestFingerprint: fingerprintStartRequest(params)
           },
-      async () => await this.startTurn(params)
+      async () => await this.withStatisticsTurn(params, () => this.startTurn(params))
     );
   }
 
@@ -1917,7 +1945,7 @@ export class AcpxSessionManager implements ISessionManager {
             turnKey: params.turnKey,
             requestFingerprint: fingerprintSendRequest(params)
           },
-      async () => {
+      async () => await this.withStatisticsTurn(params, async () => {
       const storedSession = this.requireSession(params.name);
       const providerRefresh = await this.prepareModelProviderRefresh(storedSession, params);
       const session = providerRefresh.session;
@@ -2098,7 +2126,7 @@ export class AcpxSessionManager implements ISessionManager {
         ...(turn.signals != null ? { turnSignals: turn.signals } : {}),
         contextFiles: context.files
       });
-      }
+      })
     );
   }
 
@@ -4824,6 +4852,9 @@ export class AcpxSessionManager implements ISessionManager {
       };
     };
     const consumeLine = (line: string): void => {
+      if (this.deps.statistics) {
+        try { this.deps.statistics.observeEvent(params.session.name, JSON.parse(line), "acp"); } catch { /* Malformed protocol lines are not metrics. */ }
+      }
       const event = parsePromptEventLine(line);
       if (event != null) {
         events.push(event);
@@ -5230,6 +5261,7 @@ export class AcpxSessionManager implements ISessionManager {
         if (!isRecord(parsed)) {
           return;
         }
+        this.deps.statistics?.observeEvent(params.session.name, parsed, "codex");
         const activity = extractCodexActivity(parsed);
         if (activity != null) {
           dispatchTasks.push(this.deps.outputRouter.onActivity(params.session.name, activity));
@@ -5389,6 +5421,7 @@ export class AcpxSessionManager implements ISessionManager {
   private async startActiveTurnOutput(session: SessionInfo): Promise<void> {
     const sessionName = session.name;
     this.assertTurnWasNotStopped(sessionName);
+    await this.deps.statistics?.beginSegment(session);
     const now = nowIso();
     const turnId = this.activeTurnIds.get(sessionName) ?? randomUUID();
     this.activeTurnIds.set(sessionName, turnId);
@@ -5533,6 +5566,9 @@ export class AcpxSessionManager implements ISessionManager {
     child.once("error", () => clear(child.exitCode, child.signalCode));
     const pid = child.pid;
     const identity = pid != null ? await readLinuxProcessIdentity(pid) : null;
+    if (pid != null && identity != null) {
+      this.deps.statistics?.registerRoot(sessionName, { pid, startTicks: identity.processStartIdentity.split(":")[1]! });
+    }
     await this.patchActiveTurn(sessionName, turnId, (activeTurn) => ({
       ...activeTurn,
       ...(pid != null ? { pid } : {}),
@@ -5602,6 +5638,8 @@ export class AcpxSessionManager implements ISessionManager {
     receiptOutcome?: Omit<TurnRequestSuccessOutcome, "session"> | TurnRequestErrorOutcome,
     failureMetadata?: { code: string; retryable?: boolean }
   ): Promise<SessionInfo> {
+    const stoppedForStatistics = this.stopRequests.has(sessionName) || this.deps.store.getSession(sessionName)?.state === "stopped";
+    await this.deps.statistics?.settle(sessionName, stoppedForStatistics ? "cancelled" : state === "failed" ? "failed" : "completed");
     this.checkpointActiveTurnOutput(sessionName, true);
     await this.activeTurnPersistence.get(sessionName)?.catch(() => undefined);
     const turnId = this.activeTurnIds.get(sessionName);

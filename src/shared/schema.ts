@@ -472,6 +472,12 @@ export const logsParamsZod = z
     }
   });
 
+export const statisticsContextZod = z.object({
+  version: z.literal(1),
+  chatId: z.string().regex(/^[A-Za-z0-9_-]{1,200}$/u),
+  attemptId: z.string().regex(/^[A-Za-z0-9_-]{1,200}$/u)
+}).strict();
+
 export const startParamsZod = z
   .object({
     agent: agentKindZod,
@@ -488,6 +494,7 @@ export const startParamsZod = z
     modelProvider: modelProviderConfigZod.optional(),
     ownerKey: ownerKeyZod.optional(),
     turnKey: turnKeyZod.optional(),
+    statisticsContext: statisticsContextZod.optional(),
     lifecycleEpoch: z.number().int().positive().safe().optional(),
     contextFiles: z.array(nonEmptyString).default([]),
     skills: z.array(skillNameString).default([])
@@ -500,7 +507,8 @@ export const pluginStartParamsZod = startParamsZod
     interactionMode: true,
     lifecycleEpoch: true,
     ownerKey: true,
-    turnKey: true
+    turnKey: true,
+    statisticsContext: true
   })
   .strict();
 
@@ -528,6 +536,7 @@ export const sendParamsZod = z
     permissionMode: permissionModeZod.optional(),
     interactionMode: interactionModeZod.optional(),
     turnKey: turnKeyZod.optional(),
+    statisticsContext: statisticsContextZod.optional(),
     lifecycleEpoch: z.number().int().positive().safe().optional(),
     modelProviderId: skillNameString.optional(),
     modelProvider: modelProviderConfigZod.optional(),
@@ -541,6 +550,7 @@ export const pluginSendParamsZod = sendParamsZod
     interactionMode: true,
     lifecycleEpoch: true,
     turnKey: true,
+    statisticsContext: true,
     modelProviderId: true,
     modelProvider: true
   })

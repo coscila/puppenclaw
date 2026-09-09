@@ -8,6 +8,8 @@ import { computeJobSpecZod, computeJobRecordZod, type ComputeJobRecord } from ".
 import { readProcessStartTicks, readProcessUsage } from "./process.js";
 import { writeJsonFileAtomic } from "../shared/utils.js";
 import { computeSandboxLaunch } from "./sandbox.js";
+import { ProcessCpuCounter } from "../statistics/proc-cpu.js";
+import { readProcSnapshot, TICKS_PER_SECOND } from "../resources/proc.js";
 
 function arg(name: string): string {
   const index = process.argv.indexOf(name);
@@ -23,6 +25,8 @@ async function main(): Promise<void> {
   const stderrPath = arg("--stderr");
   const spec = computeJobSpecZod.parse(JSON.parse(await readFile(specPath, "utf8")));
   const submittedAt = arg("--submitted-at");
+  const baseline = await readProcSnapshot();
+  const cpuCounter = new ProcessCpuCounter(baseline.uptimeSeconds > 0 ? baseline.uptimeSeconds * TICKS_PER_SECOND : Infinity);
   let child: ChildProcess | null = null;
   let childClosed = false;
   let childOutcome: Promise<{ code: number | null; signal: NodeJS.Signals | null; error: Error | null }> | null = null;
@@ -37,7 +41,7 @@ async function main(): Promise<void> {
   const base: ComputeJobRecord = computeJobRecordZod.parse({
     id: spec.jobId,
     state: "starting",
-    // The heartbeat rewrites the whole record every 5s from this base, so the
+    // The heartbeat rewrites the whole record every second from this base, so the
     // session linkage MUST be carried here or it would be nulled immediately.
     sessionName: spec.sessionName ?? null,
     executor: spec.executor,
@@ -70,6 +74,21 @@ async function main(): Promise<void> {
     const pending = stateWrites.catch(() => {}).then(() => writeJsonFileAtomic(statePath, next));
     stateWrites = pending;
     return pending;
+  };
+  const measuredUsage = async () => {
+    const [snapshot, latest] = await Promise.all([
+      readProcSnapshot(),
+      child?.pid ? readProcessUsage(child.pid) : Promise.resolve(null)
+    ]);
+    cpuCounter.sample(snapshot);
+    // /proc entries disappear on exit. Retain the last measured cumulative
+    // counters instead of overwriting a real observation with null/zero.
+    return {
+      cpuSeconds: cpuCounter.cpuMs === null ? state.cpuSeconds : Math.max(state.cpuSeconds ?? 0, cpuCounter.cpuMs / 1000),
+      peakMemoryKiB: latest?.peakMemoryKiB ?? state.peakMemoryKiB,
+      readBytes: latest?.readBytes ?? state.readBytes,
+      writeBytes: latest?.writeBytes ?? state.writeBytes
+    };
   };
   await writeState({});
 
@@ -117,17 +136,20 @@ async function main(): Promise<void> {
     environmentPipe.on("error", () => { /* A fail-closed launcher may exit before reading. */ });
     environmentPipe.end(launch.serializedEnv);
     const startedAt = new Date().toISOString();
+    const childStartTicks = child.pid ? await readProcessStartTicks(child.pid) : null;
+    if (child.pid && childStartTicks !== null) cpuCounter.register({ pid: child.pid, startTicks: childStartTicks });
     await writeState({
       state: "running",
       childPid: child.pid ?? null,
-      childStartTicks: child.pid ? await readProcessStartTicks(child.pid) : null,
+      childStartTicks,
       startedAt,
       lastHeartbeatAt: startedAt
     });
+    await writeState(await measuredUsage());
     heartbeat = setInterval(() => {
       if (!child?.pid || heartbeatBusy || childClosed) return;
       heartbeatBusy = true;
-      heartbeatTask = readProcessUsage(child.pid).then((usage) => {
+      heartbeatTask = measuredUsage().then((usage) => {
         peakMemoryKiB = Math.max(peakMemoryKiB, usage.peakMemoryKiB ?? 0);
         return writeState({
           ...usage,
@@ -138,7 +160,7 @@ async function main(): Promise<void> {
         heartbeatError = error;
         signalChild();
       }).finally(() => { heartbeatBusy = false; });
-    }, 5_000);
+    }, 1_000);
     heartbeat.unref();
     wallTimer = setTimeout(
       () => stopChild("wall_time"),
@@ -151,7 +173,7 @@ async function main(): Promise<void> {
     await heartbeatTask;
     if (outcome.error) throw outcome.error;
     if (heartbeatError) throw heartbeatError;
-    const usage = child.pid ? await readProcessUsage(child.pid) : null;
+    const usage = await measuredUsage();
     const completedAt = new Date().toISOString();
     await writeState({
       state:
