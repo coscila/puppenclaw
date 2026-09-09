@@ -2777,6 +2777,7 @@ export class AcpxSessionManager implements ISessionManager {
       this.deps.outputRouter.clear(params.name);
       this.activeTurnOutputs.delete(params.name);
       this.activeTurnProcesses.delete(params.name);
+      this.deps.statistics?.forgetRuntime(params.name);
       this.stopRequests.delete(params.name);
       if (reservation.purpose === "purge") {
         await this.deps.store.releaseQuiescence(params.name, epoch);

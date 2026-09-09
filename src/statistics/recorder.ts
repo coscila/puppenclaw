@@ -383,4 +383,28 @@ export class TurnStatisticsRecorder {
       await this.settle(name, "interrupted");
     this.store.close();
   }
+  purgeChat(chatId: string): {
+    version: 1;
+    chatId: string;
+    purged: true;
+    removedTurns: number;
+  } {
+    if (
+      [...this.active.values()].some((meter) => meter.row.chatId === chatId)
+    ) {
+      throw new PuppenclawError(
+        "SESSION_BUSY",
+        "A conversation turn is still active; verify runtime teardown before permanent statistics erasure.",
+      );
+    }
+    return {
+      version: 1,
+      chatId,
+      purged: true,
+      removedTurns: this.store.purgeChat(chatId),
+    };
+  }
+  forgetRuntime(sessionName: string): void {
+    if (!this.active.has(sessionName)) this.sessionRoots.delete(sessionName);
+  }
 }

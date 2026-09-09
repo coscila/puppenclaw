@@ -1,7 +1,8 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type { DatabaseSync as DatabaseSyncType } from "node:sqlite";
 import { ensureDir } from "../shared/utils.js";
+import { PuppenclawError } from "../shared/errors.js";
 import type { RunnerTurnStatistics, StatisticsPage } from "./types.js";
 
 const SQLITE = `node${":sqlite"}`;
@@ -9,9 +10,10 @@ const SQLITE = `node${":sqlite"}`;
 export class TurnStatisticsStore {
   readonly daemonId: string;
   private constructor(private readonly db: DatabaseSyncType) {
-    db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
+    db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA secure_delete=ON;
       CREATE TABLE IF NOT EXISTS statistics_meta (id INTEGER PRIMARY KEY CHECK(id=1), daemon_id TEXT NOT NULL, revision INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS turn_statistics (id TEXT PRIMARY KEY, revision INTEGER NOT NULL UNIQUE, payload TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS statistics_erasure_fences (chat_hash TEXT PRIMARY KEY);
       CREATE INDEX IF NOT EXISTS statistics_revision ON turn_statistics(revision);`);
     db.prepare("INSERT OR IGNORE INTO statistics_meta VALUES (1, ?, 0)").run(
       randomUUID(),
@@ -40,6 +42,16 @@ export class TurnStatisticsStore {
   put(value: RunnerTurnStatistics): RunnerTurnStatistics {
     this.db.exec("BEGIN IMMEDIATE");
     try {
+      if (
+        this.db
+          .prepare("SELECT 1 FROM statistics_erasure_fences WHERE chat_hash=?")
+          .get(this.chatHash(value.chatId))
+      ) {
+        throw new PuppenclawError(
+          "STATISTICS_CONTEXT_PURGED",
+          "Statistics for this chat were permanently erased.",
+        );
+      }
       const revision = (
         this.db
           .prepare(
@@ -61,6 +73,42 @@ export class TurnStatisticsStore {
       this.db.exec("ROLLBACK");
       throw error;
     }
+  }
+  private chatHash(chatId: string): string {
+    return createHash("sha256")
+      .update(`conversation-statistics-erasure-v1:${chatId}`)
+      .digest("hex");
+  }
+  /** Permanent chat erasure only. Runtime rotation and TTL cleanup must not call this. */
+  purgeChat(chatId: string): number {
+    this.db.exec("BEGIN IMMEDIATE");
+    let removed: number;
+    try {
+      this.db
+        .prepare("INSERT OR IGNORE INTO statistics_erasure_fences VALUES (?)")
+        .run(this.chatHash(chatId));
+      removed = Number(
+        this.db
+          .prepare(
+            "DELETE FROM turn_statistics WHERE json_extract(payload, '$.chatId')=?",
+          )
+          .run(chatId).changes,
+      );
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+    // Secure deletion overwrites vacated pages; checkpointing drops old WAL
+    // frames. Neither operation rewinds the stable daemon revision cursor.
+    const checkpoint = this.db
+      .prepare("PRAGMA wal_checkpoint(TRUNCATE)")
+      .get() as { busy: number };
+    if (checkpoint.busy !== 0)
+      throw new Error(
+        "Statistics erasure checkpoint is busy; retry after readers settle",
+      );
+    return removed;
   }
   page(cursor = "0", limit = 100): StatisticsPage {
     if (

@@ -429,4 +429,185 @@ describe("conversation statistics recording", () => {
       await app.close();
     }
   });
+  it("requires authenticated permanent erasure and preserves unrelated chats and rotation history", async () => {
+    const root = await createTempDir("statistics-purge-http-");
+    const { app } = await createDaemonServer({
+      dataDir: root,
+      config: makeConfig({
+        acpxCommand: await resolveFakeAcpxCommand(),
+        daemonAuthToken: "synthetic-auth",
+      }),
+    });
+    const headers = { authorization: "Bearer synthetic-auth" };
+    const purge = (chatId: string) =>
+      app.inject({
+        method: "POST",
+        url: `/statistics/chats/${chatId}/purge`,
+        headers,
+      });
+    try {
+      expect(
+        (
+          await app.inject({
+            method: "POST",
+            url: "/statistics/chats/first/purge",
+          })
+        ).statusCode,
+      ).toBe(401);
+      for (const name of ["first", "second"]) {
+        const result = await app.inject({
+          method: "POST",
+          url: "/session/start",
+          headers,
+          payload: {
+            agent: "claude",
+            name,
+            directory: root,
+            task: "Synthetic task",
+            contextFiles: [],
+            turnKey: name,
+            statisticsContext: { version: 1, chatId: name, attemptId: name },
+          },
+        });
+        expect(result.statusCode).toBe(200);
+      }
+      expect(
+        (
+          await app.inject({
+            method: "POST",
+            url: "/session/first/purge",
+            headers,
+            payload: {},
+          })
+        ).statusCode,
+      ).toBe(200);
+      const before = JSON.parse(
+        (await app.inject({ method: "GET", url: "/statistics/turns", headers }))
+          .body,
+      ).details;
+      expect(before.turns).toHaveLength(2); // ordinary teardown preserves accounting
+      expect(JSON.parse((await purge("first")).body).details).toEqual({
+        version: 1,
+        chatId: "first",
+        purged: true,
+        removedTurns: 1,
+      });
+      expect(JSON.parse((await purge("first")).body).details.removedTurns).toBe(
+        0,
+      );
+      const after = JSON.parse(
+        (await app.inject({ method: "GET", url: "/statistics/turns", headers }))
+          .body,
+      ).details;
+      expect(
+        after.turns.map((value: { chatId: string }) => value.chatId),
+      ).toEqual(["second"]);
+      expect(after.nextCursor).toBe(before.nextCursor);
+    } finally {
+      await app.close();
+    }
+    const open = await createDaemonServer({
+      dataDir: await createTempDir("statistics-open-"),
+      config: makeConfig(),
+    });
+    try {
+      expect(
+        (
+          await open.app.inject({
+            method: "POST",
+            url: "/statistics/chats/chat/purge",
+          })
+        ).statusCode,
+      ).toBe(503);
+    } finally {
+      await open.app.close();
+    }
+  });
+  it("rejects permanent erasure during a live meter and records real cancellation before erasure", async () => {
+    const root = await createTempDir("statistics-purge-live-");
+    const { app } = await createDaemonServer({
+      dataDir: root,
+      config: makeConfig({
+        acpxCommand: await resolveFakeAcpxCommand(),
+        daemonAuthToken: "synthetic-auth",
+      }),
+    });
+    const headers = { authorization: "Bearer synthetic-auth" };
+    let start: Promise<unknown> | undefined;
+    try {
+      start = app.inject({
+        method: "POST",
+        url: "/session/start",
+        headers,
+        payload: {
+          agent: "claude",
+          name: "live",
+          directory: root,
+          task: "SLOW_TURN",
+          contextFiles: [],
+          turnKey: "live",
+          statisticsContext: { version: 1, chatId: "live", attemptId: "live" },
+        },
+      });
+      let running = false;
+      for (let tries = 0; tries < 100; tries++) {
+        const page = JSON.parse(
+          (
+            await app.inject({
+              method: "GET",
+              url: "/statistics/turns",
+              headers,
+            })
+          ).body,
+        ).details;
+        if (page.turns[0]?.state === "running") {
+          running = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(running).toBe(true);
+      const blocked = await app.inject({
+        method: "POST",
+        url: "/statistics/chats/live/purge",
+        headers,
+      });
+      expect(blocked.statusCode).toBe(409);
+      expect(JSON.parse(blocked.body).code).toBe("SESSION_BUSY");
+      expect(
+        (
+          await app.inject({
+            method: "POST",
+            url: "/session/live/quiesce",
+            headers,
+            payload: {},
+          })
+        ).statusCode,
+      ).toBe(200);
+      await start;
+      const settled = JSON.parse(
+        (await app.inject({ method: "GET", url: "/statistics/turns", headers }))
+          .body,
+      ).details.turns[0];
+      expect(settled.state).toBe("cancelled");
+      expect(
+        (
+          await app.inject({
+            method: "POST",
+            url: "/statistics/chats/live/purge",
+            headers,
+          })
+        ).statusCode,
+      ).toBe(200);
+    } finally {
+      await app.inject({
+        method: "POST",
+        url: "/session/live/quiesce",
+        headers,
+        payload: {},
+      });
+      await start;
+      await app.close();
+    }
+  });
 });

@@ -138,6 +138,27 @@ describe("durable statistics foundations", () => {
       ),
     ).toEqual(unavailableTokens());
   });
+  it("permanently erases only the selected chat and persists a non-resurrectable fence without rewinding cursors", async () => {
+    const root = await createTempDir("statistics-erasure-");
+    let store = await TurnStatisticsStore.open(root);
+    store.put({ ...row("a"), chatId: "erased" });
+    store.put({ ...row("b"), chatId: "retained" });
+    const cursor = store.page().nextCursor;
+    expect(store.purgeChat("erased")).toBe(1);
+    expect(store.purgeChat("erased")).toBe(0);
+    expect(store.page().turns.map((value) => value.chatId)).toEqual([
+      "retained",
+    ]);
+    expect(store.page(cursor).nextCursor).toBe(cursor);
+    store.close();
+    store = await TurnStatisticsStore.open(root);
+    expect(() => store.put({ ...row("delayed"), chatId: "erased" })).toThrow(
+      /permanently erased/,
+    );
+    const next = store.put({ ...row("c"), chatId: "retained" });
+    expect(Number(next.revision)).toBeGreaterThan(Number(cursor));
+    store.close();
+  });
   it("measures new children, baselines existing roots, retains reparented children and rejects PID reuse", () => {
     const counter = new ProcessCpuCounter(100);
     counter.register({ pid: 1, startTicks: "50" });

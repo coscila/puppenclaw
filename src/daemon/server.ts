@@ -44,6 +44,7 @@ import {
   siteStatusParamsZod,
   sendParamsZod,
   startParamsZod,
+  statisticsContextZod,
   statusParamsZod,
   stopParamsZod,
   suspendParamsZod,
@@ -502,6 +503,12 @@ export async function createDaemonServer(params: {
     }
   });
 
+  app.post("/statistics/chats/:chatId/purge", async (request) => {
+    if (!authToken) throw new PuppenclawError("DAEMON_AUTH_REQUIRED", "Permanent statistics erasure requires configured daemon authentication.");
+    const chatId = statisticsContextZod.shape.chatId.parse((request.params as { chatId: string }).chatId);
+    return ok(jsonToolResult(statistics.purgeChat(chatId), "Permanently erased conversation statistics"));
+  });
+
   app.get("/resources/history", async (request, reply) => {
     const query = request.query as {
       since?: string;
@@ -861,6 +868,9 @@ function daemonStatusForError(code: string): number {
     case "LIFECYCLE_EPOCH_REQUIRED":
     case "STALE_LIFECYCLE_EPOCH":
     case "TURN_ALREADY_RUNNING":
+    case "SESSION_BUSY":
+    case "STATISTICS_CONTEXT_REUSED":
+    case "STATISTICS_CONTEXT_PURGED":
     case "TURN_KEY_CONFLICT":
     case "TURN_REPLAY_UNAVAILABLE":
     case "TURN_RECEIPT_CAPACITY_REACHED":

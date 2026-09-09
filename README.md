@@ -442,6 +442,38 @@ callers without an owner selector remain unowned and must still be reconciled
 or purged individually. Capability discovery advertises this contract under
 `sessionOwnerCleanup.version: 1`.
 
+## Conversation statistics
+
+Controller-owned start/send requests can attach
+`statisticsContext: { version: 1, chatId, attemptId }` when
+`conversationStatistics.version === 1` is advertised. Requests without this
+context are intentionally untracked; session names never infer attribution.
+The context is included in durable request fingerprints, so replaying the same
+turn key cannot charge an attempt twice. Agent-facing plugin tools cannot set it.
+
+Authenticated `GET /statistics/turns?cursor=0&limit=100` returns a durable
+`details` envelope with `daemonId`, `nextCursor`, `hasMore`, and latest-value
+`turns`. Every checkpoint and settlement advances a global revision. Consumers
+upsert by daemon and turn ID, never sum revisions, and rescan after a daemon ID
+change. Recovery preserves the last checkpoint and marks interruption; it does
+not extrapolate through downtime.
+
+Runtime is monotonic active runner elapsed time, not summed child wall time.
+Token input includes cache reads/writes; cache and reasoning counts are subsets,
+not additions to total. Null means unobserved, never measured zero. Failed and
+cancelled attempts retain observed partial usage. CPU uses cumulative kernel
+counters for verified host process ancestry, baselines reused runtimes, excludes
+managed compute trees, and is always labelled sampled partial coverage. It does
+not measure remote model CPU/GPU use or reconstruct missed short-lived children.
+Managed compute exposes its separately measured cumulative job-tree CPU.
+
+Permanent chat deletion must call authenticated
+`POST /statistics/chats/:chatId/purge` after verified runtime teardown. Its
+`details` proof is `{ version: 1, chatId, purged: true, removedTurns }`.
+Live attempts reject erasure. The operation is idempotent, keeps the global
+revision monotonic, and fences delayed writes with a non-plaintext chat digest.
+Ordinary session purge, model rotation, and TTL cleanup preserve statistics.
+
 ## OpenClaw Usage Surfaces
 
 Puppenclaw exposes three main surfaces:
