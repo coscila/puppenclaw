@@ -45,6 +45,14 @@ describe("Codex native outcomes through the runner", () => {
     expect(statisticsStore.page().turns[0]?.state).toBe("failed");
   });
 
+  it("rejects a JSON final candidate without terminal completion", async () => {
+    const { run, store, statisticsStore } = await setup("json-no-terminal");
+    const result = await run();
+    expect(result.details).toMatchObject({ outputRole: "status", session: { state: "failed", failureCode: "NO_FINAL_MESSAGE" } });
+    expect(store.getSession("outcome")?.transcript.filter((entry) => entry.role === "assistant")).toEqual([]);
+    expect(statisticsStore.page().turns[0]?.state).toBe("failed");
+  });
+
   it.each(["file", "transient", "json-final"])("completes %s with genuine final-answer provenance", async (scenario) => {
     const { run, store, statisticsStore } = await setup(scenario);
     const result = await run();

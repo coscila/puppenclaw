@@ -27,11 +27,11 @@ if (scenario === "failed") {
   emit({ type: "turn.failed", error: { message: "Native turn failed token=fixture-secret" } });
   process.exit(0);
 }
-if (["file", "transient", "json-final"].includes(scenario)) {
+if (["file", "transient", "json-final", "json-no-terminal"].includes(scenario)) {
   const item = { id: "final", type: "agent_message", phase: "final_answer", text: "Explicit JSON final." };
   emit({ type: "item.completed", item });
   emit({ type: "item.completed", item });
-  if (scenario !== "json-final") writeFileSync(outputPath, "Authoritative file answer.");
+  if (scenario === "file" || scenario === "transient") writeFileSync(outputPath, "Authoritative file answer.");
+  if (scenario === "json-no-terminal") process.exit(0);
 }
 emit({ type: "turn.completed", usage: { input_tokens: 100, output_tokens: 20 } });
-
