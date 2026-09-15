@@ -150,6 +150,38 @@ describe.skipIf(process.platform !== "linux")("private bounded turn diagnostics"
     expect(text).toContain("Failed to connect using [redacted]");
   });
 
+  it("preserves Rust module separators while withholding actual colon and equals payload fields", async () => {
+    const root = await directory();
+    const recorder = await start(root);
+    recorder.observeStderr("2026-09-15T11:09:28Z ERROR codex_core::tools::handlers::shell: timed out waiting for process completion\n");
+    recorder.observeStderr("ERROR codex_core::tools::parallel: task join failed before final response\n");
+    for (const field of ["request:", "request=", "tool:", "tool="]) {
+      recorder.observeStderr(`ERROR codex_core::tools::parallel: failed to process ${field}SECRET-PAYLOAD\n`);
+    }
+    await recorder.finish({ exitCode: 1, signal: null, outcome: "failed" });
+    const text = JSON.stringify(await onlySnapshot(root));
+    expect(text).toContain("codex_core::tools::handlers::shell: timed out waiting for process completion");
+    expect(text).toContain("codex_core::tools::parallel: task join failed before final response");
+    expect(text).toContain("codex_core::tools::parallel: failed to process [payload withheld]");
+    expect(text).not.toContain("SECRET-PAYLOAD");
+  });
+
+  it("records only allowlisted visible message phases without retaining prose or private phases", async () => {
+    const root = await directory();
+    const recorder = await start(root);
+    for (const phase of ["commentary", "final_answer", "analysis", "reasoning", "SECRET-ARBITRARY-PHASE"]) {
+      recorder.observeEvent({ type: "item.completed", item: { type: "agent_message", phase, text: "SECRET-PROSE" } });
+    }
+    await recorder.finish({ exitCode: 0, signal: null, outcome: "completed" });
+    const snapshot = await onlySnapshot(root);
+    expect(snapshot.eventTail.map((event: { phase?: string }) => event.phase)).toEqual([
+      "commentary", "final_answer", undefined, undefined, undefined,
+    ]);
+    const text = JSON.stringify(snapshot);
+    expect(text).not.toContain("SECRET");
+    expect(JSON.stringify(snapshot.eventTail)).not.toMatch(/analysis|reasoning/u);
+  });
+
   it("periodically persists in-flight evidence without a terminal callback", async () => {
     vi.useFakeTimers();
     const root = await directory();

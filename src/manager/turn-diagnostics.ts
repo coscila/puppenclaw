@@ -59,6 +59,7 @@ type EventSummary = {
   at: string;
   type: string;
   itemType?: string;
+  phase?: "commentary" | "final_answer";
   status?: string;
   visibleTextCharacters?: number;
   errorCategory?: string;
@@ -170,7 +171,7 @@ function safeDiagnosticLine(value: string, secrets: readonly string[]): string |
     .replace(/(\b(?:authorization|proxy-authorization)\s*[:=]\s*)(?:bearer|basic)\s+\S+/giu, "$1[redacted]")
     .replace(/(https?:\/\/[^\s?]+)\?[^\s]+/giu, "$1?[query withheld]")
     .replace(/\b(?:prompt|reasoning|tool[_ -]?(?:arguments|output|input|result)|environment(?: variables)?)\b[\s\S]*/iu, "[payload withheld]")
-    .replace(/\b(?:request|response|body|messages?|tools?|arguments|env|input|output)\s*[:=][\s\S]*/iu, "[payload withheld]")
+    .replace(/\b(?:request|response|body|messages?|tools?|arguments|env|input|output)\s*(?:=|:(?!:))[\s\S]*/iu, "[payload withheld]")
     .replace(/\b(?:raw|original|full)\s+(?:request|response|input|output)\b[\s\S]*/iu, "[payload withheld]")
     .replace(/[\[{]\s*["'{][\s\S]*/u, "[payload withheld]")
     .slice(0, 512);
@@ -500,6 +501,8 @@ export class TurnDiagnosticsRecorder {
     const item = record(event.item) ?? record(event.output_item);
     const summary: EventSummary = { at: new Date(this.now()).toISOString(), type };
     if (typeof item?.type === "string" && ITEM_TYPES.has(item.type)) summary.itemType = item.type;
+    const phase = item?.phase ?? event.phase;
+    if (phase === "commentary" || phase === "final_answer") summary.phase = phase;
     const status = item?.status ?? event.status;
     if (typeof status === "string" && STATUSES.has(status)) summary.status = status;
     if (item?.type === "agent_message" && typeof item.text === "string") {
