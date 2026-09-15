@@ -794,6 +794,29 @@ Example remote setup flow inside an `oc2oc` conversation:
   - the ACP session was never created or is not visible from the current `HOME`
 - In all cases, verify the configured `agentCommands` work outside Puppenclaw from the same environment the gateway uses
 
+### Missing final answers and interrupted turns
+
+Assistant progress, tool output, and terminal answers are separate. A Codex
+one-shot turn uses its final-message file, or an explicitly final JSON message
+with confirmed turn completion. Commentary alone produces a failed
+`NO_FINAL_MESSAGE` status, never a replay of the previous answer. Native terminal
+failures and unexpected process signals also fail; a user stop remains cancelled
+in statistics. Inspect both `activeTurn.exitCode` and `activeTurn.signal`.
+
+ACPX reconnect banners do not authorize replay. Persisted replies require a
+current-submission identity and observed completion. An automatic retry is limited
+to one explicitly rejected, undispatched queue request; missing acknowledgements
+and partial work are not automatically resubmitted.
+
+On Linux, one-shot diagnostic summaries are stored in the controller's
+`<data-dir>/diagnostics/` directory, using hashed session/turn identifiers and
+owner-only permissions. They retain event metadata, redacted runtime stderr, real
+exit/signal information, and final-file metadata—not credentials, reasoning, or
+raw tool/request payloads. Keep this directory outside every agent mount.
+Records are periodically flushed and limited to 1 MiB per turn, ten turns per
+session, seven days, and 128 MiB globally. Session purge erases its diagnostics.
+Diagnostic persistence failure does not interrupt scientific work.
+
 ## Development
 
 ```bash
