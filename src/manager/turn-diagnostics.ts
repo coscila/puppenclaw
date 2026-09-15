@@ -8,13 +8,15 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
+  readSync,
   readdirSync,
   renameSync,
   rmdirSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, basename, resolve, sep } from "node:path";
+import type { BigIntStats } from "node:fs";
+import { dirname, basename, parse, resolve, sep } from "node:path";
 import { redactSensitiveText } from "../shared/utils.js";
 
 export interface TurnDiagnosticsLimits {
@@ -203,6 +205,126 @@ function at(fd: number, name: string): string {
     throw new Error("Invalid diagnostics path component.");
   }
   return `/proc/self/fd/${fd}/${name}`;
+}
+
+export const MAX_CODEX_FINAL_MESSAGE_BYTES = 2 * 1024 * 1024;
+
+function finalMessageError(code: string): Error & { code: string } {
+  // Do not include the supplied path or an underlying error message: the
+  // model controls the final file and its parent directories.
+  return Object.assign(new Error(`Final assistant message could not be safely read (${code}).`), { code });
+}
+
+function checkFinalMessageFile(stat: BigIntStats): void {
+  if (!stat.isFile() || stat.nlink !== 1n) throw finalMessageError("EUNSAFEFILE");
+  if (stat.size > BigInt(MAX_CODEX_FINAL_MESSAGE_BYTES)) throw finalMessageError("EFBIG");
+}
+
+function sameFile(left: BigIntStats, right: BigIntStats): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function inspectPortableParents(path: string): Array<{ path: string; stat: BigIntStats }> {
+  const parents: Array<{ path: string; stat: BigIntStats }> = [];
+  let current = dirname(path);
+  const root = parse(current).root;
+  for (;;) {
+    const stat = lstatSync(current, { bigint: true });
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw finalMessageError("EUNSAFEFILE");
+    parents.push({ path: current, stat });
+    if (current === root) break;
+    const parent = dirname(current);
+    if (parent === current) throw finalMessageError("EUNSAFEFILE");
+    current = parent;
+  }
+  return parents;
+}
+
+/**
+ * Read a model-created final answer without crossing the workspace filesystem
+ * boundary through symlinks or hardlinks. Linux pins every ancestor descriptor,
+ * including across concurrent renames. Other platforms retain bounded ordinary
+ * descriptor reads with no-symlink and pre/post identity checks; Node does not
+ * expose a portable openat primitive for the stronger Linux race guarantee.
+ * Oversized or concurrently changed output fails closed, never returns a prefix.
+ */
+export async function readCodexFinalMessageFile(path: string): Promise<string> {
+  let directory: number | undefined;
+  let file: number | undefined;
+  try {
+    const absolute = resolve(path);
+    const portableParents = process.platform === "linux" ? [] : inspectPortableParents(absolute);
+    if (process.platform === "linux") directory = pinDirectory(dirname(absolute));
+    const target = directory == null ? absolute : at(directory, basename(absolute));
+    const beforeOpen = lstatSync(target, { bigint: true });
+    checkFinalMessageFile(beforeOpen);
+    file = openSync(target, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+    const beforeRead = fstatSync(file, { bigint: true });
+    checkFinalMessageFile(beforeRead);
+    if (!sameFile(beforeOpen, beforeRead)) throw finalMessageError("EFILECHANGED");
+    // One extra byte detects a file that grows after fstat. No readFile call or
+    // unbounded chunk collection is used, even for a malicious changing file.
+    const buffer = Buffer.alloc(MAX_CODEX_FINAL_MESSAGE_BYTES + 1);
+    let bytes = 0;
+    for (;;) {
+      const count = readSync(file, buffer, bytes, Math.min(64 * 1024, buffer.length - bytes), null);
+      if (count === 0) break;
+      bytes += count;
+      if (bytes > MAX_CODEX_FINAL_MESSAGE_BYTES) throw finalMessageError("EFBIG");
+    }
+    const afterRead = fstatSync(file, { bigint: true });
+    checkFinalMessageFile(afterRead);
+    if (!sameFile(beforeRead, afterRead) || beforeRead.size !== afterRead.size ||
+        beforeRead.mtimeNs !== afterRead.mtimeNs || beforeRead.ctimeNs !== afterRead.ctimeNs ||
+        BigInt(bytes) !== afterRead.size) {
+      throw finalMessageError("EFILECHANGED");
+    }
+    for (const parent of portableParents) {
+      const after = lstatSync(parent.path, { bigint: true });
+      if (!after.isDirectory() || after.isSymbolicLink() || !sameFile(parent.stat, after)) {
+        throw finalMessageError("EFILECHANGED");
+      }
+    }
+    if (directory == null) {
+      const after = lstatSync(absolute, { bigint: true });
+      checkFinalMessageFile(after);
+      if (!sameFile(beforeRead, after)) throw finalMessageError("EFILECHANGED");
+    }
+    return buffer.subarray(0, bytes).toString("utf8");
+  } catch (error) {
+    throw finalMessageError(errorCode(error) === "UNKNOWN" ? "EIO" : errorCode(error));
+  } finally {
+    if (file != null) closeSync(file);
+    if (directory != null) closeSync(directory);
+  }
+}
+
+/** Best-effort cleanup; retaining an unsafe file is preferable to unlinking elsewhere. */
+export async function unlinkCodexFinalMessageFile(path: string): Promise<boolean> {
+  // There is no portable descriptor-relative unlink in Node. Keep the private
+  // temporary file on those platforms rather than reintroducing a path race.
+  if (process.platform !== "linux") return false;
+  let directory: number | undefined;
+  let file: number | undefined;
+  try {
+    const absolute = resolve(path);
+    directory = pinDirectory(dirname(absolute));
+    const target = at(directory, basename(absolute));
+    const before = lstatSync(target, { bigint: true });
+    if (!before.isFile() || before.nlink !== 1n) return false;
+    file = openSync(target, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const pinned = fstatSync(file, { bigint: true });
+    const current = lstatSync(target, { bigint: true });
+    if (!pinned.isFile() || pinned.nlink !== 1n || !current.isFile() || current.nlink !== 1n ||
+        !sameFile(before, pinned) || !sameFile(pinned, current)) return false;
+    unlinkSync(target);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    if (file != null) closeSync(file);
+    if (directory != null) closeSync(directory);
+  }
 }
 
 function privateChild(parent: number, name: string, create: boolean): number {

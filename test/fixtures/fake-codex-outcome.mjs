@@ -1,4 +1,5 @@
-import { readFileSync, writeFileSync, writeSync } from "node:fs";
+import { readFileSync, symlinkSync, writeFileSync, writeSync } from "node:fs";
+import { resolve } from "node:path";
 
 const args = process.argv.slice(2);
 const outputPath = args[args.indexOf("--output-last-message") + 1];
@@ -26,6 +27,14 @@ if (scenario === "failed") {
   writeFileSync(outputPath, "Incomplete file answer.");
   emit({ type: "turn.failed", error: { message: "Native turn failed token=fixture-secret" } });
   process.exit(0);
+}
+if (scenario === "unsafe-file") {
+  const target = resolve("private-final-target.txt");
+  writeFileSync(target, "Private fixture data must not become an assistant answer.");
+  symlinkSync(target, outputPath);
+}
+if (scenario === "oversized-file") {
+  writeFileSync(outputPath, "x".repeat(2 * 1024 * 1024 + 1));
 }
 if (["file", "transient", "json-final", "json-no-terminal"].includes(scenario)) {
   const item = { id: "final", type: "agent_message", phase: "final_answer", text: "Explicit JSON final." };

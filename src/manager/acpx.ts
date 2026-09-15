@@ -68,7 +68,7 @@ import {
 } from "../shared/utils.js";
 import type { ISessionManager } from "./interface.js";
 import { CodexEventAdapter } from "./codex-events.js";
-import { TurnDiagnosticsRecorder, purgeSessionDiagnostics } from "./turn-diagnostics.js";
+import { TurnDiagnosticsRecorder, purgeSessionDiagnostics, readCodexFinalMessageFile, unlinkCodexFinalMessageFile } from "./turn-diagnostics.js";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -5118,12 +5118,12 @@ export class AcpxSessionManager implements ISessionManager {
     await Promise.all(dispatchTasks);
 
     let finalReadError: unknown;
-    const finalOutput = (await readFile(outputPath, "utf8").catch((error: unknown) => {
+    const finalOutput = (await readCodexFinalMessageFile(outputPath).catch((error: unknown) => {
       finalReadError = error;
       return "";
     })).trim();
     await diagnostic?.recordFinalFile(outputPath, finalReadError);
-    await unlink(outputPath).catch(() => {});
+    await unlinkCodexFinalMessageFile(outputPath);
     const liveOutput = this.activeTurnOutputs.get(params.session.name)?.text.trim() ?? "";
     const canonicalFinalOutput = sanitizeActiveTurnText(finalOutput);
     const combinedOutput = canonicalFinalOutput || (events.terminalStatus === "completed" ? events.finalAnswer : undefined) || "";

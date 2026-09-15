@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { access } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import { AcpxSessionManager } from "../../src/manager/acpx.js";
@@ -43,6 +43,23 @@ describe("Codex native outcomes through the runner", () => {
     expect(JSON.stringify(result)).not.toContain("fixture-secret");
     expect(JSON.stringify(result)).not.toContain("Incomplete file answer.");
     expect(statisticsStore.page().turns[0]?.state).toBe("failed");
+  });
+
+  it.skipIf(process.platform === "win32")("does not read a final-answer symlink outside its output boundary", async () => {
+    const { root, run, store, statisticsStore } = await setup("unsafe-file");
+    const result = await run();
+    expect(result.details).toMatchObject({ outputRole: "status", session: { state: "failed", failureCode: "NO_FINAL_MESSAGE" } });
+    expect(JSON.stringify(result)).not.toContain("Private fixture data");
+    expect(store.getSession("outcome")?.transcript.filter((entry) => entry.role === "assistant")).toEqual([]);
+    expect(await readFile(join(root, "private-final-target.txt"), "utf8")).toBe("Private fixture data must not become an assistant answer.");
+    expect(statisticsStore.page().turns[0]?.state).toBe("failed");
+  });
+
+  it("rejects oversized final-answer files rather than publishing a truncated answer", async () => {
+    const { run, store } = await setup("oversized-file");
+    const result = await run();
+    expect(result.details).toMatchObject({ outputRole: "status", session: { state: "failed", failureCode: "NO_FINAL_MESSAGE" } });
+    expect(store.getSession("outcome")?.transcript.filter((entry) => entry.role === "assistant")).toEqual([]);
   });
 
   it("rejects a JSON final candidate without terminal completion", async () => {
