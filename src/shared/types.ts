@@ -556,6 +556,8 @@ export type PromptEvent =
       message: string;
       code?: string;
       retryable?: boolean;
+      detailCode?: string;
+      origin?: string;
     };
 
 export type CommandParseResult =

@@ -3651,7 +3651,8 @@ process.exit(1);
     expect(details.outputRole).toBe("status");
     expect(details.output).toBe("Runner completed without a final assistant message.");
     expect(details.turnSignals?.stopReason).toBe("no_final_message");
-    expect(details.session.state).toBe("idle");
+    expect(details.session.state).toBe("failed");
+    expect(details.session.activeTurn?.state).toBe("failed");
     expect(
       details.session.transcript
         .filter((entry) => entry.role === "assistant")
@@ -3760,7 +3761,8 @@ process.exit(1);
     expect(details.outputRole).toBe("status");
     expect(details.output).toBe("Runner completed without a final assistant message.");
     expect(details.turnSignals?.stopReason).toBe("no_final_message");
-    expect(details.session.state).toBe("idle");
+    expect(details.session.state).toBe("failed");
+    expect(details.session.activeTurn?.state).toBe("failed");
     expect(details.session.transcript.at(-1)).toMatchObject({
       role: "status",
       text: "Runner completed without a final assistant message."

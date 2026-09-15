@@ -8,7 +8,7 @@ import { SessionStore } from "../shared/store.js";
 import { requiresFreshClaudeTranscript } from "../shared/model-compatibility.js";
 import { UsageLedgerStore } from "../shared/usage-ledger.js";
 import type { TurnStatisticsRecorder } from "../statistics/recorder.js";
-import { hasNonzeroUsage, normalizeCodexUsage, normalizeUsage } from "../shared/usage.js";
+import { hasNonzeroUsage, normalizeUsage } from "../shared/usage.js";
 import { DEFAULT_MAX_SESSIONS } from "../shared/schema.js";
 import { ensureError, PuppenclawError } from "../shared/errors.js";
 import type { PluginLogger } from "../shared/logger.js";
@@ -64,10 +64,11 @@ import type {
 import {
   loadContextFiles,
   nowIso,
-  redactSensitiveText,
-  summarizePromptEvents
+  redactSensitiveText
 } from "../shared/utils.js";
 import type { ISessionManager } from "./interface.js";
+import { CodexEventAdapter } from "./codex-events.js";
+import { TurnDiagnosticsRecorder, purgeSessionDiagnostics } from "./turn-diagnostics.js";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -306,8 +307,14 @@ const PACKAGE_SKILLS_ROOT = resolvePath(
   "..",
   "skills"
 );
-const RECONNECT_HISTORY_TIMEOUT_MS = 120_000;
+const RECONNECT_HISTORY_TIMEOUT_MS = 5_000;
 const RECONNECT_HISTORY_POLL_MS = 750;
+const SAFE_PRE_DISPATCH_QUEUE_REJECTIONS: ReadonlySet<string> = new Set([
+  "QUEUE_OWNER_CLOSED",
+  "QUEUE_OWNER_SHUTTING_DOWN",
+  "QUEUE_OWNER_OVERLOADED",
+  "QUEUE_OWNER_GENERATION_MISMATCH"
+]);
 const MAX_ACTIVE_TURN_OUTPUT_CHARS = 120_000;
 const MAX_CODEX_EVENT_TEXT_CHARS = 6_000;
 const QUIESCENCE_CONTROL_TIMEOUT_MS = 1_000;
@@ -714,269 +721,6 @@ function extractTextContent(value: unknown): string[] {
   return directText != null ? [directText] : [];
 }
 
-function extractVisibleContentText(value: unknown): string[] {
-  if (typeof value === "string") {
-    return [value];
-  }
-  if (Array.isArray(value)) {
-    return value.flatMap((entry) => extractVisibleContentText(entry));
-  }
-  if (!isRecord(value)) {
-    return [];
-  }
-  const type = asTrimmedString(value.type).toLowerCase();
-  if (/(reasoning|thinking|thought)/iu.test(type)) {
-    return [];
-  }
-  const text =
-    typeof value.text === "string"
-      ? value.text
-      : typeof value.output_text === "string"
-        ? value.output_text
-        : typeof value.content === "string"
-          ? value.content
-          : undefined;
-  return text != null ? [text] : [];
-}
-
-function extractCodexLiveOutput(event: JsonRecord): string | undefined {
-  const type = asTrimmedString(event.type).toLowerCase();
-  if (/(reasoning|thinking|thought)/iu.test(type)) {
-    return undefined;
-  }
-
-  const item =
-    (isRecord(event.item) ? event.item : undefined) ??
-    (isRecord(event.output_item) ? event.output_item : undefined) ??
-    (isRecord(event.content) ? event.content : undefined);
-  const subject = item ?? event;
-  const subjectType = asTrimmedString(subject.type).toLowerCase();
-  if (/(reasoning|thinking|thought)/iu.test(subjectType)) {
-    return undefined;
-  }
-
-  // Tool protocol records are exposed only through structured activity
-  // events. Check them before generic message/delta extraction because some
-  // compatible providers wrap tool calls in message-shaped envelopes.
-  const toolName = extractToolCallName(event, subject);
-  if (
-    toolName != null ||
-    isToolCallEvent(type, subjectType) ||
-    isToolOutputEvent(type, subjectType)
-  ) {
-    return undefined;
-  }
-
-  const assistantText = extractVisibleContentText(subject.content).join("");
-  if (assistantText.length > 0 && isAssistantLikeEvent(type, subject)) {
-    return assistantText;
-  }
-
-  const deltaText =
-    typeof event.delta === "string"
-      ? event.delta
-      : typeof event.text === "string" && /(?:message|output|text).*delta/iu.test(type)
-        ? event.text
-        : undefined;
-  if (deltaText != null) {
-    return deltaText;
-  }
-
-  if (type === "error" || subjectType === "error") {
-    const message =
-      asOptionalString(event.message) ??
-      asOptionalString(subject.message) ??
-      asOptionalString(event.error) ??
-      "Codex reported an error.";
-    if (isTransientCodexReconnectMessage(message)) {
-      return undefined;
-    }
-    return `\n[error] ${message}\n`;
-  }
-
-  return undefined;
-}
-
-function extractCodexActivity(event: JsonRecord):
-  | {
-      type: "tool_call" | "tool_output";
-      text?: string;
-      title?: string;
-    }
-  | null {
-  const type = asTrimmedString(event.type).toLowerCase();
-  const item =
-    (isRecord(event.item) ? event.item : undefined) ??
-    (isRecord(event.output_item) ? event.output_item : undefined) ??
-    (isRecord(event.content) ? event.content : undefined);
-  const subject = item ?? event;
-  const subjectType = asTrimmedString(subject.type).toLowerCase();
-  const toolName = extractToolCallName(event, subject);
-  if (toolName != null || isToolCallEvent(type, subjectType)) {
-    const args = extractToolCallArguments(event, subject);
-    return {
-      type: "tool_call",
-      title: toolName ?? "tool",
-      ...(args != null
-        ? { text: sanitizeActiveTurnText(truncateOneLine(args, 280)) }
-        : {})
-    };
-  }
-  if (isToolOutputEvent(type, subjectType)) {
-    const output =
-      asOptionalString(subject.output) ??
-      asOptionalString(subject.result) ??
-      asOptionalString(event.output) ??
-      extractVisibleContentText(subject.content).join("");
-    return {
-      type: "tool_output",
-      ...(output != null
-        ? { text: sanitizeActiveTurnText(tailText(output, MAX_CODEX_EVENT_TEXT_CHARS)) }
-        : {})
-    };
-  }
-  return null;
-}
-
-function extractToolCallName(...roots: unknown[]): string | undefined {
-  for (const root of roots) {
-    const direct = extractToolCallNameFromRecord(root);
-    if (direct != null) {
-      return direct;
-    }
-  }
-  return undefined;
-}
-
-function extractToolCallNameFromRecord(value: unknown, depth = 0): string | undefined {
-  if (depth > 5 || !isRecord(value)) {
-    return undefined;
-  }
-  const direct =
-    asOptionalString(value.name) ??
-    asOptionalString(value.tool_name) ??
-    asOptionalString(value.function_name);
-  if (direct != null && isLikelyToolCallRecord(value)) {
-    return direct;
-  }
-  const functionRecord = isRecord(value.function) ? value.function : undefined;
-  const functionName = asOptionalString(functionRecord?.name);
-  if (functionName != null) {
-    return functionName;
-  }
-  for (const key of ["tool_call", "function_call", "raw_item", "item", "output_item"]) {
-    const nested = extractToolCallNameFromRecord(value[key], depth + 1);
-    if (nested != null) {
-      return nested;
-    }
-  }
-  for (const key of ["tool_calls", "function_calls", "content", "output"]) {
-    const collection = value[key];
-    if (!Array.isArray(collection)) {
-      continue;
-    }
-    for (const entry of collection) {
-      const nested = extractToolCallNameFromRecord(entry, depth + 1);
-      if (nested != null) {
-        return nested;
-      }
-    }
-  }
-  return undefined;
-}
-
-function extractToolCallArguments(...roots: unknown[]): string | undefined {
-  for (const root of roots) {
-    const args = extractToolCallArgumentsFromRecord(root);
-    if (args != null) {
-      return args;
-    }
-  }
-  return undefined;
-}
-
-function extractToolCallArgumentsFromRecord(value: unknown, depth = 0): string | undefined {
-  if (depth > 5 || !isRecord(value)) {
-    return undefined;
-  }
-  const direct =
-    asOptionalString(value.arguments) ??
-    asOptionalString(value.args) ??
-    asOptionalString(value.input);
-  if (direct != null && isLikelyToolCallRecord(value)) {
-    return direct;
-  }
-  const functionRecord = isRecord(value.function) ? value.function : undefined;
-  const functionArgs =
-    asOptionalString(functionRecord?.arguments) ?? asOptionalString(functionRecord?.args);
-  if (functionArgs != null) {
-    return functionArgs;
-  }
-  for (const key of ["tool_call", "function_call", "raw_item", "item", "output_item"]) {
-    const nested = extractToolCallArgumentsFromRecord(value[key], depth + 1);
-    if (nested != null) {
-      return nested;
-    }
-  }
-  for (const key of ["tool_calls", "function_calls", "content", "output"]) {
-    const collection = value[key];
-    if (!Array.isArray(collection)) {
-      continue;
-    }
-    for (const entry of collection) {
-      const nested = extractToolCallArgumentsFromRecord(entry, depth + 1);
-      if (nested != null) {
-        return nested;
-      }
-    }
-  }
-  return undefined;
-}
-
-function isLikelyToolCallRecord(value: JsonRecord): boolean {
-  const type = asTrimmedString(value.type).toLowerCase();
-  return (
-    /(?:tool|function)_?call/iu.test(type) ||
-    isRecord(value.function) ||
-    value.tool_name != null ||
-    value.function_name != null ||
-    value.arguments != null ||
-    value.args != null
-  );
-}
-
-function isTransientCodexReconnectMessage(message: string): boolean {
-  return (
-    /reconnecting\.\.\.\s+\d+\/\d+/iu.test(message) &&
-    /stream disconnected before completion|operation was aborted due to timeout|timeout/iu.test(
-      message
-    )
-  );
-}
-
-function isAssistantLikeEvent(type: string, subject: JsonRecord): boolean {
-  const role = asTrimmedString(subject.role).toLowerCase();
-  const subjectType = asTrimmedString(subject.type).toLowerCase();
-  return (
-    role === "assistant" ||
-    /assistant|message|output_text/iu.test(type) ||
-    /assistant|message|output_text/iu.test(subjectType)
-  );
-}
-
-function isToolCallEvent(type: string, subjectType: string): boolean {
-  return (
-    (/(?:tool|function)_?call/iu.test(type) || /(?:tool|function)_?call/iu.test(subjectType)) &&
-    !isToolOutputEvent(type, subjectType)
-  );
-}
-
-function isToolOutputEvent(type: string, subjectType: string): boolean {
-  return /(?:tool|function)_?(?:call_)?output|command_output|exec_output/iu.test(
-    `${type} ${subjectType}`
-  );
-}
-
 function sanitizeActiveTurnText(text: string): string {
   return redactSensitiveText(text);
 }
@@ -996,46 +740,72 @@ function tailText(text: string, maxChars: number): string {
   return `[truncated ${text.length - maxChars} chars]\n${text.slice(-maxChars)}`;
 }
 
-function extractLatestAgentText(
-  sessionRecord: JsonRecord | null | undefined,
-  afterMessageCount: number | undefined
-): string | undefined {
-  const messages = readMessages(sessionRecord);
-  const candidates =
-    afterMessageCount != null && afterMessageCount >= 0
-      ? messages.slice(afterMessageCount)
-      : messages.slice(-8);
-  for (const entry of candidates.toReversed()) {
-    if (!isRecord(entry) || !isRecord(entry.Agent)) {
-      continue;
-    }
-    const text = extractTextContent(entry.Agent.content).join("\n\n").trim();
-    if (text.length > 0) {
-      return text;
-    }
-  }
-  return undefined;
+type RuntimeTurnCursor = {
+  recordId: string;
+  userIds: ReadonlySet<string>;
+  serializedSubmissionState: string;
+};
+
+function runtimeSubmissionState(record: JsonRecord): string {
+  return JSON.stringify({
+    messages: readMessages(record),
+    lastRequestId: record.lastRequestId,
+    lastPromptAt: record.lastPromptAt
+  });
 }
 
-function extractLatestAssistantHistoryText(
-  historyRecord: JsonRecord | null | undefined,
-  sinceMs: number
-): string | undefined {
-  const entries = Array.isArray(historyRecord?.entries) ? historyRecord.entries : [];
-  for (const entry of [...entries].reverse()) {
-    if (!isRecord(entry) || asTrimmedString(entry.role).toLowerCase() !== "assistant") {
-      continue;
-    }
-    const timestampMs = Date.parse(asTrimmedString(entry.timestamp));
-    if (Number.isFinite(timestampMs) && timestampMs < sinceMs - 5_000) {
-      continue;
-    }
-    const text = asOptionalString(entry.text) ?? asOptionalString(entry.textPreview);
-    if (text != null) {
-      return text;
-    }
+function runtimeTurnCursor(record: JsonRecord | null): RuntimeTurnCursor | undefined {
+  const recordId = asOptionalString(record?.acpxRecordId);
+  if (record == null || recordId == null || !Array.isArray(record.messages)) {
+    return undefined;
   }
-  return undefined;
+  const userIds = new Set<string>();
+  for (const message of record.messages) {
+    if (!isRecord(message) || !isRecord(message.User)) continue;
+    const id = asOptionalString(message.User.id);
+    if (id == null || userIds.has(id)) return undefined;
+    userIds.add(id);
+  }
+  return { recordId, userIds, serializedSubmissionState: runtimeSubmissionState(record) };
+}
+
+function isRuntimeSubmissionUnchanged(
+  cursor: RuntimeTurnCursor | undefined,
+  record: JsonRecord | null
+): boolean {
+  return cursor != null && record != null && record.acpxRecordId === cursor.recordId &&
+    Array.isArray(record.messages) &&
+    runtimeSubmissionState(record) === cursor.serializedSubmissionState;
+}
+
+function extractCurrentTurnAgentText(
+  record: JsonRecord | null,
+  cursor: RuntimeTurnCursor | undefined,
+  promptText: string
+): string | undefined {
+  if (cursor == null || record?.acpxRecordId !== cursor.recordId) return undefined;
+  const messages = readMessages(record);
+  let promptIndex: number | undefined;
+  // ACPX history timestamps describe the whole record, not individual messages.
+  // Only a unique new User.id can identify this submission. Replayed/ambiguous
+  // user messages or an unidentifiable baseline must never resurrect old output.
+  for (const [index, message] of messages.entries()) {
+    if (!isRecord(message) || !isRecord(message.User)) continue;
+    const id = asOptionalString(message.User.id);
+    if (id == null) return undefined;
+    if (cursor.userIds.has(id)) {
+      if (promptIndex != null) return undefined;
+      continue;
+    }
+    if (promptIndex != null || extractTextContent(message.User.content).join("\n\n") !== promptText) {
+      return undefined;
+    }
+    promptIndex = index;
+  }
+  if (promptIndex == null) return undefined;
+  return messages.slice(promptIndex + 1).flatMap((message) =>
+    isRecord(message) && isRecord(message.Agent) ? extractTextContent(message.Agent.content) : []
+  ).join("\n\n").trim() || undefined;
 }
 
 function createTextDeltaEvent(input: {
@@ -1259,6 +1029,18 @@ function parsePromptEventLine(line: string): PromptEvent | null {
           ...(hasNonzeroUsage(usage) ? { usage } : {})
         };
       }
+      case "status": {
+        const usage = normalizeUsage(structured.payload.usage);
+        const used = asOptionalFiniteNumber(structured.payload.used);
+        const size = asOptionalFiniteNumber(structured.payload.size);
+        return {
+          type: "status",
+          text: asOptionalString(structured.payload.text) ?? asOptionalString(structured.payload.summary) ?? "ACP status updated",
+          ...(used != null ? { used } : {}),
+          ...(size != null ? { size } : {}),
+          ...(hasNonzeroUsage(usage) ? { usage } : {})
+        };
+      }
       case "done": {
         const stopReason = asOptionalString(structured.payload.stopReason);
         return {
@@ -1268,6 +1050,8 @@ function parsePromptEventLine(line: string): PromptEvent | null {
       }
       case "error": {
         const code = asOptionalString(structured.payload.code);
+        const detailCode = asOptionalString(structured.payload.detailCode);
+        const origin = asOptionalString(structured.payload.origin);
         const retryable =
           typeof structured.payload.retryable === "boolean"
             ? structured.payload.retryable
@@ -1276,6 +1060,8 @@ function parsePromptEventLine(line: string): PromptEvent | null {
           type: "error",
           message: asOptionalString(structured.payload.message) ?? "ACP runtime error",
           ...(code != null ? { code } : {}),
+          ...(detailCode != null ? { detailCode } : {}),
+          ...(origin != null ? { origin } : {}),
           ...(retryable != null ? { retryable } : {})
         };
       }
@@ -1465,10 +1251,10 @@ function resolveSpawnCommand(commandText: string, args: string[]): SpawnCommand 
   };
 }
 
-function childExit(child: ChildProcess): Promise<number | null> {
-  return new Promise<number | null>((resolve, reject) => {
+function childExit(child: ChildProcess): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  return new Promise((resolve, reject) => {
     child.once("error", reject);
-    child.once("close", (code) => resolve(code));
+    child.once("close", (code, signal) => resolve({ code, signal }));
   });
 }
 
@@ -2773,6 +2559,7 @@ export class AcpxSessionManager implements ISessionManager {
           });
         }
       }
+      await purgeSessionDiagnostics(this.deps.store.rootDir, params.name);
       await this.deps.store.removeSession(params.name);
       this.deps.outputRouter.clear(params.name);
       this.activeTurnOutputs.delete(params.name);
@@ -4566,46 +4353,24 @@ export class AcpxSessionManager implements ISessionManager {
     return parseJsonLines(result.stdout).find((event) => toErrorRecord(event) == null) ?? null;
   }
 
-  private async getRuntimeMessageCount(session: SessionInfo): Promise<number | undefined> {
-    const record = await this.getRuntimeSessionRecord(session);
-    return record != null ? readMessages(record).length : undefined;
-  }
-
-  private async getRuntimeSessionHistory(session: SessionInfo): Promise<JsonRecord | null> {
-    const runtimeEnv = this.modelProviderRuntimeEnv(session.modelProvider);
-    const result = await this.runControlCommand({
-      args: this.buildVerbArgs(session.agent, session.directory, [
-        "sessions",
-        "history",
-        "--limit",
-        "8",
-        session.name
-      ]),
-      cwd: session.directory,
-      ...(runtimeEnv != null ? { env: runtimeEnv } : {})
-    });
-    return parseJsonLines(result.stdout).find((event) => toErrorRecord(event) == null) ?? null;
-  }
-
   private async waitForDelayedAssistantOutput(params: {
     session: SessionInfo;
-    afterMessageCount: number | undefined;
-    sinceMs: number;
+    cursor: RuntimeTurnCursor;
+    promptText: string;
   }): Promise<string | undefined> {
     const deadline = Date.now() + RECONNECT_HISTORY_TIMEOUT_MS;
     while (Date.now() < deadline) {
+      if (this.stopRequests.has(params.session.name)) return undefined;
       try {
         const record = await this.getRuntimeSessionRecord(params.session);
-        const output = extractLatestAgentText(record, params.afterMessageCount);
+        if (this.stopRequests.has(params.session.name)) return undefined;
+        const output = extractCurrentTurnAgentText(record, params.cursor, params.promptText);
         if (output != null) {
           return output;
         }
-        const history = await this.getRuntimeSessionHistory(params.session);
-        const historyOutput = extractLatestAssistantHistoryText(history, params.sinceMs);
-        if (historyOutput != null) {
-          return historyOutput;
-        }
+        if (record?.acpxRecordId !== params.cursor.recordId) return undefined;
       } catch (error) {
+        if (this.stopRequests.has(params.session.name)) return undefined;
         this.deps.logger.debug(
           `Waiting for delayed ACPX output for ${params.session.name}: ${ensureError(error).message}`
         );
@@ -4732,7 +4497,6 @@ export class AcpxSessionManager implements ISessionManager {
     permissionMode: PermissionMode;
     interactionMode?: InteractionMode;
     retryAfterReconnect?: boolean;
-    baselineMessageCount?: number;
   }): Promise<TurnResult> {
     const nativeMode = await this.prepareNativeInteractionMode(params);
     let turn: TurnResult;
@@ -4776,27 +4540,22 @@ export class AcpxSessionManager implements ISessionManager {
     permissionMode: PermissionMode;
     interactionMode?: InteractionMode;
     retryAfterReconnect?: boolean;
-    baselineMessageCount?: number;
   }): Promise<TurnResult> {
     this.deps.store.assertSessionMutable(params.session.name);
     if (this.usesOneShotRuntime(params.session)) {
       return await this.runCodexOneShotTurn(params);
     }
 
-    const oneShotRuntime = this.usesOneShotRuntime(params.session);
-    const baselineMessageCount = oneShotRuntime
-      ? undefined
-      : (params.baselineMessageCount ??
-        (await this.getRuntimeMessageCount(params.session).catch(() => undefined)));
+    const cursor = runtimeTurnCursor(
+      await this.getRuntimeSessionRecord(params.session).catch(() => null)
+    );
     const promptStartedAtMs = Date.now();
     await this.startActiveTurnOutput(params.session);
     this.assertTurnWasNotStopped(params.session.name);
     const args = this.buildVerbArgs(
       params.session.agent,
       params.session.directory,
-      oneShotRuntime
-        ? ["exec", "--file", "-"]
-        : ["prompt", "--session", params.session.name, "--file", "-"],
+      ["prompt", "--session", params.session.name, "--file", "-"],
       true,
       params.permissionMode
     );
@@ -4958,7 +4717,7 @@ export class AcpxSessionManager implements ISessionManager {
       stderr += chunk;
     });
 
-    const exitCode = await exit.catch((error) => {
+    const { code: exitCode, signal: exitSignal } = await exit.catch((error) => {
       this.completeActiveTurnOutput(params.session.name);
       throw normalizeProviderError(
         params.session,
@@ -4973,71 +4732,52 @@ export class AcpxSessionManager implements ISessionManager {
 
     await Promise.all(dispatchTasks);
 
-    const output = outputChunks.join("").trim() || summarizePromptEvents(events).trim();
+    const stoppedTurn = (): TurnResult | undefined => {
+      if (!this.stopRequests.has(params.session.name) &&
+          this.deps.store.getSession(params.session.name)?.state !== "stopped") return undefined;
+      this.completeActiveTurnOutput(params.session.name);
+      return {
+        output: "Turn stopped by user.",
+        outputRole: "status",
+        warnings: [],
+        transcript: [{ role: "status", text: "Turn stopped by user.", createdAt: nowIso() }],
+        state: "stopped",
+        ...(latestTokenUsage != null ? { tokenUsage: latestTokenUsage } : {}),
+        ...(latestNormalizedUsage != null ? { usage: latestNormalizedUsage } : {})
+      };
+    };
+    let stopped = stoppedTurn();
+    if (stopped != null) return stopped;
+    let output = outputChunks.join("").trim();
     const doneEvent = events.findLast(
       (event): event is Extract<PromptEvent, { type: "done" }> => event.type === "done"
     );
     const turnStopReason = doneEvent?.stopReason;
     const promptSignals = signalsFromPromptEvents(events);
     const turnDurationMs = Date.now() - promptStartedAtMs;
-    const errorEvent = events.find(
+    const errorEvents = events.filter(
       (event): event is Extract<PromptEvent, { type: "error" }> => event.type === "error"
     );
-    const reconnectEvent = events.find(
-      (event): event is Extract<PromptEvent, { type: "status" }> =>
-        event.type === "status" && /needs reconnect/iu.test(event.text)
-    );
-    const reconnectText =
-      reconnectEvent?.text ??
-      (errorEvent != null && /needs reconnect/iu.test(errorEvent.message)
-        ? errorEvent.message
-        : undefined) ??
-      (/needs reconnect/iu.test(stderr) ? stderr.trim() : undefined);
-    if (reconnectText != null && !oneShotRuntime) {
-      const safeReconnectText = sanitizeActiveTurnText(reconnectText);
-      this.deps.logger.warn(
-        `ACPX session ${params.session.name} requested reconnect; waiting for delayed assistant output.`
-      );
-      const delayedOutput = await this.waitForDelayedAssistantOutput({
-        session: params.session,
-        afterMessageCount: baselineMessageCount,
-        sinceMs: promptStartedAtMs
-      });
-      const recoveredOutput = delayedOutput ?? outputChunks.join("").trim();
-      if (recoveredOutput.length > 0) {
-        // Claude can persist a synthetic authentication diagnostic before its
-        // transport asks to reconnect. That is not a delayed model answer.
-        // Match the native diagnostic prefix, not ordinary prose discussing
-        // OAuth credentials, then reuse the standard safe provider error.
-        const recoveredFailure =
-          params.session.agent === "claude" && /^Failed to authenticate:/u.test(recoveredOutput.trim())
-            ? classifyProviderFailure({ agent: "claude", message: recoveredOutput })
-            : null;
-        if (recoveredFailure != null) {
-          await this.deps.outputRouter.onError(
-            params.session.name,
-            new PuppenclawError(recoveredFailure.code, recoveredFailure.message),
-            { code: recoveredFailure.code, retryable: recoveredFailure.retryable }
-          );
-          this.completeActiveTurnOutput(params.session.name);
-          return failedProviderTurn(recoveredFailure);
-        }
-        this.deps.logger.info(
-          `Recovered delayed ACPX assistant output for ${params.session.name}.`
-        );
-        const result = await this.finishSuccessfulTurn({
-          sessionName: params.session.name,
-          output: recoveredOutput,
-          ...(promptSignals != null ? { signals: promptSignals } : {}),
-          ...(latestTokenUsage != null ? { tokenUsage: latestTokenUsage } : {}),
-          ...(latestNormalizedUsage != null ? { usage: latestNormalizedUsage } : {}),
-          ...(turnStopReason != null ? { stopReason: turnStopReason } : {}),
-          durationMs: turnDurationMs
-        });
-        this.completeActiveTurnOutput(params.session.name);
-        return result;
-      }
-      if (params.retryAfterReconnect !== true) {
+    const errorEvent = errorEvents.find((event) => classifyProviderFailure({
+      agent: params.session.agent, ...event
+    })?.code === "PROVIDER_AUTHENTICATION_REQUIRED") ?? errorEvents[0];
+    const postTurnRecord = cursor != null && (errorEvent != null || exitCode !== 0 || exitSignal != null)
+      ? await this.getRuntimeSessionRecord(params.session).catch(() => null)
+      : null;
+    stopped = stoppedTurn();
+    if (stopped != null) return stopped;
+    // Queue acknowledgement can be lost after dispatch. Only an explicit
+    // pre-execution rejection plus unchanged submission state permits replay.
+    // A normal "agent needs reconnect" banner is not a failure signal at all.
+    if (errorEvents.length === 1 && errorEvent?.origin === "queue" &&
+        SAFE_PRE_DISPATCH_QUEUE_REJECTIONS.has(errorEvent.detailCode ?? "") &&
+        errorEvent.retryable !== false && exitSignal == null && exitCode != null &&
+        params.retryAfterReconnect !== true &&
+        outputChunks.length === 0 && latestNormalizedUsage == null &&
+        events.every((event) => event.type === "error" || event.type === "status") &&
+        isRuntimeSubmissionUnchanged(cursor, postTurnRecord)) {
+      const providerFailure = classifyProviderFailure({ agent: params.session.agent, ...errorEvent });
+      if (providerFailure?.code !== "PROVIDER_AUTHENTICATION_REQUIRED") {
         await this.waitForRuntimeSessionReady({
           name: params.session.name,
           agent: params.session.agent,
@@ -5046,44 +4786,35 @@ export class AcpxSessionManager implements ISessionManager {
             ? { modelProvider: params.session.modelProvider }
             : {})
         });
-        return await this.runRuntimeTurn({
-          session: params.session,
-          promptText: params.promptText,
-          permissionMode: params.permissionMode,
-          ...(params.interactionMode != null ? { interactionMode: params.interactionMode } : {}),
-          retryAfterReconnect: true,
-          ...(baselineMessageCount != null ? { baselineMessageCount } : {})
-        });
+        stopped = stoppedTurn();
+        if (stopped != null) return stopped;
+        // Re-check after waiting: another producer may have submitted meanwhile.
+        const readyRecord = await this.getRuntimeSessionRecord(params.session).catch(() => null);
+        stopped = stoppedTurn();
+        if (stopped != null) return stopped;
+        if (isRuntimeSubmissionUnchanged(cursor, readyRecord)) {
+          return await this.runRuntimeTurn({
+            session: params.session,
+            promptText: params.promptText,
+            permissionMode: params.permissionMode,
+            ...(params.interactionMode != null ? { interactionMode: params.interactionMode } : {}),
+            retryAfterReconnect: true
+          });
+        }
       }
-      const reconnectFailure = classifyProviderFailure({
-        agent: params.session.agent,
-        code: "CONNECTION_FAILED",
-        message: safeReconnectText,
-        retryable: true
-      });
-      if (reconnectFailure != null) {
-        await this.deps.outputRouter.onError(
-          params.session.name,
-          new PuppenclawError(reconnectFailure.code, reconnectFailure.message),
-          { code: reconnectFailure.code, retryable: reconnectFailure.retryable }
-        );
-        this.completeActiveTurnOutput(params.session.name);
-        return failedProviderTurn(reconnectFailure);
-      }
-      await this.deps.outputRouter.onError(params.session.name, new Error(safeReconnectText));
+    }
+    const currentDiagnostic = output || extractCurrentTurnAgentText(postTurnRecord, cursor, params.promptText);
+    const nativeAuthFailure = params.session.agent === "claude" && currentDiagnostic != null &&
+      /^Failed to authenticate:/u.test(currentDiagnostic.trim())
+      ? classifyProviderFailure({ agent: "claude", message: currentDiagnostic }) : null;
+    if (nativeAuthFailure != null) {
+      await this.deps.outputRouter.onError(
+        params.session.name,
+        new PuppenclawError(nativeAuthFailure.code, nativeAuthFailure.message),
+        { code: nativeAuthFailure.code, retryable: nativeAuthFailure.retryable }
+      );
       this.completeActiveTurnOutput(params.session.name);
-      return {
-        output: safeReconnectText,
-        warnings: [],
-        transcript: [
-          {
-            role: "status",
-            text: safeReconnectText,
-            createdAt: nowIso()
-          }
-        ],
-        state: "failed"
-      };
+      return failedProviderTurn(nativeAuthFailure);
     }
     if (errorEvent != null) {
       const safeErrorMessage = sanitizeActiveTurnText(errorEvent.message);
@@ -5123,9 +4854,9 @@ export class AcpxSessionManager implements ISessionManager {
         state: "failed"
       };
     }
-    if ((exitCode ?? 0) !== 0) {
+    if (exitCode !== 0 || exitSignal != null) {
       const message = sanitizeActiveTurnText(
-        stderr.trim() || `acpx exited with code ${exitCode ?? "unknown"}`
+        stderr.trim() || `acpx exited with code ${exitCode ?? "unknown"}${exitSignal != null ? ` (${exitSignal})` : ""}`
       );
       this.deps.logger.warn(
         `ACPX session ${params.session.name} exited with code ${exitCode ?? "unknown"}: ${message}`
@@ -5159,6 +4890,48 @@ export class AcpxSessionManager implements ISessionManager {
       };
     }
 
+    if (doneEvent == null) {
+      const message = "ACP runtime ended without confirming completion of the current turn; partial work may have been saved.";
+      await this.deps.outputRouter.onError(params.session.name, new PuppenclawError("ACP_TURN_INCOMPLETE", message), {
+        code: "ACP_TURN_INCOMPLETE", retryable: false
+      });
+      this.completeActiveTurnOutput(params.session.name);
+      return {
+        output: message,
+        outputRole: "status",
+        warnings: [],
+        transcript: [{ role: "status", text: message, createdAt: nowIso() }],
+        state: "failed",
+        failureCode: "ACP_TURN_INCOMPLETE",
+        retryable: false,
+        durationMs: turnDurationMs,
+        ...(latestTokenUsage != null ? { tokenUsage: latestTokenUsage } : {}),
+        ...(latestNormalizedUsage != null ? { usage: latestNormalizedUsage } : {})
+      };
+    }
+    // The same invocation must have emitted its terminal completion before any
+    // persisted text can supplement missing streamed output. History text alone
+    // is never proof of completion, even when its submission is identifiable.
+    if (output.length === 0 && cursor != null) {
+      output = await this.waitForDelayedAssistantOutput({
+        session: params.session,
+        cursor,
+        promptText: params.promptText
+      }) ?? "";
+      stopped = stoppedTurn();
+      if (stopped != null) return stopped;
+      const recoveredAuthFailure = params.session.agent === "claude" && /^Failed to authenticate:/u.test(output)
+        ? classifyProviderFailure({ agent: "claude", message: output }) : null;
+      if (recoveredAuthFailure != null) {
+        await this.deps.outputRouter.onError(params.session.name,
+          new PuppenclawError(recoveredAuthFailure.code, recoveredAuthFailure.message),
+          { code: recoveredAuthFailure.code, retryable: recoveredAuthFailure.retryable });
+        this.completeActiveTurnOutput(params.session.name);
+        return failedProviderTurn(recoveredAuthFailure);
+      }
+    }
+    stopped = stoppedTurn();
+    if (stopped != null) return stopped;
     const result = await this.finishSuccessfulTurn({
       sessionName: params.session.name,
       output,
@@ -5224,6 +4997,20 @@ export class AcpxSessionManager implements ISessionManager {
 
     await this.startActiveTurnOutput(params.session);
     this.assertTurnWasNotStopped(params.session.name);
+    const diagnostic = await TurnDiagnosticsRecorder.start({
+      rootDir: this.deps.store.rootDir,
+      sessionName: params.session.name,
+      turnId: this.activeTurnIds.get(params.session.name)!,
+      agent: params.session.agent,
+      secretValues: Object.entries(env)
+        .filter(([key, value]) => /KEY|TOKEN|SECRET|PASSWORD|DATABASE_URL/u.test(key) && typeof value === "string" && value.length >= 6)
+        .map(([, value]) => value as string),
+      onError: (error) => this.deps.logger.warn(error.message)
+    }).catch(() => {
+      this.deps.logger.warn(`Private turn diagnostics unavailable for ${params.session.name}.`);
+      return undefined;
+    });
+    try {
     const child = spawnCommand.shell
       ? spawn(spawnCommand.command, {
           cwd: params.session.directory,
@@ -5244,15 +5031,15 @@ export class AcpxSessionManager implements ISessionManager {
 
     let stderr = "";
     let pendingStdout = "";
-    const liveOutputChunks: string[] = [];
+    let liveOutputChunks = 0;
     const dispatchTasks: Array<Promise<void>> = [];
-    let latestCodexUsage: NormalizedUsage | undefined;
+    const events = new CodexEventAdapter();
     const appendLiveOutput = (text: string): void => {
       const sanitized = sanitizeActiveTurnText(text);
       if (sanitized.length === 0) {
         return;
       }
-      liveOutputChunks.push(sanitized);
+      liveOutputChunks += 1;
       this.appendActiveTurnOutput(params.session.name, sanitized);
       dispatchTasks.push(this.deps.outputRouter.onChunk(params.session.name, sanitized));
     };
@@ -5263,32 +5050,17 @@ export class AcpxSessionManager implements ISessionManager {
           return;
         }
         this.deps.statistics?.observeEvent(params.session.name, parsed, "codex");
-        const activity = extractCodexActivity(parsed);
-        if (activity != null) {
+        diagnostic?.observeEvent(parsed);
+        const update = events.consume(parsed);
+        for (const activity of update.activities) {
           dispatchTasks.push(this.deps.outputRouter.onActivity(params.session.name, activity));
         }
-        const visibleText = extractCodexLiveOutput(parsed);
+        const visibleText = update.assistantText;
         if (visibleText != null && visibleText.length > 0) {
           appendLiveOutput(visibleText);
         }
-        // Codex exec --json emits per-turn usage on `turn.completed.usage` and
-        // cumulative usage under `token_count.info.total_token_usage`. Capture
-        // it (last-writer-wins → final turn total) so the one-shot runtime
-        // records real tokens instead of nothing.
-        const codexEventType = asTrimmedString(parsed.type).toLowerCase();
-        let codexUsageRaw: unknown;
-        if (codexEventType === "turn.completed") {
-          codexUsageRaw = parsed.usage;
-        } else if (codexEventType === "token_count" && isRecord(parsed.info)) {
-          codexUsageRaw = parsed.info.total_token_usage;
-        }
-        if (isRecord(codexUsageRaw)) {
-          const usage = normalizeCodexUsage(codexUsageRaw);
-          if (hasNonzeroUsage(usage)) {
-            latestCodexUsage = usage;
-          }
-        }
       } catch {
+        diagnostic?.observeEvent({ type: "malformed_json" });
         // `codex exec --json` stdout is a protocol channel. Never turn an
         // unparsable record into assistant prose: it may contain raw tool
         // arguments, tool output, or credentials from a broken relay.
@@ -5314,7 +5086,8 @@ export class AcpxSessionManager implements ISessionManager {
       }
     });
     child.stderr.on("data", (chunk: string) => {
-      stderr += chunk;
+      stderr = `${stderr}${chunk}`.slice(-65_536);
+      diagnostic?.observeStderr(chunk);
     });
 
     // See runTurn: an early child exit must not turn the prompt write EPIPE
@@ -5328,7 +5101,8 @@ export class AcpxSessionManager implements ISessionManager {
     child.stdin.write(buildCodexPermissionPrompt(params.promptText, params.permissionMode));
     child.stdin.end();
 
-    const exitCode = await exit.catch((error) => {
+    const { code: exitCode, signal: exitSignal } = await exit.catch(async (error) => {
+      await diagnostic?.finish({ exitCode: null, signal: null, outcome: "failed", reasonCode: "CODEX_TURN_FAILED" }).catch(() => {});
       this.setActiveTurnOutput(params.session.name, `\n[error] ${ensureError(error).message}\n`);
       this.completeActiveTurnOutput(params.session.name);
       throw normalizeProviderError(
@@ -5343,18 +5117,48 @@ export class AcpxSessionManager implements ISessionManager {
     }
     await Promise.all(dispatchTasks);
 
-    const finalOutput = (await readFile(outputPath, "utf8").catch(() => "")).trim();
+    let finalReadError: unknown;
+    const finalOutput = (await readFile(outputPath, "utf8").catch((error: unknown) => {
+      finalReadError = error;
+      return "";
+    })).trim();
+    await diagnostic?.recordFinalFile(outputPath, finalReadError);
     await unlink(outputPath).catch(() => {});
-    const liveOutput = liveOutputChunks.join("").trim();
+    const liveOutput = this.activeTurnOutputs.get(params.session.name)?.text.trim() ?? "";
     const canonicalFinalOutput = sanitizeActiveTurnText(finalOutput);
-    const combinedOutput = canonicalFinalOutput || liveOutput;
+    const combinedOutput = canonicalFinalOutput || (events.terminalStatus === "completed" ? events.finalAnswer : undefined) || "";
+    const latestCodexUsage = events.latestUsage;
+    const stopped = this.stopRequests.has(params.session.name) || this.deps.store.getSession(params.session.name)?.state === "stopped";
+    const nativeFailed = exitCode !== 0 || exitSignal != null || events.terminalStatus === "failed";
+    await diagnostic?.finish({
+      exitCode,
+      signal: exitSignal,
+      outcome: stopped ? "stopped" : nativeFailed || !combinedOutput ? "failed" : "completed",
+      ...(nativeFailed ? { reasonCode: "CODEX_TURN_FAILED" } : !combinedOutput ? { reasonCode: "NO_FINAL_MESSAGE" } : {})
+    }).catch(() => this.deps.logger.warn(`Unable to finalize private diagnostics for ${params.session.name}.`));
 
-    if ((exitCode ?? 0) !== 0) {
+    // A stop is an intentional cancellation, not an unexpected process fault.
+    // The lifecycle persistence path keeps the stopped state and partial usage.
+    if (stopped) {
+      this.completeActiveTurnOutput(params.session.name);
+      return {
+        output: "Turn stopped by user.",
+        outputRole: "status",
+        warnings: [],
+        transcript: [{ role: "status", text: "Turn stopped by user.", createdAt: nowIso() }],
+        state: "stopped",
+        ...(latestCodexUsage != null ? { usage: latestCodexUsage } : {})
+      };
+    }
+
+    if (nativeFailed) {
       const message = sanitizeActiveTurnText(
-        stderr.trim() || combinedOutput || `codex exited with code ${exitCode ?? "unknown"}`
+        exitSignal != null
+          ? `Codex was terminated by ${exitSignal}.`
+          : events.failureMessage || stderr.trim() || `Codex exited with code ${exitCode ?? "unknown"}.`
       );
       this.deps.logger.warn(
-        `Codex session ${params.session.name} exited with code ${exitCode ?? "unknown"}: ${message}`
+        `Codex session ${params.session.name} failed (exit ${exitCode ?? "unknown"}, signal ${exitSignal ?? "none"}): ${message}`
       );
       const failureOutput = [liveOutput, `\n[error] ${message}\n`]
         .filter((part) => part.trim().length > 0)
@@ -5371,7 +5175,7 @@ export class AcpxSessionManager implements ISessionManager {
           { code: providerFailure.code, retryable: providerFailure.retryable }
         );
         this.completeActiveTurnOutput(params.session.name);
-        return failedProviderTurn(providerFailure);
+        return { ...failedProviderTurn(providerFailure), ...(latestCodexUsage != null ? { usage: latestCodexUsage } : {}) };
       }
       await this.deps.outputRouter.onError(params.session.name, new Error(message));
       this.completeActiveTurnOutput(params.session.name);
@@ -5385,13 +5189,16 @@ export class AcpxSessionManager implements ISessionManager {
             createdAt: nowIso()
           }
         ],
-        state: "failed"
+        state: "failed",
+        failureCode: "CODEX_TURN_FAILED",
+        retryable: false,
+        ...(latestCodexUsage != null ? { usage: latestCodexUsage } : {})
       };
     }
 
     if (combinedOutput.length === 0) {
       this.deps.logger.warn(
-        `Codex session ${params.session.name} exited with code ${exitCode ?? 0} without a final assistant message (--output-last-message ${finalOutput.length > 0 ? "sanitized to empty" : "empty or missing"}, ${liveOutputChunks.length} live chunks, ${stderr.trim().length} stderr chars).`
+        `Codex session ${params.session.name} exited with code ${exitCode} without a final assistant message (--output-last-message ${finalOutput.length > 0 ? "sanitized to empty" : "empty or missing"}, ${liveOutputChunks} live chunks, ${stderr.trim().length} stderr chars).`
       );
     }
     if (combinedOutput.length > 0) {
@@ -5417,6 +5224,9 @@ export class AcpxSessionManager implements ISessionManager {
     });
     this.completeActiveTurnOutput(params.session.name);
     return result;
+    } finally {
+      diagnostic?.close();
+    }
   }
 
   private async startActiveTurnOutput(session: SessionInfo): Promise<void> {
@@ -5758,20 +5568,20 @@ export class AcpxSessionManager implements ISessionManager {
           ? resolveQuestionFromOutput(params.output)
           : undefined);
     if (question == null && signals?.plan == null && params.output.trim().length === 0) {
-      // A successful turn with no visible assistant output must never be
+      // A turn with no visible assistant output must never be
       // published as an assistant message: consumers holding only the
       // cumulative transcript would fall back to the previous assistant entry
       // and resurrect a stale reply as this turn's answer.
       this.deps.logger.warn(
-        `Session ${params.sessionName} completed without a final assistant message; publishing a status result.`
+        `Session ${params.sessionName} produced no final assistant message; publishing a failed status result.`
       );
       const statusSignals = mergeTurnSignals(signals, {
         stopReason: NO_FINAL_MESSAGE_STOP_REASON
       });
-      await this.deps.outputRouter.onFinal(params.sessionName, NO_FINAL_MESSAGE_STATUS_TEXT);
-      await this.deps.outputRouter.onComplete(
+      await this.deps.outputRouter.onError(
         params.sessionName,
-        "Turn completed without a final assistant message."
+        new PuppenclawError("NO_FINAL_MESSAGE", NO_FINAL_MESSAGE_STATUS_TEXT),
+        { code: "NO_FINAL_MESSAGE", retryable: false }
       );
       return {
         output: NO_FINAL_MESSAGE_STATUS_TEXT,
@@ -5783,7 +5593,9 @@ export class AcpxSessionManager implements ISessionManager {
         ...(statusSignals != null ? { signals: statusSignals } : {}),
         warnings: [],
         transcript: [{ role: "status", text: NO_FINAL_MESSAGE_STATUS_TEXT, createdAt: nowIso() }],
-        state: "idle"
+        state: "failed",
+        failureCode: "NO_FINAL_MESSAGE",
+        retryable: false
       };
     }
     await this.deps.outputRouter.onFinal(params.sessionName, params.output);
