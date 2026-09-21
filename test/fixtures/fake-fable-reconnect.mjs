@@ -29,6 +29,28 @@ if (args.includes("prompt")) {
   writeFileSync(attemptsPath, String(attempt));
   process.stderr.write("[acpx] session synthetic · agent needs reconnect\n");
   if (options.kind != null) {
+    if (options.kind === "plan-permission") {
+      const sessionId = "native-plan-session";
+      const update = (value) => emit({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: value } });
+      emit({ jsonrpc: "2.0", id: 7, method: "session/prompt", params: { sessionId, prompt: [{ type: "text", text: prompt }] } });
+      for (let index = 0; index < (options.denials ?? 1); index++) {
+        emit({ jsonrpc: "2.0", id: index, method: "session/request_permission", params: {
+          sessionId, toolCall: { toolCallId: `plan-${index}`, title: "Ready to code?", kind: options.permissionKind ?? "switch_mode" },
+          options: [{ optionId: "default", kind: "allow_once", name: "Yes" },
+            { optionId: "plan", kind: "reject_once", name: "No, keep planning" }]
+        } });
+        if (!options.missingPermissionResponse) emit({ jsonrpc: "2.0", id: index,
+          result: { outcome: { outcome: "selected", optionId: options.selectedOption ?? "plan" } } });
+      }
+      if (!options.noFreshOutput) update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "The completed plan is ready for your approval." } });
+      if (!options.missingTerminal) emit({ jsonrpc: "2.0", id: options.wrongTerminal ? 8 : 7, result: { stopReason: "end_turn" } });
+      if (options.errorAfterDone) emit({ type: "error", code: "CONNECTION_FAILED", message: "Actual failure after done" });
+      if (options.signal) {
+        process.kill(process.pid, options.signal);
+        await delay(1000);
+      }
+      process.exit(options.exitCode ?? 5);
+    }
     if (options.kind === "stale") {
       writeFileSync(marker, JSON.stringify({ ...record(), updated_at: new Date().toISOString() }));
       emit({ type: "error", code: "CONNECTION_FAILED", message: "ACP agent disconnected during request" });

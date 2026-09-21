@@ -68,6 +68,7 @@ import {
 } from "../shared/utils.js";
 import type { ISessionManager } from "./interface.js";
 import { CodexEventAdapter } from "./codex-events.js";
+import { AcpPlanPermissionTracker } from "./acp-plan-permissions.js";
 import { TurnDiagnosticsRecorder, purgeSessionDiagnostics, readCodexFinalMessageFile, unlinkCodexFinalMessageFile } from "./turn-diagnostics.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -4595,6 +4596,7 @@ export class AcpxSessionManager implements ISessionManager {
     child.stdin.end();
 
     const events: PromptEvent[] = [];
+    const planPermissions = new AcpPlanPermissionTracker();
     const dispatchTasks: Array<Promise<void>> = [];
     const outputChunks: string[] = [];
     let latestTokenUsage: TokenUsage | undefined;
@@ -4612,6 +4614,7 @@ export class AcpxSessionManager implements ISessionManager {
       };
     };
     const consumeLine = (line: string): void => {
+      planPermissions.observeLine(line);
       if (this.deps.statistics) {
         try { this.deps.statistics.observeEvent(params.session.name, JSON.parse(line), "acp"); } catch { /* Malformed protocol lines are not metrics. */ }
       }
@@ -4854,7 +4857,18 @@ export class AcpxSessionManager implements ISessionManager {
         state: "failed"
       };
     }
-    if (exitCode !== 0 || exitSignal != null) {
+    // ACPX reports PERMISSION_DENIED (5) even when Claude completed a plan
+    // after the read-only boundary selected "No, keep planning". Accept only
+    // a complete, current-invocation exchange containing those denials alone.
+    const completedPlanBoundary = params.session.agent === "claude" && planPermissions.allowsCompletedPlan({
+      exitCode,
+      signal: exitSignal,
+      ...(params.interactionMode != null ? { interactionMode: params.interactionMode } : {}),
+      permissionMode: params.permissionMode,
+      hasFreshOutput: output.length > 0,
+      hasError: errorEvents.length > 0
+    });
+    if ((exitCode !== 0 || exitSignal != null) && !completedPlanBoundary) {
       const message = sanitizeActiveTurnText(
         stderr.trim() || `acpx exited with code ${exitCode ?? "unknown"}${exitSignal != null ? ` (${exitSignal})` : ""}`
       );
@@ -4932,15 +4946,22 @@ export class AcpxSessionManager implements ISessionManager {
     }
     stopped = stoppedTurn();
     if (stopped != null) return stopped;
+    const completedSignals = completedPlanBoundary
+      ? mergeTurnSignals(promptSignals, { nativeMode: "plan", plan: { ...promptSignals?.plan, source: "claude-tool" } })
+      : promptSignals;
     const result = await this.finishSuccessfulTurn({
       sessionName: params.session.name,
       output,
-      ...(promptSignals != null ? { signals: promptSignals } : {}),
+      ...(completedSignals != null ? { signals: completedSignals } : {}),
       ...(latestTokenUsage != null ? { tokenUsage: latestTokenUsage } : {}),
       ...(latestNormalizedUsage != null ? { usage: latestNormalizedUsage } : {}),
       ...(turnStopReason != null ? { stopReason: turnStopReason } : {}),
       durationMs: turnDurationMs
     });
+    if (completedPlanBoundary) {
+      result.warnings.push("Plan completed. The read-only planning boundary kept execution disabled; the plan is awaiting user approval.");
+      this.deps.logger.info(`ACPX session ${params.session.name} completed a plan after ${planPermissions.deniedPlanRequests} keep-planning permission response(s); exit code 5 retained in process diagnostics.`);
+    }
     this.completeActiveTurnOutput(params.session.name);
     return result;
   }

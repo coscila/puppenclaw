@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 
 import { AcpxSessionManager } from "../../src/manager/acpx.js";
+import type { StartParams } from "../../src/shared/types.js";
 import { createStoreAndRouter, createTempDir, makeConfig } from "../helpers.js";
 
 const oldAnswer = "OLD ASSISTANT OUTPUT";
@@ -29,13 +30,55 @@ async function fixture(options: Record<string, unknown>, baseline = oldRecord) {
   });
   return {
     manager, store, workspace, completed,
-    run: () => manager.start({ agent: "claude", name: "reconnect-test", directory: workspace,
-      task: "Current request", contextFiles: [] }),
+    run: (overrides: Partial<StartParams> = {}) => manager.start({ agent: "claude", name: "reconnect-test", directory: workspace,
+      task: "Current request", contextFiles: [], ...overrides }),
     attempts: async () => Number(await readFile(join(workspace, ".fake-reconnect-attempts"), "utf8"))
   };
 }
 
 describe("turn-specific ACPX reconnect handling", () => {
+  it.each([1, 2])("publishes a completed plan after %s keep-planning denials without replay", async (denials) => {
+    const env = await fixture({ kind: "plan-permission", denials });
+    try {
+      const result = await env.run({ interactionMode: "plan", permissionMode: "approve-reads" });
+      expect(result.details).toMatchObject({ turnSignals: { nativeMode: "plan", plan: { source: "claude-tool" }, stopReason: "end_turn" } });
+      const session = env.store.getSession("reconnect-test");
+      expect(session?.state).not.toBe("failed");
+      expect(session?.activeTurn).toMatchObject({ state: "completed", exitCode: 5 });
+      expect(session?.transcript.at(-1)).toMatchObject({ role: "assistant", text: "The completed plan is ready for your approval." });
+      expect(env.completed).toHaveBeenCalledTimes(1);
+      expect(await env.attempts()).toBe(1);
+    } finally { await env.store.close(); }
+  });
+
+  it.each([
+    { permissionKind: "execute" }, { selectedOption: "default" }, { missingPermissionResponse: true },
+    { missingTerminal: true }, { wrongTerminal: true }, { noFreshOutput: true },
+    { errorAfterDone: true }, { exitCode: 2 }, { signal: "SIGTERM" }
+  ])("does not excuse another denial or incomplete plan: %j", async (options) => {
+    const env = await fixture({ kind: "plan-permission", ...options });
+    try {
+      expect((await env.run({ interactionMode: "plan", permissionMode: "approve-reads" })).details).toMatchObject({ session: { state: "failed" } });
+      expect(env.store.getSession("reconnect-test")?.transcript.some((entry) => entry.role === "assistant")).toBe(false);
+      expect(env.completed).not.toHaveBeenCalled();
+      expect(await env.attempts()).toBe(1);
+    } finally { await env.store.close(); }
+  });
+
+  it.each([
+    { interactionMode: "execute", permissionMode: "approve-reads" },
+    { interactionMode: "plan", permissionMode: "deny-all" },
+    { interactionMode: "plan", permissionMode: "approve-all" },
+    { permissionMode: "approve-reads" }
+  ] as Partial<StartParams>[]) ("requires the explicit read-only plan boundary: %j", async (overrides) => {
+    const env = await fixture({ kind: "plan-permission" });
+    try {
+      expect((await env.run(overrides)).details).toMatchObject({ session: { state: "failed" } });
+      expect(env.completed).not.toHaveBeenCalled();
+      expect(await env.attempts()).toBe(1);
+    } finally { await env.store.close(); }
+  });
+
   it.each([false, true])("never promotes timestamp-refreshed old history (missing baseline: %s)", async (missingBaseline) => {
     const env = await fixture({ kind: "stale", missingBaseline });
     try {
