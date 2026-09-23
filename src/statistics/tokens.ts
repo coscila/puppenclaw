@@ -54,9 +54,12 @@ export function statisticsTokens(
       ? ["cached_input_tokens", "cachedInputTokens"]
       : ["cachedReadTokens", "cacheRead", "cache_read_input_tokens"],
   );
+  // Codex (>= 0.147) reports cache writes as a subset of its inclusive input;
+  // older builds omit the field, which keeps the historical 0.
   const cacheWrite =
     format === "codex"
-      ? 0
+      ? (first(value, ["cache_write_input_tokens", "cacheWriteInputTokens"]) ??
+        0)
       : first(value, [
           "cachedWriteTokens",
           "cacheWrite",
@@ -85,14 +88,16 @@ export function statisticsTokens(
     return unavailableTokens();
   if (input === null && output === null && total === null)
     return unavailableTokens();
+  const boundedCacheRead =
+    input !== null && cacheRead !== null ? Math.min(input, cacheRead) : cacheRead;
   return {
     input,
     output,
-    cacheRead:
-      input !== null && cacheRead !== null
-        ? Math.min(input, cacheRead)
-        : cacheRead,
-    cacheWrite,
+    cacheRead: boundedCacheRead,
+    cacheWrite:
+      inclusive && input !== null && cacheWrite !== null
+        ? Math.min(Math.max(0, input - (boundedCacheRead ?? 0)), cacheWrite)
+        : cacheWrite,
     reasoning:
       output !== null && reasoning !== null
         ? Math.min(output, reasoning)

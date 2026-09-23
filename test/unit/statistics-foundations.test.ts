@@ -138,6 +138,40 @@ describe("durable statistics foundations", () => {
       ),
     ).toEqual(unavailableTokens());
   });
+  it("keeps codex cache_write_input_tokens as an inclusive-input subset", () => {
+    expect(
+      statisticsTokens(
+        {
+          input_tokens: 1000,
+          cached_input_tokens: 600,
+          cache_write_input_tokens: 150,
+          output_tokens: 40,
+          reasoning_output_tokens: 10,
+        },
+        "codex",
+        true,
+      ),
+    ).toEqual({
+      input: 1000,
+      output: 40,
+      cacheRead: 600,
+      cacheWrite: 150,
+      reasoning: 10,
+      total: 1040,
+      quality: "measured",
+    });
+    expect(
+      statisticsTokens(
+        { input_tokens: 10, cached_input_tokens: 8, cache_write_input_tokens: 9, output_tokens: 1 },
+        "codex",
+        true,
+      ),
+    ).toMatchObject({ input: 10, cacheRead: 8, cacheWrite: 2, total: 11 });
+    expect(
+      statisticsTokens({ input_tokens: 10, output_tokens: 1 }, "codex", true)
+        .cacheWrite,
+    ).toBe(0);
+  });
   it("permanently erases only the selected chat and persists a non-resurrectable fence without rewinding cursors", async () => {
     const root = await createTempDir("statistics-erasure-");
     let store = await TurnStatisticsStore.open(root);

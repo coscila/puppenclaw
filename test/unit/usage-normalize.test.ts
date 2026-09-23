@@ -255,6 +255,27 @@ describe("normalizeCodexUsage", () => {
     });
   });
 
+  it("keeps codex cache_write_input_tokens as a subset of input without changing the total", () => {
+    expect(
+      normalizeCodexUsage({
+        input_tokens: 1000,
+        cached_input_tokens: 300,
+        cache_write_input_tokens: 200,
+        output_tokens: 120,
+        total_tokens: 1120
+      })
+    ).toEqual({ input: 500, output: 120, cacheRead: 300, cacheWrite: 200, total: 1120 });
+    // A cache write can never exceed the uncached input it is part of.
+    expect(
+      normalizeCodexUsage({
+        input_tokens: 100,
+        cached_input_tokens: 90,
+        cache_write_input_tokens: 50,
+        output_tokens: 1
+      })
+    ).toEqual({ input: 0, output: 1, cacheRead: 90, cacheWrite: 10, total: 101 });
+  });
+
   it("clamps cached over input and returns zeros for non-object input", () => {
     expect(
       normalizeCodexUsage({
