@@ -75,6 +75,11 @@ function stringify(value: unknown): string | undefined {
   }
 }
 
+/** Lines in the `ocsl.` namespace are written by the OCSL Codex wrapper, not Codex. */
+export function isWrapperMetadataType(value: unknown): boolean {
+  return kind(value).startsWith("ocsl.");
+}
+
 function remember<K, V>(map: Map<K, V>, key: K, value: V): void {
   map.set(key, value);
   if (map.size > MAX_TRACKED_ITEMS) map.delete(map.keys().next().value as K);
@@ -130,6 +135,9 @@ export class CodexEventAdapter {
     const event = record(raw);
     if (event == null) return update;
     const eventType = kind(event.type);
+    // Wrapper metadata (e.g. ocsl.model_usage) shares the stdout channel but
+    // is never a Codex event: no progress, activity, usage or terminal state.
+    if (isWrapperMetadataType(eventType)) return update;
     const sequenceScope = text(event.item_id) ?? text(record(event.item)?.id) ?? text(event.response_id);
     const eventId = text(event.event_id) ??
       (typeof event.sequence_number === "number" && sequenceScope != null
@@ -256,7 +264,7 @@ export class CodexEventAdapter {
     const completed = /(?:completed|done)$/iu.test(eventType) ||
       /^(?:completed|failed)$/u.test(kind(tool.status));
     const isOutput = /(?:tool|function)_?(?:call_)?output|command_output|exec_output/iu.test(toolType) ||
-      (completed && /command_execution|mcp_tool_call|collab_agent_tool_call/iu.test(toolType));
+      (completed && /command_execution|mcp_tool_call|collab_(?:agent_)?tool_call/iu.test(toolType));
     const fn = record(tool.function);
     const title = toolType === "command_execution" ? "exec_command" :
       text(tool.tool) != null ? [text(tool.server), text(tool.tool)].filter(Boolean).join("/") :

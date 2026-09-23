@@ -114,6 +114,18 @@ describe.skipIf(process.platform !== "linux")("private bounded turn diagnostics"
     expect(snapshot.process.reasonCode).toBe("other");
   });
 
+  it("records collab_tool_call items and never counts OCSL wrapper metadata as an event", async () => {
+    const root = await directory();
+    const recorder = await start(root);
+    recorder.observeEvent({ type: "item.completed", item: { id: "c", type: "collab_tool_call", tool: "spawn_agent", status: "completed" } });
+    recorder.observeEvent({ type: "ocsl.model_usage", version: 1, threads: [] });
+    await recorder.finish({ exitCode: 0, signal: null, outcome: "completed" });
+    const snapshot = await onlySnapshot(root);
+    expect(snapshot.eventCount).toBe(1);
+    expect(snapshot.eventCounts).toEqual({ "item.completed": 1 });
+    expect(snapshot.eventTail).toMatchObject([{ type: "item.completed", itemType: "collab_tool_call", status: "completed" }]);
+  });
+
   it("keeps readable novel runtime errors while suppressing inline and multiline payload dumps", async () => {
     const root = await directory();
     const recorder = await start(root);

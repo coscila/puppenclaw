@@ -76,7 +76,7 @@ const ITEM_TYPES = new Set([
   "agent_message", "message", "reasoning", "command_execution", "file_change",
   "mcp_tool_call", "web_search", "todo_list", "error", "function_call",
   "function_call_output", "custom_tool_call", "custom_tool_call_output",
-  "collab_agent_tool_call", "collab_agent_spawn", "collab_agent_wait",
+  "collab_agent_tool_call", "collab_tool_call", "collab_agent_spawn", "collab_agent_wait",
 ]);
 const STATUSES = new Set([
   "in_progress", "completed", "failed", "cancelled", "aborted", "incomplete",
@@ -494,6 +494,8 @@ export class TurnDiagnosticsRecorder {
     if (this.closed) return;
     const event = record(value);
     if (!event) return;
+    // Wrapper metadata is not a native event and must not count as "other".
+    if (typeof event.type === "string" && event.type.trim().toLowerCase().startsWith("ocsl.")) return;
     const type = typeof event.type === "string" && EVENT_TYPES.has(event.type) ? event.type : "other";
     if (type === "thread.started" && typeof event.thread_id === "string") {
       this.nativeThreadHash = hash(event.thread_id);

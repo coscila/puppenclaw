@@ -175,6 +175,37 @@ describe("CodexEventAdapter", () => {
     expect(adapter.finalAnswer).toBeUndefined();
   });
 
+  it("routes codex 0.147 collab_tool_call items like collab_agent_tool_call", () => {
+    for (const type of ["collab_tool_call", "collab_agent_tool_call"]) {
+      const adapter = new CodexEventAdapter();
+      const item = { id: `spawn-${type}`, type, tool: "spawn_agent", sender_thread_id: "main", receiver_thread_ids: [], prompt: "Summarize the paper", agents_states: {}, status: "in_progress" };
+      expect(adapter.consume({ type: "item.started", item })).toEqual({ activities: [
+        { type: "tool_call", title: "spawn_agent" }
+      ] });
+      expect(adapter.consume({ type: "item.completed", item: { ...item, receiver_thread_ids: ["worker"], status: "completed" } }))
+        .toEqual({ activities: [{ type: "tool_output", title: "spawn_agent" }] });
+      expect(adapter.finalAnswer).toBeUndefined();
+    }
+  });
+
+  it("ignores OCSL wrapper metadata lines entirely", () => {
+    const adapter = new CodexEventAdapter();
+    adapter.consume(message("Final report.", "final_answer"));
+    adapter.consume({ type: "turn.completed", usage: { input_tokens: 10, output_tokens: 2 } });
+    for (const line of [
+      { type: "ocsl.model_usage", version: 1, threads: [{ threadId: "t", parentThreadId: null, role: "main", agentRole: null, model: "m",
+        usage: { input_tokens: 999, cached_input_tokens: 0, cache_write_input_tokens: 0, output_tokens: 999, reasoning_output_tokens: 0, total_tokens: 1998 } }] },
+      { type: "OCSL.model_usage", message: "assistant message text", item: { type: "agent_message", text: "leak" } },
+      { type: "ocsl.future_metadata", usage: { input_tokens: 5 }, error: { message: "not an error" } }
+    ]) {
+      expect(adapter.consume(line)).toEqual({ activities: [] });
+    }
+    expect(adapter.finalAnswer).toBe("Final report.");
+    expect(adapter.terminalStatus).toBe("completed");
+    expect(adapter.latestUsage?.total).toBe(12);
+    expect(adapter.lastError).toBeUndefined();
+  });
+
   it("keeps legacy tool calls hidden even inside assistant message-shaped envelopes", () => {
     const adapter = new CodexEventAdapter();
     expect(adapter.consume({
