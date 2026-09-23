@@ -2569,7 +2569,8 @@ export class AcpxSessionManager implements ISessionManager {
       throw new PuppenclawError("NO_SESSION", `Unknown session ${name}.`);
     }
     const history = this.deps.ledger?.perSessionHistory(name, params.limit ?? 20) ?? [];
-    const latest = history[0];
+    // A turn's subagent rows share its timestamp; the session model is the main row's.
+    const latest = history.find((entry) => entry.role !== "subagent") ?? history[0];
     const provider = latest?.provider ?? "unknown";
     const model = latest?.model ?? "unknown";
     const summary = `Usage for purged session ${name} (${provider} ${model}): ${totals.turns} turn${

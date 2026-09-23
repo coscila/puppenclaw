@@ -135,4 +135,54 @@ describe("daemon per-session cost", () => {
       await app.close();
     }
   });
+
+  it("names a purged session after its main model when a turn also recorded subagent rows", async () => {
+    const dataDir = await createTempDir("puppenclaw-daemon-cost-models-");
+    const acpxCommand = await resolveFakeAcpxCommand();
+    const seedLedger = await UsageLedgerStore.open(join(dataDir, "usage"));
+    // Both rows share the turn timestamp; the subagent id sorts after the
+    // main id, so history lists the subagent row first.
+    seedLedger.append(
+      makeEntry({
+        id: "usage-turn-1-main-aaaa",
+        agent: "codex",
+        provider: "remote_langdock_gpt6_luna_xhigh",
+        model: "gpt-6-luna",
+        turnId: "turn-1",
+        role: "main",
+        threads: 1
+      })
+    );
+    seedLedger.append(
+      makeEntry({
+        id: "usage-turn-1-subagent-bbbb",
+        agent: "codex",
+        provider: "remote_langdock_gpt6_luna_xhigh",
+        model: "chat",
+        turnId: "turn-1",
+        role: "subagent",
+        threads: 4
+      })
+    );
+    seedLedger.close();
+
+    const { app } = await createDaemonServer({
+      config: makeConfig({ acpxCommand, daemonAuthToken: "secret-token" }),
+      dataDir
+    });
+    try {
+      const response = await app.inject({
+        method: "GET",
+        url: "/session/purged-one-shot/cost",
+        headers: { authorization: "Bearer secret-token" }
+      });
+      expect(response.statusCode).toBe(200);
+      const details = (JSON.parse(response.body) as { details: Record<string, unknown> }).details;
+      expect((details.history as UsageLedgerEntry[])[0]?.role).toBe("subagent");
+      expect(details.model).toBe("gpt-6-luna");
+      expect(details.turns).toBe(1);
+    } finally {
+      await app.close();
+    }
+  });
 });
