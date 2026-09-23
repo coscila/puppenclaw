@@ -8,11 +8,13 @@ import {
   type ProcSnapshot,
 } from "../resources/proc.js";
 import { PuppenclawError } from "../shared/errors.js";
+import type { ModelUsageGroup } from "../shared/model-usage.js";
 import type { SessionInfo } from "../shared/types.js";
 import { ProcessCpuCounter, type VerifiedProcessRoot } from "./proc-cpu.js";
 import { statisticsTokens, unavailableTokens } from "./tokens.js";
 import { TurnStatisticsStore } from "./store.js";
 import type {
+  RunnerTurnModelStatistics,
   RunnerTurnStatistics,
   StatisticsContext,
   StatisticsState,
@@ -29,11 +31,43 @@ type Meter = {
   settlement: Promise<void> | null;
   usageResults: Map<string, StatisticsTokens>;
   usageBridgeSeen: boolean;
+  /** Set once a valid wrapper model-usage line arrived; it then owns the totals. */
+  modelUsageSeen: boolean;
 };
 const record = (value: unknown): Record<string, unknown> | null =>
   value !== null && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : null;
+type TokenCountKey = Exclude<keyof StatisticsTokens, "quality">;
+/** Field-wise sum; a field is null when any part lacks it or the sum is unsafe. */
+function sumTokens(
+  parts: readonly StatisticsTokens[],
+  final: boolean,
+): StatisticsTokens {
+  const sum = (key: TokenCountKey): number | null => {
+    const values = parts.map((item) => item[key]);
+    if (values.some((value) => value === null)) return null;
+    const total = values.reduce<number>((a, b) => a + b!, 0);
+    return Number.isSafeInteger(total) ? total : null;
+  };
+  const input = sum("input");
+  const output = sum("output");
+  return {
+    input,
+    output,
+    cacheRead: sum("cacheRead"),
+    cacheWrite: sum("cacheWrite"),
+    reasoning: sum("reasoning"),
+    total: sum("total"),
+    quality:
+      final &&
+      input !== null &&
+      output !== null &&
+      parts.every((item) => item.quality === "measured")
+        ? "measured"
+        : "partial",
+  };
+}
 export class TurnStatisticsRecorder {
   private readonly active = new Map<string, Meter>();
   private readonly sessionRoots = new Map<string, VerifiedProcessRoot[]>();
@@ -111,6 +145,7 @@ export class TurnStatisticsRecorder {
       settlement: null,
       usageResults: new Map(),
       usageBridgeSeen: false,
+      modelUsageSeen: false,
     });
     return row.runnerTurnId;
   }
@@ -200,6 +235,9 @@ export class TurnStatisticsRecorder {
         }
       }
     } else {
+      // The wrapper's per-thread line owns the totals once it arrived: never
+      // add or overwrite it with main-thread Codex usage (no double counting).
+      if (meter.modelUsageSeen) return;
       if (event.type === "turn.completed") {
         usage = event.usage;
         final = true;
@@ -213,9 +251,7 @@ export class TurnStatisticsRecorder {
     if (meter.usageResults.size > 0) {
       // UUID-keyed SDK results are increments. The ACP completion repeats the
       // user aggregate, so it only supplies finality and is never added again.
-      const sum = (
-        key: Exclude<keyof StatisticsTokens, "quality">,
-      ): number | null => {
+      const sum = (key: TokenCountKey): number | null => {
         const values = [...meter.usageResults.values()].map(
           (item) => item[key],
         );
@@ -249,6 +285,35 @@ export class TurnStatisticsRecorder {
       meter.row.tokens.quality !== "unavailable"
     )
       meter.row.tokens.quality = "partial";
+  }
+  /**
+   * Accepts the OCSL wrapper's per-thread usage (already validated and grouped).
+   * The latest line wins; the turn total becomes the sum over its models, which
+   * includes the main thread, so it replaces rather than adds to Codex usage.
+   */
+  observeModelUsage(name: string, groups: readonly ModelUsageGroup[]): void {
+    const meter = this.active.get(name);
+    if (!meter || meter.ended || groups.length === 0) return;
+    const models: RunnerTurnModelStatistics[] = groups.map((group) => ({
+      role: group.role,
+      model: group.model,
+      modelProviderId:
+        group.role === "main" ? meter.row.modelProviderId : null,
+      threads: group.threads,
+      tokens: statisticsTokens(group.usage, "codex", true),
+    }));
+    if (models.some((model) => model.tokens.quality === "unavailable")) return;
+    meter.modelUsageSeen = true;
+    meter.row.models = models;
+    meter.row.tokens = sumTokens(
+      models.map((model) => model.tokens),
+      true,
+    );
+    // The wrapper baselines resumed threads, so cumulative counters are no
+    // longer an attribution gap for this turn.
+    meter.row.coverageReasons = meter.row.coverageReasons.filter(
+      (reason) => reason !== "cumulative_usage_without_baseline",
+    );
   }
   private reason(meter: Meter, reason: string): void {
     if (!meter.row.coverageReasons.includes(reason))
@@ -364,6 +429,10 @@ export class TurnStatisticsRecorder {
     meter.row.finishedAt = new Date().toISOString();
     if (state !== "completed" && meter.row.tokens.quality !== "unavailable")
       meter.row.tokens.quality = "partial";
+    if (state !== "completed")
+      for (const model of meter.row.models ?? [])
+        if (model.tokens.quality !== "unavailable")
+          model.tokens.quality = "partial";
     this.checkpoint(meter);
     if (meter.counter)
       this.sessionRoots.set(name, meter.counter.rootsStillAlive());

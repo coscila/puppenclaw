@@ -153,6 +153,20 @@ export class TurnStatisticsStore {
           quality:
             row.tokens.quality === "unavailable" ? "unavailable" : "partial",
         },
+        ...(row.models != null
+          ? {
+              models: row.models.map((model) => ({
+                ...model,
+                tokens: {
+                  ...model.tokens,
+                  quality:
+                    model.tokens.quality === "unavailable"
+                      ? "unavailable"
+                      : "partial",
+                },
+              })),
+            }
+          : {}),
         coverageReasons: [
           ...new Set([...row.coverageReasons, "daemon_restart"]),
         ],

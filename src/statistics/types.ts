@@ -18,6 +18,18 @@ export type StatisticsTokens = {
   total: number | null;
   quality: "measured" | "partial" | "unavailable";
 };
+/**
+ * Per-model split of one turn from the OCSL wrapper's `ocsl.model_usage` line:
+ * native threads grouped by (role, model). The main orchestrator carries the
+ * session's model provider id; subagents are attributed by the consumer.
+ */
+export type RunnerTurnModelStatistics = {
+  role: "main" | "subagent";
+  model: string;
+  modelProviderId: string | null;
+  threads: number;
+  tokens: StatisticsTokens;
+};
 export type RunnerTurnStatistics = StatisticsContext & {
   id: string;
   revision: string;
@@ -33,7 +45,10 @@ export type RunnerTurnStatistics = StatisticsContext & {
   finishedAt: string | null;
   activeElapsedMs: number;
   runtimeQuality: "measured" | "partial";
+  /** When `models` is present this is the sum over it (all threads of the turn). */
   tokens: StatisticsTokens;
+  /** Only present when the wrapper reported per-thread usage for the turn. */
+  models?: RunnerTurnModelStatistics[];
   cpu: {
     agentCpuMs: number | null;
     quality: "partial" | "unavailable";
