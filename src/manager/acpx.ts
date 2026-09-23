@@ -1,5 +1,5 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { copyFile, mkdir, readFile, readdir, stat, unlink } from "node:fs/promises";
 import { basename, dirname, extname, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,6 +9,14 @@ import { requiresFreshClaudeTranscript } from "../shared/model-compatibility.js"
 import { UsageLedgerStore } from "../shared/usage-ledger.js";
 import type { TurnStatisticsRecorder } from "../statistics/recorder.js";
 import { hasNonzeroUsage, normalizeUsage } from "../shared/usage.js";
+import {
+  normalizeModelUsageGroup,
+  OCSL_MODEL_USAGE_TYPE,
+  parseOcslModelUsage,
+  sumNormalizedUsage,
+  type ModelUsageGroup,
+  type ModelUsageRole
+} from "../shared/model-usage.js";
 import { DEFAULT_MAX_SESSIONS } from "../shared/schema.js";
 import { ensureError, PuppenclawError } from "../shared/errors.js";
 import type { PluginLogger } from "../shared/logger.js";
@@ -58,6 +66,7 @@ import type {
   TurnRequestReceipt,
   TurnRequestSuccessOutcome,
   TurnOutputRole,
+  UsageLedgerEntry,
   TurnSignals,
   UnfocusParams
 } from "../shared/types.js";
@@ -67,7 +76,7 @@ import {
   redactSensitiveText
 } from "../shared/utils.js";
 import type { ISessionManager } from "./interface.js";
-import { CodexEventAdapter } from "./codex-events.js";
+import { CodexEventAdapter, isWrapperMetadataType } from "./codex-events.js";
 import { AcpPlanPermissionTracker } from "./acp-plan-permissions.js";
 import { TurnDiagnosticsRecorder, purgeSessionDiagnostics, readCodexFinalMessageFile, unlinkCodexFinalMessageFile } from "./turn-diagnostics.js";
 
@@ -91,12 +100,26 @@ type NativeModePreparation = {
   warning?: string;
 };
 
+type TurnModelUsage = {
+  /** The runner turn id shared by every per-model ledger row of this turn. */
+  turnId: string;
+  entries: Array<{
+    role: ModelUsageRole;
+    model: string;
+    threads: number;
+    usage: NormalizedUsage;
+  }>;
+};
+
 type TurnResult = {
   output: string;
   outputRole?: TurnOutputRole;
   question?: string;
   tokenUsage?: TokenUsage;
+  /** With `modelUsage` this is the sum over its entries (never added to Codex usage). */
   usage?: NormalizedUsage;
+  /** Per-(role, model) usage from the OCSL wrapper's `ocsl.model_usage` line. */
+  modelUsage?: TurnModelUsage;
   stopReason?: string;
   durationMs?: number;
   warnings: string[];
@@ -1348,6 +1371,12 @@ function deriveUsageProvider(session: SessionInfo): string {
   }
 }
 
+/** Deterministic per turn and (role, model), so a re-recorded turn cannot duplicate rows. */
+function modelUsageLedgerId(turnId: string, role: ModelUsageRole, model: string): string {
+  const modelKey = createHash("sha256").update(model).digest("hex").slice(0, 16);
+  return `usage-${turnId}-${role}-${modelKey}`;
+}
+
 function deriveUsageModel(session: SessionInfo): string {
   return (
     session.model ??
@@ -1399,6 +1428,10 @@ export class AcpxSessionManager implements ISessionManager {
     if (this.deps.ledger == null || turn.state === "failed") {
       return;
     }
+    if (turn.modelUsage != null) {
+      this.recordModelUsageRows(session, turn, turn.modelUsage);
+      return;
+    }
     const usage = turn.usage;
     if (usage == null || !hasNonzeroUsage(usage)) {
       return;
@@ -1415,6 +1448,39 @@ export class AcpxSessionManager implements ISessionManager {
         durationMs: turn.durationMs ?? 0,
         timestamp: nowIso()
       });
+    } catch (error) {
+      this.deps.logger.warn(
+        `Orchestrator usage ledger append failed for ${session.name}: ${ensureError(error).message}`
+      );
+    }
+  }
+
+  /**
+   * One ledger row per (role, model) of the turn. The main row keeps today's
+   * provider/model derivation; subagent rows keep the session provider and
+   * name the model that actually ran. All rows share turnId and timestamp.
+   */
+  private recordModelUsageRows(session: SessionInfo, turn: TurnResult, modelUsage: TurnModelUsage): void {
+    const timestamp = nowIso();
+    const provider = deriveUsageProvider(session);
+    const entries: UsageLedgerEntry[] = modelUsage.entries
+      .filter((entry) => hasNonzeroUsage(entry.usage))
+      .map((entry) => ({
+        id: modelUsageLedgerId(modelUsage.turnId, entry.role, entry.model),
+        sessionName: session.name,
+        agent: session.agent,
+        provider,
+        model: entry.role === "main" ? deriveUsageModel(session) : entry.model,
+        usage: entry.usage,
+        ...(turn.stopReason != null ? { stopReason: turn.stopReason } : {}),
+        durationMs: turn.durationMs ?? 0,
+        timestamp,
+        turnId: modelUsage.turnId,
+        role: entry.role,
+        threads: entry.threads
+      }));
+    try {
+      this.deps.ledger?.appendMany(entries);
     } catch (error) {
       this.deps.logger.warn(
         `Orchestrator usage ledger append failed for ${session.name}: ${ensureError(error).message}`
@@ -5076,10 +5142,11 @@ export class AcpxSessionManager implements ISessionManager {
 
     await this.startActiveTurnOutput(params.session);
     this.assertTurnWasNotStopped(params.session.name);
+    const runnerTurnId = this.activeTurnIds.get(params.session.name)!;
     const diagnostic = await TurnDiagnosticsRecorder.start({
       rootDir: this.deps.store.rootDir,
       sessionName: params.session.name,
-      turnId: this.activeTurnIds.get(params.session.name)!,
+      turnId: runnerTurnId,
       agent: params.session.agent,
       secretValues: Object.entries(env)
         .filter(([key, value]) => /KEY|TOKEN|SECRET|PASSWORD|DATABASE_URL/u.test(key) && typeof value === "string" && value.length >= 6)
@@ -5113,6 +5180,26 @@ export class AcpxSessionManager implements ISessionManager {
     let liveOutputChunks = 0;
     const dispatchTasks: Array<Promise<void>> = [];
     const events = new CodexEventAdapter();
+    let modelUsageGroups: ModelUsageGroup[] | undefined;
+    // Wrapper metadata shares the protocol channel but is never a Codex event:
+    // it reaches neither the transcript/ACP stream nor diagnostics.
+    const consumeWrapperMetadata = (event: JsonRecord): void => {
+      const groups = event.type === OCSL_MODEL_USAGE_TYPE ? parseOcslModelUsage(event) : null;
+      if (groups == null) {
+        this.deps.logger.debug(
+          `Ignored invalid or unknown Codex wrapper metadata for session ${params.session.name}.`
+        );
+        return;
+      }
+      modelUsageGroups = groups; // the last valid line wins
+      try {
+        this.deps.statistics?.observeModelUsage(params.session.name, groups);
+      } catch (error) {
+        this.deps.logger.warn(
+          `Unable to record per-model statistics for ${params.session.name}: ${ensureError(error).message}`
+        );
+      }
+    };
     const appendLiveOutput = (text: string): void => {
       const sanitized = sanitizeActiveTurnText(text);
       if (sanitized.length === 0) {
@@ -5126,6 +5213,10 @@ export class AcpxSessionManager implements ISessionManager {
       try {
         const parsed = JSON.parse(line) as unknown;
         if (!isRecord(parsed)) {
+          return;
+        }
+        if (isWrapperMetadataType(parsed.type)) {
+          consumeWrapperMetadata(parsed);
           return;
         }
         this.deps.statistics?.observeEvent(params.session.name, parsed, "codex");
@@ -5206,7 +5297,23 @@ export class AcpxSessionManager implements ISessionManager {
     const liveOutput = this.activeTurnOutputs.get(params.session.name)?.text.trim() ?? "";
     const canonicalFinalOutput = sanitizeActiveTurnText(finalOutput);
     const combinedOutput = canonicalFinalOutput || (events.terminalStatus === "completed" ? events.finalAnswer : undefined) || "";
-    const latestCodexUsage = events.latestUsage;
+    const modelUsage: TurnModelUsage | undefined = modelUsageGroups == null
+      ? undefined
+      : {
+          turnId: runnerTurnId,
+          entries: modelUsageGroups.map((group) => ({
+            role: group.role,
+            model: group.model,
+            threads: group.threads,
+            usage: normalizeModelUsageGroup(group)
+          }))
+        };
+    // The wrapper line already includes the main thread: it replaces, never
+    // adds to, the main-thread usage from Codex events.
+    const latestCodexUsage = modelUsage != null
+      ? sumNormalizedUsage(modelUsage.entries.map((entry) => entry.usage))
+      : events.latestUsage;
+    const modelUsageResult = modelUsage != null ? { modelUsage } : {};
     const stopped = this.stopRequests.has(params.session.name) || this.deps.store.getSession(params.session.name)?.state === "stopped";
     const nativeFailed = exitCode !== 0 || exitSignal != null || events.terminalStatus === "failed";
     await diagnostic?.finish({
@@ -5226,7 +5333,8 @@ export class AcpxSessionManager implements ISessionManager {
         warnings: [],
         transcript: [{ role: "status", text: "Turn stopped by user.", createdAt: nowIso() }],
         state: "stopped",
-        ...(latestCodexUsage != null ? { usage: latestCodexUsage } : {})
+        ...(latestCodexUsage != null ? { usage: latestCodexUsage } : {}),
+        ...modelUsageResult
       };
     }
 
@@ -5254,7 +5362,11 @@ export class AcpxSessionManager implements ISessionManager {
           { code: providerFailure.code, retryable: providerFailure.retryable }
         );
         this.completeActiveTurnOutput(params.session.name);
-        return { ...failedProviderTurn(providerFailure), ...(latestCodexUsage != null ? { usage: latestCodexUsage } : {}) };
+        return {
+          ...failedProviderTurn(providerFailure),
+          ...(latestCodexUsage != null ? { usage: latestCodexUsage } : {}),
+          ...modelUsageResult
+        };
       }
       await this.deps.outputRouter.onError(params.session.name, new Error(message));
       this.completeActiveTurnOutput(params.session.name);
@@ -5271,7 +5383,8 @@ export class AcpxSessionManager implements ISessionManager {
         state: "failed",
         failureCode: "CODEX_TURN_FAILED",
         retryable: false,
-        ...(latestCodexUsage != null ? { usage: latestCodexUsage } : {})
+        ...(latestCodexUsage != null ? { usage: latestCodexUsage } : {}),
+        ...modelUsageResult
       };
     }
 
@@ -5302,7 +5415,7 @@ export class AcpxSessionManager implements ISessionManager {
       ...(latestCodexUsage != null ? { usage: latestCodexUsage } : {})
     });
     this.completeActiveTurnOutput(params.session.name);
-    return result;
+    return { ...result, ...modelUsageResult };
     } finally {
       diagnostic?.close();
     }

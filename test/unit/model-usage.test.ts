@@ -1,13 +1,19 @@
-import { describe, expect, it } from "vitest";
+import { readdir, readFile } from "node:fs/promises";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
+import { describe, expect, it, vi } from "vitest";
+
+import { AcpxSessionManager } from "../../src/manager/acpx.js";
 import {
   MAX_MODEL_USAGE_THREADS,
   parseOcslModelUsage,
   type ModelUsageGroup
 } from "../../src/shared/model-usage.js";
+import { UsageLedgerStore } from "../../src/shared/usage-ledger.js";
 import { TurnStatisticsRecorder } from "../../src/statistics/recorder.js";
 import { TurnStatisticsStore } from "../../src/statistics/store.js";
-import { createTempDir } from "../helpers.js";
+import { createStoreAndRouter, createTempDir, makeConfig } from "../helpers.js";
 
 type Usage = {
   input_tokens: number;
@@ -170,5 +176,171 @@ describe("statistics recorder per-model usage", () => {
     expect(row.tokens.quality).toBe("partial");
     expect(row.models?.every((model) => model.tokens.quality === "partial")).toBe(true);
     store.close();
+  });
+});
+
+async function runnerSetup() {
+  const root = await createTempDir("codex-model-usage-");
+  const { store, outputRouter } = await createStoreAndRouter(root);
+  const statisticsStore = await TurnStatisticsStore.open(join(root, "statistics"));
+  const statistics = new TurnStatisticsRecorder(statisticsStore, { listComputeJobs: () => [] });
+  const ledger = await UsageLedgerStore.open(join(root, "usage"));
+  const chunks: string[] = [];
+  const activities: unknown[] = [];
+  vi.spyOn(outputRouter, "onChunk").mockImplementation(async (_name, text) => { chunks.push(text); });
+  vi.spyOn(outputRouter, "onActivity").mockImplementation(async (_name, activity) => { activities.push(activity); });
+  const manager = new AcpxSessionManager({
+    config: makeConfig({ agentCommands: { codex: `node "${fileURLToPath(new URL("../fixtures/fake-codex-model-usage.mjs", import.meta.url))}"` } }),
+    logger: { info() {}, warn() {}, error() {}, debug() {} },
+    store, outputRouter, statistics, ledger
+  });
+  const start = (scenario: string, name = "lab") => manager.start({
+    agent: "codex", name, directory: root,
+    task: `SCENARIO:${scenario}`, contextFiles: [],
+    modelProvider: { id: "remote_langdock_gpt6_luna_xhigh", kind: "codex-openai-compatible", model: "gpt-6-luna" },
+    statisticsContext: { version: 1, chatId: "chat", attemptId: `${name}-${scenario}` }
+  });
+  const diagnostics = async (): Promise<Array<{ eventCounts: Record<string, number> }>> => {
+    const snapshots = [];
+    for (const session of await readdir(join(root, "diagnostics")).catch(() => [] as string[])) {
+      for (const file of await readdir(join(root, "diagnostics", session))) {
+        snapshots.push(JSON.parse(await readFile(join(root, "diagnostics", session, file), "utf8")));
+      }
+    }
+    return snapshots;
+  };
+  return { root, manager, store, statisticsStore, statistics, ledger, chunks, activities, start, diagnostics };
+}
+
+const MAIN_LEDGER_USAGE = { input: 300, output: 50, cacheRead: 600, cacheWrite: 100, total: 1050 };
+const SUB_LEDGER_USAGE = { input: 20000, output: 5000, cacheRead: 80000, cacheWrite: 0, total: 105000 };
+
+describe("Codex one-shot turns with the ocsl.model_usage line", () => {
+  it.each(["line", "trailing", "invalid-after-valid"])(
+    "records per-model statistics and ledger rows without transcript pollution (%s)",
+    async (scenario) => {
+      const setup = await runnerSetup();
+      try {
+        const result = await setup.start(scenario);
+        expect(result.details).toMatchObject({ output: "Model usage final answer.", session: { state: "idle" } });
+        expect(setup.store.getSession("lab")?.transcript.map((entry) => [entry.role, entry.text])).toEqual([
+          ["user", `SCENARIO:${scenario}`],
+          ["assistant", "Model usage final answer."]
+        ]);
+        const published = JSON.stringify([setup.chunks, setup.activities, result]);
+        expect(published).not.toMatch(/ocsl|model_usage|worker-1/u);
+        expect(setup.activities).toEqual([
+          { type: "tool_call", title: "spawn_agent" },
+          { type: "tool_output", title: "spawn_agent" }
+        ]);
+
+        const row = setup.statisticsStore.page().turns[0]!;
+        expect(row.tokens).toEqual({
+          input: 101000, output: 5050, cacheRead: 80600, cacheWrite: 100, reasoning: 4010, total: 106050, quality: "measured"
+        });
+        expect(row.models?.map((model) => [model.role, model.model, model.modelProviderId, model.threads, model.tokens.total])).toEqual([
+          ["main", "gpt-6-luna", "remote_langdock_gpt6_luna_xhigh", 1, 1050],
+          ["subagent", "chat", null, 2, 105000]
+        ]);
+
+        const history = setup.ledger.perSessionHistory("lab");
+        const turnId = row.runnerTurnId;
+        expect(history.map(({ timestamp: _t, durationMs: _d, id: _id, ...rest }) => rest).sort((a, b) => a.model.localeCompare(b.model))).toEqual([
+          { sessionName: "lab", agent: "codex", provider: "remote_langdock_gpt6_luna_xhigh", model: "chat",
+            usage: SUB_LEDGER_USAGE, turnId, role: "subagent", threads: 2 },
+          { sessionName: "lab", agent: "codex", provider: "remote_langdock_gpt6_luna_xhigh", model: "gpt-6-luna",
+            usage: MAIN_LEDGER_USAGE, turnId, role: "main", threads: 1 }
+        ]);
+        expect(new Set(history.map((entry) => entry.id)).size).toBe(2);
+        expect(history.every((entry) => entry.id.startsWith(`usage-${turnId}-`))).toBe(true);
+        expect(setup.ledger.perSessionTotals("lab")).toEqual({
+          turns: 1,
+          usage: { input: 20300, output: 5050, cacheRead: 80600, cacheWrite: 100, total: 106050 }
+        });
+        const [snapshot] = await setup.diagnostics();
+        expect(snapshot?.eventCounts).toEqual({
+          "thread.started": 1, "turn.started": 1, "item.started": 1, "item.completed": 2, "turn.completed": 1,
+          // A truncated line is not JSON, so it stays a malformed protocol record.
+          ...(scenario === "invalid-after-valid" ? { malformed_json: 1 } : {})
+        });
+      } finally {
+        await setup.statistics.close();
+        setup.ledger.close();
+      }
+    }
+  );
+
+  it("uses the last valid line", async () => {
+    const setup = await runnerSetup();
+    try {
+      await setup.start("last-wins");
+      const row = setup.statisticsStore.page().turns[0]!;
+      expect(row.tokens.total).toBe(2 * 106050);
+      expect(row.models?.map((model) => model.tokens.total)).toEqual([2 * 1050, 2 * 105000]);
+      expect(setup.ledger.perSessionTotals("lab")).toMatchObject({ turns: 1, usage: { total: 2 * 106050 } });
+    } finally {
+      await setup.statistics.close();
+      setup.ledger.close();
+    }
+  });
+
+  it.each(["none", "invalid"])("keeps today's main-thread accounting when no valid line arrives (%s)", async (scenario) => {
+    const setup = await runnerSetup();
+    try {
+      const result = await setup.start(scenario);
+      expect(result.details).toMatchObject({ output: "Model usage final answer.", session: { state: "idle" } });
+      expect(JSON.stringify([setup.chunks, setup.activities, setup.store.getSession("lab")?.transcript])).not.toMatch(/ocsl|must not leak/u);
+      const row = setup.statisticsStore.page().turns[0]!;
+      expect("models" in row).toBe(false);
+      expect(row.tokens).toEqual({ input: 1000, output: 50, cacheRead: 600, cacheWrite: 0, reasoning: null, total: 1050, quality: "measured" });
+      const history = setup.ledger.perSessionHistory("lab");
+      expect(history).toHaveLength(1);
+      expect(Object.keys(history[0]!).sort()).toEqual(["agent", "durationMs", "id", "model", "provider", "sessionName", "timestamp", "usage"]);
+      expect(history[0]).toMatchObject({ model: "gpt-6-luna", usage: { input: 400, output: 50, cacheRead: 600, cacheWrite: 0, total: 1050 } });
+      const [snapshot] = await setup.diagnostics();
+      expect(snapshot?.eventCounts.other).toBeUndefined();
+    } finally {
+      await setup.statistics.close();
+      setup.ledger.close();
+    }
+  });
+
+  it("keeps the failed-turn ledger skip while statistics carry the line", async () => {
+    const setup = await runnerSetup();
+    try {
+      const result = await setup.start("failed");
+      expect(result.details).toMatchObject({ session: { state: "failed", failureCode: "CODEX_TURN_FAILED" } });
+      const row = setup.statisticsStore.page().turns[0]!;
+      expect(row.state).toBe("failed");
+      expect(row.tokens).toMatchObject({ total: 106050, quality: "partial" });
+      expect(row.models).toHaveLength(2);
+      expect(setup.ledger.perSessionHistory("lab")).toEqual([]);
+    } finally {
+      await setup.statistics.close();
+      setup.ledger.close();
+    }
+  });
+
+  it("counts distinct turns in cost totals while history keeps one row per model", async () => {
+    const setup = await runnerSetup();
+    try {
+      await setup.start("line");
+      await setup.manager.send({
+        name: "lab", message: "SCENARIO:line", contextFiles: [],
+        statisticsContext: { version: 1, chatId: "chat", attemptId: "second" }
+      });
+      const cost = await setup.manager.cost({ name: "lab" });
+      const details = cost.details as { turns: number; history: Array<{ turnId: string }>; totals: { usage: { total: number } } };
+      expect(details.turns).toBe(2);
+      expect(details.history).toHaveLength(4);
+      expect(new Set(details.history.map((entry) => entry.turnId)).size).toBe(2);
+      expect(details.totals.usage.total).toBe(2 * 106050);
+      expect(cost.content[0]).toMatchObject({ text: expect.stringContaining("2 turns") });
+      const rollup = (await setup.manager.cost({})).details as { rollup: Array<{ model: string; turns: number }> };
+      expect(rollup.rollup.map((entry) => [entry.model, entry.turns])).toEqual([["chat", 2], ["gpt-6-luna", 2]]);
+    } finally {
+      await setup.statistics.close();
+      setup.ledger.close();
+    }
   });
 });
