@@ -261,7 +261,11 @@ writeFileSync(join(cwd, \`.fake-codex-permission-env-\${invocation}.json\`), JSO
   modelProviderId: process.env.PUPPENCLAW_MODEL_PROVIDER_ID ?? null,
   modelProviderModel: process.env.PUPPENCLAW_MODEL_PROVIDER_MODEL ?? null,
   modelProviderKind: process.env.PUPPENCLAW_MODEL_PROVIDER_KIND ?? null,
-  modelProviderBaseUrl: process.env.PUPPENCLAW_MODEL_PROVIDER_BASE_URL ?? null
+  modelProviderBaseUrl: process.env.PUPPENCLAW_MODEL_PROVIDER_BASE_URL ?? null,
+  subagentModel: process.env.PUPPENCLAW_MODEL_PROVIDER_SUBAGENT_MODEL ?? null,
+  subagentEffort: process.env.PUPPENCLAW_MODEL_PROVIDER_SUBAGENT_EFFORT ?? null,
+  subagentMaxThreads: process.env.PUPPENCLAW_MODEL_PROVIDER_SUBAGENT_MAX_THREADS ?? null,
+  reasoningEffort: process.env.PUPPENCLAW_MODEL_PROVIDER_REASONING_EFFORT ?? null
 }), "utf8");
 
 const answer = \`Captured permission turn \${invocation}.\`;
@@ -774,6 +778,10 @@ describe("AcpxSessionManager", () => {
         modelProviderModel: string | null;
         modelProviderKind: string | null;
         modelProviderBaseUrl: string | null;
+        subagentModel: string | null;
+        subagentEffort: string | null;
+        subagentMaxThreads: string | null;
+        reasoningEffort: string | null;
       };
       expect(captured).toEqual({
         direct: "/opt/puppenclaw/codex",
@@ -782,7 +790,11 @@ describe("AcpxSessionManager", () => {
         modelProviderId: "fake-openai-compatible",
         modelProviderModel: "fake-model",
         modelProviderKind: "codex-openai-compatible",
-        modelProviderBaseUrl: null
+        modelProviderBaseUrl: null,
+        subagentModel: null,
+        subagentEffort: null,
+        subagentMaxThreads: null,
+        reasoningEffort: null
       });
     } finally {
       if (previousPersistent == null) {
@@ -882,6 +894,166 @@ describe("AcpxSessionManager", () => {
       modelProviderId: "local-glm",
       modelProvider: refreshedProvider
     });
+  });
+
+  it("passes a local subagent policy to the Codex wrapper instead of CLI model overrides", async () => {
+    const workspaceDir = await createTempDir("puppenclaw-codex-subagent-policy-");
+    const codexCommand = await resolveFakeCodexPermissionCommand(workspaceDir);
+    const { store, outputRouter } = await createStoreAndRouter(workspaceDir);
+    const policyEnvNames = [
+      "PUPPENCLAW_MODEL_PROVIDER_SUBAGENT_MODEL",
+      "PUPPENCLAW_MODEL_PROVIDER_SUBAGENT_EFFORT",
+      "PUPPENCLAW_MODEL_PROVIDER_SUBAGENT_MAX_THREADS",
+      "PUPPENCLAW_MODEL_PROVIDER_REASONING_EFFORT"
+    ] as const;
+    const previousEnv = new Map(policyEnvNames.map((name) => [name, process.env[name]]));
+    // A daemon environment must never inject or override a session's policy.
+    for (const name of policyEnvNames) {
+      process.env[name] = "inherited-daemon-value";
+    }
+    const readArgs = async (turn: number) =>
+      JSON.parse(
+        await readFile(join(workspaceDir, `.fake-codex-permission-args-${turn}.json`), "utf8")
+      ) as string[];
+    const readEnv = async (turn: number) =>
+      JSON.parse(
+        await readFile(join(workspaceDir, `.fake-codex-permission-env-${turn}.json`), "utf8")
+      ) as Record<string, string | null>;
+    const argsAfterOutputPath = (args: string[]) =>
+      args.slice(args.indexOf("--output-last-message") + 2);
+
+    try {
+      const manager = new AcpxSessionManager({
+        config: makeConfig({ agentCommands: { codex: codexCommand } }),
+        logger: { info() {}, warn() {}, error() {}, debug() {} },
+        store,
+        outputRouter
+      });
+      const provider = {
+        id: "remote_langdock_gpt6_sol_medium",
+        kind: "codex-openai-compatible" as const,
+        model: "gpt-6-sol",
+        baseUrl: "http://127.0.0.1:18161/v1",
+        authTokenEnv: "LANGDOCK_API_KEY",
+        wireApi: "responses" as const
+      };
+
+      await manager.start({
+        agent: "codex",
+        name: "codex-subagent-policy",
+        directory: workspaceDir,
+        task: "Plan with local workers.",
+        effort: "medium",
+        model: "gpt-6-sol",
+        modelProviderId: provider.id,
+        modelProvider: {
+          ...provider,
+          subagents: { model: "chat", effort: "xhigh", maxConcurrentThreads: 6 }
+        },
+        contextFiles: []
+      });
+      const policyArgs = await readArgs(0);
+      expect(argsAfterOutputPath(policyArgs)).toEqual(["-"]);
+      expect(policyArgs).not.toContain("-m");
+      expect(policyArgs).not.toContain("-c");
+      expect(policyArgs.some((arg) => arg.includes("model_reasoning_effort"))).toBe(false);
+      expect(await readEnv(0)).toMatchObject({
+        modelProviderId: provider.id,
+        modelProviderModel: "gpt-6-sol",
+        modelProviderKind: "codex-openai-compatible",
+        subagentModel: "chat",
+        subagentEffort: "xhigh",
+        subagentMaxThreads: "6",
+        reasoningEffort: "medium"
+      });
+
+      const refreshedPolicy = { model: "chat", effort: "high" as const, maxConcurrentThreads: 3 };
+      await manager.send({
+        name: "codex-subagent-policy",
+        message: "Continue with a refreshed worker policy.",
+        modelProviderId: provider.id,
+        modelProvider: { ...provider, subagents: refreshedPolicy },
+        contextFiles: []
+      });
+      expect(argsAfterOutputPath(await readArgs(1))).toEqual(["-"]);
+      expect(await readEnv(1)).toMatchObject({
+        subagentModel: "chat",
+        subagentEffort: "high",
+        subagentMaxThreads: "3",
+        reasoningEffort: "medium"
+      });
+      expect(store.getSession("codex-subagent-policy")?.modelProvider).toEqual({
+        ...provider,
+        subagents: refreshedPolicy
+      });
+
+      // A fork keeps the source's policy, so its first turn is pinned too.
+      await manager.fork({ source: "codex-subagent-policy", target: "codex-subagent-policy-fork" });
+      expect(argsAfterOutputPath(await readArgs(2))).toEqual(["-"]);
+      expect(await readEnv(2)).toMatchObject({
+        subagentModel: "chat",
+        subagentEffort: "high",
+        subagentMaxThreads: "3",
+        reasoningEffort: "medium"
+      });
+      expect(store.getSession("codex-subagent-policy-fork")?.modelProvider).toEqual({
+        ...provider,
+        subagents: refreshedPolicy
+      });
+      // Without `-m`, a different requested model would be dropped silently.
+      await expect(
+        manager.fork({
+          source: "codex-subagent-policy",
+          target: "codex-subagent-policy-luna",
+          model: "gpt-6-luna"
+        })
+      ).rejects.toMatchObject({ code: "MODEL_PROVIDER_SUBAGENT_POLICY_CONFLICT" });
+      await expect(readArgs(3)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(store.getSession("codex-subagent-policy-luna")).toMatchObject({ state: "failed" });
+
+      // Dropping the policy restores today's CLI overrides and removes every
+      // policy variable, including inherited ones.
+      await manager.send({
+        name: "codex-subagent-policy",
+        message: "Continue without local workers.",
+        modelProviderId: provider.id,
+        modelProvider: provider,
+        contextFiles: []
+      });
+      const plainArgs = await readArgs(3);
+      expect(plainArgs).toEqual([
+        "exec",
+        "--cd",
+        workspaceDir,
+        "--skip-git-repo-check",
+        "--sandbox",
+        "read-only",
+        "--json",
+        "--output-last-message",
+        expect.stringMatching(/codex-subagent-policy-\d+-last-message\.txt$/u),
+        "-m",
+        "gpt-6-sol",
+        "-c",
+        'model_reasoning_effort="medium"',
+        "-"
+      ]);
+      expect(await readEnv(3)).toMatchObject({
+        modelProviderModel: "gpt-6-sol",
+        subagentModel: null,
+        subagentEffort: null,
+        subagentMaxThreads: null,
+        reasoningEffort: null
+      });
+      expect(store.getSession("codex-subagent-policy")?.modelProvider).toEqual(provider);
+    } finally {
+      for (const [name, value] of previousEnv) {
+        if (value == null) {
+          delete process.env[name];
+        } else {
+          process.env[name] = value;
+        }
+      }
+    }
   });
 
   it("refreshes a same-id Claude Code model and effort without losing transcript", async () => {

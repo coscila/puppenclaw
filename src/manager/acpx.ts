@@ -647,6 +647,41 @@ function buildCodexPermissionArgs(mode: PermissionMode): string[] {
     : ["--sandbox", "read-only"];
 }
 
+// Read by the Codex provider wrapper. They come only from the session's
+// validated modelProvider.subagents and resolved effort, never from the
+// daemon's own environment.
+const CODEX_SUBAGENT_POLICY_ENV_NAMES = [
+  "PUPPENCLAW_MODEL_PROVIDER_SUBAGENT_MODEL",
+  "PUPPENCLAW_MODEL_PROVIDER_SUBAGENT_EFFORT",
+  "PUPPENCLAW_MODEL_PROVIDER_SUBAGENT_MAX_THREADS",
+  "PUPPENCLAW_MODEL_PROVIDER_REASONING_EFFORT"
+] as const;
+
+function withoutInheritedCodexSubagentPolicy(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const scrubbed = { ...env };
+  for (const name of CODEX_SUBAGENT_POLICY_ENV_NAMES) {
+    delete scrubbed[name];
+  }
+  return scrubbed;
+}
+
+function buildCodexModelArgs(
+  session: Pick<SessionInfo, "model" | "runtimeEffort" | "modelProvider">
+): string[] {
+  // With a local subagent policy the wrapper writes the main model and effort
+  // into config.toml next to the pinned subagent roles. CLI overrides would
+  // take precedence over those layers, so they are omitted.
+  if (session.modelProvider?.subagents != null) {
+    return [];
+  }
+  return [
+    ...(session.model != null ? ["-m", session.model] : []),
+    ...(session.runtimeEffort != null
+      ? ["-c", `model_reasoning_effort="${session.runtimeEffort}"`]
+      : [])
+  ];
+}
+
 function buildCodexPermissionPrompt(promptText: string, mode: PermissionMode): string {
   if (mode !== "deny-all") {
     return promptText;
@@ -3889,6 +3924,15 @@ export class AcpxSessionManager implements ISessionManager {
         : {}),
       ...(modelProvider.reasoningProfile != null
         ? { PUPPENCLAW_MODEL_PROVIDER_REASONING_PROFILE: modelProvider.reasoningProfile }
+        : {}),
+      ...(modelProvider.subagents != null
+        ? {
+            PUPPENCLAW_MODEL_PROVIDER_SUBAGENT_MODEL: modelProvider.subagents.model,
+            PUPPENCLAW_MODEL_PROVIDER_SUBAGENT_EFFORT: modelProvider.subagents.effort,
+            PUPPENCLAW_MODEL_PROVIDER_SUBAGENT_MAX_THREADS: String(
+              modelProvider.subagents.maxConcurrentThreads
+            )
+          }
         : {})
     };
   }
@@ -4972,6 +5016,19 @@ export class AcpxSessionManager implements ISessionManager {
     permissionMode: PermissionMode;
     interactionMode?: InteractionMode;
   }): Promise<TurnResult> {
+    const subagents = params.session.modelProvider?.subagents;
+    if (
+      subagents != null &&
+      params.session.model != null &&
+      params.session.model !== params.session.modelProvider?.model
+    ) {
+      // Without `-m` the wrapper runs the provider's model; refuse rather than
+      // silently dropping a different requested session model.
+      throw new PuppenclawError(
+        "MODEL_PROVIDER_SUBAGENT_POLICY_CONFLICT",
+        "A Codex session with a local subagent policy must use its model provider's model."
+      );
+    }
     const tmpDir = join(params.session.directory, ".puppenclaw", "tmp");
     await mkdir(tmpDir, { recursive: true });
     const outputPath = join(
@@ -4989,10 +5046,7 @@ export class AcpxSessionManager implements ISessionManager {
       "--json",
       "--output-last-message",
       outputPath,
-      ...(params.session.model != null ? ["-m", params.session.model] : []),
-      ...(params.session.runtimeEffort != null
-        ? ["-c", `model_reasoning_effort="${params.session.runtimeEffort}"`]
-        : []),
+      ...buildCodexModelArgs(params.session),
       "-"
     ];
     const codexCommand = this.deps.config.codexCommand?.trim();
@@ -5003,8 +5057,12 @@ export class AcpxSessionManager implements ISessionManager {
     const spawnCommand = resolveSpawnCommand(codexCommand ?? providerLauncher, directCommandArgs);
     const runtimeEnv = this.modelProviderRuntimeEnv(params.session.modelProvider);
     const env = {
-      ...process.env,
+      ...withoutInheritedCodexSubagentPolicy(process.env),
       ...(runtimeEnv ?? {}),
+      // Replaces the `-c model_reasoning_effort` override omitted above.
+      ...(subagents != null && params.session.runtimeEffort != null
+        ? { PUPPENCLAW_MODEL_PROVIDER_REASONING_EFFORT: params.session.runtimeEffort }
+        : {}),
       // Derived only from Puppenclaw's validated turn controls. The Codex
       // wrapper converts this out-of-band value into trusted model
       // instructions, so user prompt text cannot elevate a planning turn.

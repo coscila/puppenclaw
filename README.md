@@ -308,6 +308,23 @@ marks it unavailable: the current ACP boundary cannot safely represent Ultracode
 progress, background-run, and multiplexing lifecycle. A Claude Ultracode request therefore fails
 clearly instead of silently substituting Max or a prompt instruction.
 
+### Codex local subagent policy
+
+A `codex-openai-compatible` model provider may carry an optional, strict
+`modelProvider.subagents` object: `{ "model": "chat", "effort": "xhigh", "maxConcurrentThreads": 6 }`
+(`maxConcurrentThreads` is an integer from 1 to 16). Other provider kinds reject it. The policy is
+persisted with the session, copied by forks, replaced by a same-id provider refresh, and part of the
+turn fingerprint only when present, so existing fingerprints stay unchanged.
+
+With a policy, the one-shot Codex turn passes it to the provider wrapper as
+`PUPPENCLAW_MODEL_PROVIDER_SUBAGENT_MODEL`, `PUPPENCLAW_MODEL_PROVIDER_SUBAGENT_EFFORT` and
+`PUPPENCLAW_MODEL_PROVIDER_SUBAGENT_MAX_THREADS`, and passes the main turn's resolved effort as
+`PUPPENCLAW_MODEL_PROVIDER_REASONING_EFFORT`. It omits the `-m` and `-c model_reasoning_effort`
+CLI overrides, because the wrapper writes the main model and effort into `config.toml` next to the
+pinned subagent roles. A session model that differs from the provider's model fails with
+`MODEL_PROVIDER_SUBAGENT_POLICY_CONFLICT`. Without a policy, arguments and environment are
+unchanged, and the daemon never forwards these variables from its own environment.
+
 ### Config Notes
 
 - `backend`
