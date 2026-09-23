@@ -70,6 +70,17 @@ export const planningProfileZod = z.enum(["off", "quick", "deep"]);
 export const responseFormatZod = z.enum(["text", "json"]);
 export const exposureModeZod = z.enum(["read-only", "execute"]);
 export const remoteVerbZod = z.enum(REMOTE_CONTROL_VERBS);
+export const MODEL_PROVIDER_SUBAGENT_MAX_THREADS = 16;
+// Pins every Codex subagent of a session to one model and reasoning effort.
+// Only an OpenAI-compatible Codex provider can carry it: the Codex wrapper
+// turns it into pinned agent roles, and the provider's proxy enforces it.
+export const modelProviderSubagentPolicyZod = z
+  .object({
+    model: nonEmptyString,
+    effort: effortLevelZod,
+    maxConcurrentThreads: z.number().int().min(1).max(MODEL_PROVIDER_SUBAGENT_MAX_THREADS)
+  })
+  .strict();
 export const modelProviderConfigZod = z
   .object({
     id: skillNameString,
@@ -79,9 +90,19 @@ export const modelProviderConfigZod = z
     reasoningProfile: z.enum(["claude", "codex", "glm-5.2", "qwen-3.6", "qwen-3.8"]).optional(),
     baseUrl: nonEmptyString.optional(),
     authTokenEnv: nonEmptyString.optional(),
-    wireApi: z.enum(["responses"]).optional()
+    wireApi: z.enum(["responses"]).optional(),
+    subagents: modelProviderSubagentPolicyZod.optional()
   })
-  .strict();
+  .strict()
+  .superRefine((provider, context) => {
+    if (provider.subagents != null && provider.kind !== "codex-openai-compatible") {
+      context.addIssue({
+        code: "custom",
+        path: ["subagents"],
+        message: "modelProvider.subagents requires kind codex-openai-compatible."
+      });
+    }
+  });
 export const orchestrationStepKindZod = z.enum([
   "judge",
   "research",
@@ -913,7 +934,17 @@ export const toolStartSchema = Type.Object({
       ),
       baseUrl: Type.Optional(Type.String({ minLength: 1 })),
       authTokenEnv: Type.Optional(Type.String({ minLength: 1 })),
-      wireApi: Type.Optional(Type.Literal("responses"))
+      wireApi: Type.Optional(Type.Literal("responses")),
+      subagents: Type.Optional(
+        Type.Object({
+          model: Type.String({ minLength: 1 }),
+          effort: reasoningModeType(),
+          maxConcurrentThreads: Type.Integer({
+            minimum: 1,
+            maximum: MODEL_PROVIDER_SUBAGENT_MAX_THREADS
+          })
+        })
+      )
     })
   ),
   contextFiles: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),

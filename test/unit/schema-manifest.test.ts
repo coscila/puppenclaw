@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   buildPluginManifest,
+  effortLevelZod,
   pluginConfigZod,
   pluginSendParamsZod,
   pluginStartParamsZod,
@@ -234,6 +235,131 @@ describe("plugin manifest and config schema", () => {
     ).properties;
     expect(toolProperties).not.toHaveProperty("modelProviderId");
     expect(toolProperties).not.toHaveProperty("modelProvider");
+  });
+
+  describe("model provider subagent policy", () => {
+    const provider = {
+      id: "remote_langdock_gpt6_sol_medium",
+      kind: "codex-openai-compatible" as const,
+      model: "gpt-6-sol",
+      baseUrl: "http://127.0.0.1:18161/v1",
+      authTokenEnv: "LANGDOCK_API_KEY",
+      wireApi: "responses" as const
+    };
+    const subagents = { model: "chat", effort: "xhigh" as const, maxConcurrentThreads: 6 };
+    const start = (modelProvider: Record<string, unknown>) => ({
+      agent: "codex" as const,
+      name: "local-workers",
+      directory: "/tmp/local-workers",
+      task: "Plan with local workers.",
+      modelProviderId: provider.id,
+      modelProvider
+    });
+    const send = (modelProvider: Record<string, unknown>) => ({
+      name: "local-workers",
+      message: "Refresh the provider with local workers.",
+      modelProviderId: provider.id,
+      modelProvider
+    });
+
+    it("accepts and keeps a subagent policy on start and follow-up refreshes", () => {
+      const modelProvider = { ...provider, subagents };
+      expect(startParamsZod.parse(start(modelProvider)).modelProvider).toEqual(modelProvider);
+      expect(pluginStartParamsZod.parse(start(modelProvider)).modelProvider).toEqual(
+        modelProvider
+      );
+      expect(sendParamsZod.parse(send(modelProvider)).modelProvider).toEqual(modelProvider);
+      for (const maxConcurrentThreads of [1, 16]) {
+        expect(
+          startParamsZod.safeParse(
+            start({ ...provider, subagents: { ...subagents, maxConcurrentThreads } })
+          ).success
+        ).toBe(true);
+      }
+    });
+
+    it("keeps providers without a subagent policy unchanged", () => {
+      const parsed = startParamsZod.parse(start(provider)).modelProvider;
+      expect(parsed).toEqual(provider);
+      expect(parsed).not.toHaveProperty("subagents");
+    });
+
+    it.each([
+      ["an unknown policy key", { ...subagents, fork: "all" }],
+      ["a missing model", { effort: "xhigh", maxConcurrentThreads: 6 }],
+      ["a blank model", { ...subagents, model: "  " }],
+      ["a missing effort", { model: "chat", maxConcurrentThreads: 6 }],
+      ["an unknown effort", { ...subagents, effort: "extreme" }],
+      ["a missing thread cap", { model: "chat", effort: "xhigh" }],
+      ["a zero thread cap", { ...subagents, maxConcurrentThreads: 0 }],
+      ["a thread cap above 16", { ...subagents, maxConcurrentThreads: 17 }],
+      ["a fractional thread cap", { ...subagents, maxConcurrentThreads: 2.5 }],
+      ["a string thread cap", { ...subagents, maxConcurrentThreads: "6" }]
+    ])("rejects %s", (_label, policy) => {
+      expect(startParamsZod.safeParse(start({ ...provider, subagents: policy })).success).toBe(
+        false
+      );
+      expect(sendParamsZod.safeParse(send({ ...provider, subagents: policy })).success).toBe(
+        false
+      );
+    });
+
+    it.each([
+      ["codex-openai", { ...provider, kind: "codex-openai" }],
+      ["claude-code", { ...provider, kind: "claude-code" }],
+      ["an unspecified kind", { id: provider.id, model: provider.model }]
+    ])("rejects a subagent policy on %s providers", (_label, modelProvider) => {
+      const result = startParamsZod.safeParse(start({ ...modelProvider, subagents }));
+      expect(result.success).toBe(false);
+      expect(result.error?.issues[0]?.path).toEqual(["modelProvider", "subagents"]);
+      expect(sendParamsZod.safeParse(send({ ...modelProvider, subagents })).success).toBe(false);
+    });
+
+    it("mirrors the strict policy in the start tool schema", () => {
+      const modelProviderSchema = (
+        toolStartSchema as unknown as {
+          properties: {
+            modelProvider: {
+              additionalProperties: boolean;
+              required: string[];
+              properties: Record<string, Record<string, unknown>>;
+            };
+          };
+        }
+      ).properties.modelProvider;
+      expect(modelProviderSchema.required).not.toContain("subagents");
+      const subagentSchema = modelProviderSchema.properties.subagents as {
+        type: string;
+        additionalProperties: boolean;
+        required: string[];
+        properties: {
+          model: Record<string, unknown>;
+          effort: { anyOf: Array<{ const: string }> };
+          maxConcurrentThreads: Record<string, unknown>;
+        };
+      };
+      expect(subagentSchema.type).toBe("object");
+      expect(subagentSchema.additionalProperties).toBe(false);
+      expect([...subagentSchema.required].sort()).toEqual([
+        "effort",
+        "maxConcurrentThreads",
+        "model"
+      ]);
+      expect(Object.keys(subagentSchema.properties).sort()).toEqual([
+        "effort",
+        "maxConcurrentThreads",
+        "model"
+      ]);
+      expect(subagentSchema.properties.model).toEqual({ type: "string", minLength: 1 });
+      expect(subagentSchema.properties.effort.anyOf.map((entry) => entry.const)).toEqual([
+        ...effortLevelZod.options
+      ]);
+      expect(subagentSchema.properties.maxConcurrentThreads).toEqual({
+        type: "integer",
+        minimum: 1,
+        maximum: 16
+      });
+    });
   });
 
   it.each(["xhigh", "max", "ultra"] as const)(

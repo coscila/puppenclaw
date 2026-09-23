@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AcpxSessionManager } from "../../src/manager/acpx.js";
 import { OutputRouter } from "../../src/plugin/output-router.js";
 import { SessionStore } from "../../src/shared/store.js";
-import type { SessionInfo } from "../../src/shared/types.js";
+import type { ModelProviderSubagentPolicy, SessionInfo } from "../../src/shared/types.js";
 import {
   fingerprintSendRequest,
   fingerprintStartRequest
@@ -520,6 +520,125 @@ describe("durable turn requests", () => {
       );
     }
   );
+
+  describe("model provider subagent policy", () => {
+    const modelProvider = {
+      id: "remote_qwen38_xhigh",
+      label: "Local LLM (xhigh thinking)",
+      kind: "codex-openai-compatible" as const,
+      model: "chat",
+      reasoningProfile: "qwen-3.8" as const,
+      baseUrl: "http://127.0.0.1:18160/v1",
+      authTokenEnv: "PAISDB_AI_API_KEY",
+      wireApi: "responses" as const
+    };
+    const subagents: ModelProviderSubagentPolicy = {
+      model: "chat",
+      effort: "xhigh",
+      maxConcurrentThreads: 6
+    };
+    const startRequest = {
+      agent: "codex" as const,
+      name: " provider-golden ",
+      directory: "/var/tmp/puppenclaw-provider-golden",
+      task: " Keep this provider start stable. ",
+      interactionMode: "plan" as const,
+      permissionMode: "approve-reads" as const,
+      effort: "xhigh" as const,
+      modelProviderId: "remote_qwen38_xhigh",
+      modelProvider,
+      ownerKey: "owner.account.a.00000001",
+      contextFiles: [],
+      skills: []
+    };
+    const sendRequest = {
+      name: " provider-golden ",
+      message: " Keep this provider refresh stable. ",
+      interactionMode: "execute" as const,
+      permissionMode: "approve-all" as const,
+      effort: "xhigh" as const,
+      modelProviderId: "remote_qwen38_xhigh",
+      modelProvider,
+      contextFiles: []
+    };
+
+    it.skipIf(process.platform === "win32")(
+      "keeps provider start and send fingerprints golden without a subagent policy",
+      () => {
+        // Digests recorded before modelProvider.subagents existed. Changing them
+        // would make persisted turn keys stop replaying after an upgrade.
+        expect(fingerprintStartRequest(startRequest)).toBe(
+          "a8c690101f6fbd3dfabbfe8ae10a44235e3311c8a513a96e414c604ce38ff0b9"
+        );
+        expect(fingerprintSendRequest(sendRequest)).toBe(
+          "996a03d6b4cfd4399a9700697c7481d9eca31089226b0e0f86e67791d1b16093"
+        );
+      }
+    );
+
+    it("binds every subagent policy field into provider fingerprints", () => {
+      const withPolicy = (policy: ModelProviderSubagentPolicy) => ({
+        start: fingerprintStartRequest({
+          ...startRequest,
+          modelProvider: { ...modelProvider, subagents: policy }
+        }),
+        send: fingerprintSendRequest({
+          ...sendRequest,
+          modelProvider: { ...modelProvider, subagents: policy }
+        })
+      });
+      const base = withPolicy(subagents);
+      expect(base.start).not.toBe(fingerprintStartRequest(startRequest));
+      expect(base.send).not.toBe(fingerprintSendRequest(sendRequest));
+      expect(withPolicy({ ...subagents })).toEqual(base);
+      for (const variant of [
+        { ...subagents, model: "chat-2" },
+        { ...subagents, effort: "high" as const },
+        { ...subagents, maxConcurrentThreads: 7 }
+      ]) {
+        const changed = withPolicy(variant);
+        expect(changed.start).not.toBe(base.start);
+        expect(changed.send).not.toBe(base.send);
+      }
+    });
+
+    it("persists a subagent policy with the session across a store restart", async () => {
+      const dir = await createTempDir("puppenclaw-subagent-policy-persist-");
+      const first = await SessionStore.open(dir);
+      await first.upsertSession({
+        ...session("subagent-policy", dir),
+        agent: "codex",
+        model: "gpt-6-sol",
+        modelProviderId: "remote_langdock_gpt6_sol_medium",
+        modelProvider: {
+          id: "remote_langdock_gpt6_sol_medium",
+          kind: "codex-openai-compatible",
+          model: "gpt-6-sol",
+          baseUrl: "http://127.0.0.1:18161/v1",
+          authTokenEnv: "LANGDOCK_API_KEY",
+          wireApi: "responses",
+          subagents
+        }
+      });
+      await first.close();
+
+      const reopened = await SessionStore.open(dir);
+      try {
+        expect(reopened.getRecoveryStatus()).toEqual({ required: false });
+        expect(reopened.getSession("subagent-policy")?.modelProvider).toEqual({
+          id: "remote_langdock_gpt6_sol_medium",
+          kind: "codex-openai-compatible",
+          model: "gpt-6-sol",
+          baseUrl: "http://127.0.0.1:18161/v1",
+          authTokenEnv: "LANGDOCK_API_KEY",
+          wireApi: "responses",
+          subagents
+        });
+      } finally {
+        await reopened.close();
+      }
+    });
+  });
 
   it("replays a seeded pre-owner start receipt after a store restart", async () => {
     const workspaceDir = await createTempDir("puppenclaw-legacy-start-replay-");

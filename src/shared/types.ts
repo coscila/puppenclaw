@@ -36,6 +36,7 @@ import type {
   focusParamsZod,
   suspendParamsZod,
   modelProviderConfigZod,
+  modelProviderSubagentPolicyZod,
   ownerSessionCleanupParamsZod,
   ownerSessionListParamsZod,
   runStateZod,
@@ -65,6 +66,7 @@ export type ResponseFormat = z.infer<typeof responseFormatZod>;
 export type ExposureMode = z.infer<typeof exposureModeZod>;
 export type RemoteVerb = z.infer<typeof remoteVerbZod>;
 export type ModelProviderConfig = z.infer<typeof modelProviderConfigZod>;
+export type ModelProviderSubagentPolicy = z.infer<typeof modelProviderSubagentPolicyZod>;
 export type PluginConfig = z.input<typeof pluginConfigZod>;
 export type ParsedPluginConfig = z.output<typeof pluginConfigZod>;
 export type McpServerConfig = z.infer<typeof mcpServerConfigZod>;

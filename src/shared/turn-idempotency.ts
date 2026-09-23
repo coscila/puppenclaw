@@ -18,7 +18,19 @@ function canonicalProvider(provider: ModelProviderConfig | undefined): Canonical
     reasoningProfile: provider.reasoningProfile ?? null,
     baseUrl: provider.baseUrl ?? null,
     authTokenEnv: provider.authTokenEnv ?? null,
-    wireApi: provider.wireApi ?? null
+    wireApi: provider.wireApi ?? null,
+    // Fingerprints are durable replay state. A provider without a subagent
+    // policy must keep the exact canonical shape (and digest) it had before
+    // the field existed, so the key is added only when the policy is present.
+    ...(provider.subagents != null
+      ? {
+          subagents: {
+            model: provider.subagents.model,
+            effort: provider.subagents.effort,
+            maxConcurrentThreads: provider.subagents.maxConcurrentThreads
+          }
+        }
+      : {})
   };
 }
 
