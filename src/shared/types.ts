@@ -226,6 +226,15 @@ export type UsageLedgerEntry = {
   stopReason?: string;
   durationMs: number;
   timestamp: string;
+  /**
+   * Present when one turn is recorded as several per-model rows (Codex
+   * `ocsl.model_usage`): all rows of the turn share it, so turn counts use
+   * DISTINCT turnId. Legacy single-row turns omit it and count by row id.
+   */
+  turnId?: string;
+  role?: "main" | "subagent";
+  /** Native Codex threads aggregated into this row. */
+  threads?: number;
 };
 
 export type SessionTranscriptEntry = {

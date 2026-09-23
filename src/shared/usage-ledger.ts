@@ -25,6 +25,12 @@ function toInt(value: unknown): number {
 }
 
 /**
+ * One turn may be stored as several per-model rows sharing a payload turnId;
+ * legacy rows have none and remain one turn each (their unique row id).
+ */
+const TURN_COUNT_SQL = "COUNT(DISTINCT COALESCE(json_extract(payload, '$.turnId'), id))";
+
+/**
  * Durable, append-only per-turn token ledger backed by its own SQLite database.
  *
  * It is deliberately a separate store from `SessionStore` (state.json) so that
@@ -75,6 +81,23 @@ export class UsageLedgerStore {
     this.db.close();
   }
 
+  /** Appends all rows of one turn atomically; existing ids are left untouched. */
+  appendMany(entries: readonly UsageLedgerEntry[]): void {
+    if (entries.length === 0) {
+      return;
+    }
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const entry of entries) {
+        this.append(entry);
+      }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   append(entry: UsageLedgerEntry): void {
     this.db
       .prepare(
@@ -104,7 +127,7 @@ export class UsageLedgerStore {
   perSessionTotals(sessionName: string): UsageTotals {
     const row = this.db
       .prepare(
-        `SELECT COUNT(*) AS turns,
+        `SELECT ${TURN_COUNT_SQL} AS turns,
                 SUM(input) AS input, SUM(output) AS output,
                 SUM(cache_read) AS cache_read, SUM(cache_write) AS cache_write,
                 SUM(total) AS total
@@ -129,7 +152,7 @@ export class UsageLedgerStore {
     const args = since != null ? [since] : [];
     const rows = this.db
       .prepare(
-        `SELECT provider, model, COUNT(*) AS turns,
+        `SELECT provider, model, ${TURN_COUNT_SQL} AS turns,
                 SUM(input) AS input, SUM(output) AS output,
                 SUM(cache_read) AS cache_read, SUM(cache_write) AS cache_write,
                 SUM(total) AS total
@@ -150,7 +173,7 @@ export class UsageLedgerStore {
     const args = since != null ? [since] : [];
     const row = this.db
       .prepare(
-        `SELECT COUNT(*) AS turns,
+        `SELECT ${TURN_COUNT_SQL} AS turns,
                 SUM(input) AS input, SUM(output) AS output,
                 SUM(cache_read) AS cache_read, SUM(cache_write) AS cache_write,
                 SUM(total) AS total

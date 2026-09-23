@@ -475,15 +475,17 @@ export async function createDaemonServer(params: {
     )
   );
 
-  app.get("/session/:name/cost", async (request) =>
-    ok(
+  app.get("/session/:name/cost", async (request) => {
+    const limit = boundedCostHistoryLimit((request.query as { limit?: unknown } | undefined)?.limit);
+    return ok(
       await manager.cost(
         costParamsZod.parse({
-          name: (request.params as { name: string }).name
+          name: (request.params as { name: string }).name,
+          ...(limit != null ? { limit } : {})
         })
       )
-    )
-  );
+    );
+  });
 
   app.get("/session/:name/processes", async (request) =>
     ok(
@@ -838,6 +840,18 @@ export async function createDaemonServer(params: {
   });
 
   return { app };
+}
+
+/**
+ * `?limit=` for per-session cost history, clamped to the schema's 1..1000.
+ * A missing or non-numeric value keeps the manager default.
+ */
+function boundedCostHistoryLimit(value: unknown): number | undefined {
+  const raw = Array.isArray(value) ? value[0] : value;
+  if (typeof raw !== "string" || !/^\s*\d{1,12}\s*$/u.test(raw)) {
+    return undefined;
+  }
+  return Math.min(1000, Math.max(1, Number(raw)));
 }
 
 function publicRecoveryStatus(status: StateRecoveryStatus): Record<string, unknown> {
