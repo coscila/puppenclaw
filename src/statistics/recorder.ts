@@ -290,15 +290,26 @@ export class TurnStatisticsRecorder {
    * Accepts the OCSL wrapper's per-thread usage (already validated and grouped).
    * The latest line wins; the turn total becomes the sum over its models, which
    * includes the main thread, so it replaces rather than adds to Codex usage.
+   *
+   * Subagents ran on the session's provider unless the session pinned them to
+   * local model workers (`localWorkers`, from `modelProvider.subagents`): only
+   * those carry a null provider id, which the consumer resolves to the preset
+   * the policy pins them to.
    */
-  observeModelUsage(name: string, groups: readonly ModelUsageGroup[]): void {
+  observeModelUsage(
+    name: string,
+    groups: readonly ModelUsageGroup[],
+    options: { localWorkers?: boolean } = {},
+  ): void {
     const meter = this.active.get(name);
     if (!meter || meter.ended || groups.length === 0) return;
     const models: RunnerTurnModelStatistics[] = groups.map((group) => ({
       role: group.role,
       model: group.model,
       modelProviderId:
-        group.role === "main" ? meter.row.modelProviderId : null,
+        group.role === "subagent" && options.localWorkers === true
+          ? null
+          : meter.row.modelProviderId,
       threads: group.threads,
       tokens: statisticsTokens(group.usage, "codex", true),
     }));

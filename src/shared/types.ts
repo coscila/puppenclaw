@@ -235,6 +235,13 @@ export type UsageLedgerEntry = {
   role?: "main" | "subagent";
   /** Native Codex threads aggregated into this row. */
   threads?: number;
+  /**
+   * Subagent rows only. True when the session pinned its subagents to local
+   * model workers (`modelProvider.subagents`): the threads ran on that local
+   * model, not on `provider`, which is still the session provider. False when
+   * the subagents ran on the session provider itself.
+   */
+  localWorkers?: boolean;
 };
 
 export type SessionTranscriptEntry = {

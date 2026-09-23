@@ -10,6 +10,7 @@ import {
   parseOcslModelUsage,
   type ModelUsageGroup
 } from "../../src/shared/model-usage.js";
+import type { ModelProviderConfig } from "../../src/shared/types.js";
 import { UsageLedgerStore } from "../../src/shared/usage-ledger.js";
 import { TurnStatisticsRecorder } from "../../src/statistics/recorder.js";
 import { TurnStatisticsStore } from "../../src/statistics/store.js";
@@ -129,7 +130,7 @@ describe("statistics recorder per-model usage", () => {
     const { store, recorder } = await recorderFor("models");
     recorder.observeEvent("models", { type: "token_count", info: { total_token_usage: { input_tokens: 5, output_tokens: 5 } } }, "codex");
     recorder.observeEvent("models", { type: "turn.completed", usage: { input_tokens: 1000, cached_input_tokens: 600, output_tokens: 50 } }, "codex");
-    recorder.observeModelUsage("models", groups);
+    recorder.observeModelUsage("models", groups, { localWorkers: true });
     // A late native event cannot replace or add to the wrapper totals.
     recorder.observeEvent("models", { type: "turn.completed", usage: { input_tokens: 7, output_tokens: 7 } }, "codex");
     await recorder.settle("models", "completed");
@@ -146,6 +147,20 @@ describe("statistics recorder per-model usage", () => {
         tokens: { input: 100000, output: 5000, cacheRead: 80000, cacheWrite: 0, reasoning: 4000, total: 105000, quality: "measured" }
       }
     ]);
+    await recorder.close();
+  });
+
+  it("keeps subagents on the session provider without a local worker policy", async () => {
+    const { store, recorder } = await recorderFor("plain-subagents");
+    const own = parseOcslModelUsage(line([MAIN, thread("helper", "gpt-6-luna", usage(700, 100, 70))]))!;
+    recorder.observeModelUsage("plain-subagents", own);
+    await recorder.settle("plain-subagents", "completed");
+    const row = store.page().turns[0]!;
+    expect(row.models?.map((model) => [model.role, model.model, model.modelProviderId, model.tokens.total])).toEqual([
+      ["main", "gpt-6-luna", "remote_langdock_gpt6_luna_xhigh", 1050],
+      ["subagent", "gpt-6-luna", "remote_langdock_gpt6_luna_xhigh", 770]
+    ]);
+    expect(row.tokens.total).toBe(1820);
     await recorder.close();
   });
 
@@ -179,6 +194,14 @@ describe("statistics recorder per-model usage", () => {
   });
 });
 
+const GPT6_PROVIDER: ModelProviderConfig = {
+  id: "remote_langdock_gpt6_luna_xhigh", kind: "codex-openai-compatible", model: "gpt-6-luna"
+};
+// "Use local model workers": every subagent is pinned to the Local LLM.
+const LOCAL_WORKER_PROVIDER: ModelProviderConfig = {
+  ...GPT6_PROVIDER, subagents: { model: "chat", effort: "xhigh", maxConcurrentThreads: 6 }
+};
+
 async function runnerSetup() {
   const root = await createTempDir("codex-model-usage-");
   const { store, outputRouter } = await createStoreAndRouter(root);
@@ -194,10 +217,10 @@ async function runnerSetup() {
     logger: { info() {}, warn() {}, error() {}, debug() {} },
     store, outputRouter, statistics, ledger
   });
-  const start = (scenario: string, name = "lab") => manager.start({
+  const start = (scenario: string, name = "lab", modelProvider: ModelProviderConfig = LOCAL_WORKER_PROVIDER) => manager.start({
     agent: "codex", name, directory: root,
     task: `SCENARIO:${scenario}`, contextFiles: [],
-    modelProvider: { id: "remote_langdock_gpt6_luna_xhigh", kind: "codex-openai-compatible", model: "gpt-6-luna" },
+    modelProvider,
     statisticsContext: { version: 1, chatId: "chat", attemptId: `${name}-${scenario}` }
   });
   const diagnostics = async (): Promise<Array<{ eventCounts: Record<string, number> }>> => {
@@ -247,7 +270,7 @@ describe("Codex one-shot turns with the ocsl.model_usage line", () => {
         const turnId = row.runnerTurnId;
         expect(history.map(({ timestamp: _t, durationMs: _d, id: _id, ...rest }) => rest).sort((a, b) => a.model.localeCompare(b.model))).toEqual([
           { sessionName: "lab", agent: "codex", provider: "remote_langdock_gpt6_luna_xhigh", model: "chat",
-            usage: SUB_LEDGER_USAGE, turnId, role: "subagent", threads: 2 },
+            usage: SUB_LEDGER_USAGE, turnId, role: "subagent", threads: 2, localWorkers: true },
           { sessionName: "lab", agent: "codex", provider: "remote_langdock_gpt6_luna_xhigh", model: "gpt-6-luna",
             usage: MAIN_LEDGER_USAGE, turnId, role: "main", threads: 1 }
         ]);
@@ -269,6 +292,32 @@ describe("Codex one-shot turns with the ocsl.model_usage line", () => {
       }
     }
   );
+
+  it.each([
+    ["a GPT-6 chat without local workers", GPT6_PROVIDER],
+    ["a Local LLM medium chat", { id: "remote_qwen38_medium", kind: "codex-openai-compatible", model: "chat" } as const]
+  ])("keeps subagents on the session provider in %s", async (_label, provider: ModelProviderConfig) => {
+    const setup = await runnerSetup();
+    try {
+      await setup.start("line", "plain", provider);
+      const row = setup.statisticsStore.page().turns[0]!;
+      expect(row.tokens.total).toBe(106050);
+      expect(row.models?.map((model) => [model.role, model.model, model.modelProviderId, model.threads])).toEqual([
+        ["main", "gpt-6-luna", provider.id, 1],
+        ["subagent", "chat", provider.id, 2]
+      ]);
+      const history = setup.ledger.perSessionHistory("plain")
+        .map((entry) => [entry.role, entry.provider, entry.model, entry.localWorkers])
+        .sort((a, b) => String(a[0]).localeCompare(String(b[0])));
+      expect(history).toEqual([
+        ["main", provider.id, provider.model, undefined],
+        ["subagent", provider.id, "chat", false]
+      ]);
+    } finally {
+      await setup.statistics.close();
+      setup.ledger.close();
+    }
+  });
 
   it("uses the last valid line", async () => {
     const setup = await runnerSetup();

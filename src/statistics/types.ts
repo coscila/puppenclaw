@@ -20,8 +20,11 @@ export type StatisticsTokens = {
 };
 /**
  * Per-model split of one turn from the OCSL wrapper's `ocsl.model_usage` line:
- * native threads grouped by (role, model). The main orchestrator carries the
- * session's model provider id; subagents are attributed by the consumer.
+ * native threads grouped by (role, model). Entries carry the session's model
+ * provider id, since subagents normally run on it too. The exception is
+ * subagents of a session with a local subagent policy (`modelProvider.subagents`,
+ * "use local model workers"). They ran on the pinned local model instead, so
+ * their provider id is null and the consumer attributes them.
  */
 export type RunnerTurnModelStatistics = {
   role: "main" | "subagent";

@@ -103,6 +103,12 @@ type NativeModePreparation = {
 type TurnModelUsage = {
   /** The runner turn id shared by every per-model ledger row of this turn. */
   turnId: string;
+  /**
+   * The session pinned its subagents to local model workers
+   * (`modelProvider.subagents`), so subagent entries ran on the local model,
+   * not on the session provider.
+   */
+  localWorkers: boolean;
   entries: Array<{
     role: ModelUsageRole;
     model: string;
@@ -1457,8 +1463,10 @@ export class AcpxSessionManager implements ISessionManager {
 
   /**
    * One ledger row per (role, model) of the turn. The main row keeps today's
-   * provider/model derivation; subagent rows keep the session provider and
-   * name the model that actually ran. All rows share turnId and timestamp.
+   * provider/model derivation; subagent rows keep the session provider, name
+   * the model that actually ran and say whether they were local model workers
+   * (then they ran on the local model, not on that provider). All rows share
+   * turnId and timestamp.
    */
   private recordModelUsageRows(session: SessionInfo, turn: TurnResult, modelUsage: TurnModelUsage): void {
     const timestamp = nowIso();
@@ -1477,7 +1485,8 @@ export class AcpxSessionManager implements ISessionManager {
         timestamp,
         turnId: modelUsage.turnId,
         role: entry.role,
-        threads: entry.threads
+        threads: entry.threads,
+        ...(entry.role === "subagent" ? { localWorkers: modelUsage.localWorkers } : {})
       }));
     try {
       this.deps.ledger?.appendMany(entries);
@@ -5193,7 +5202,9 @@ export class AcpxSessionManager implements ISessionManager {
       }
       modelUsageGroups = groups; // the last valid line wins
       try {
-        this.deps.statistics?.observeModelUsage(params.session.name, groups);
+        this.deps.statistics?.observeModelUsage(params.session.name, groups, {
+          localWorkers: subagents != null
+        });
       } catch (error) {
         this.deps.logger.warn(
           `Unable to record per-model statistics for ${params.session.name}: ${ensureError(error).message}`
@@ -5301,6 +5312,7 @@ export class AcpxSessionManager implements ISessionManager {
       ? undefined
       : {
           turnId: runnerTurnId,
+          localWorkers: subagents != null,
           entries: modelUsageGroups.map((group) => ({
             role: group.role,
             model: group.model,
