@@ -262,6 +262,11 @@ export async function createDaemonServer(params: {
       serverControlled: true,
       userExecutionMarkersTrusted: false
     },
+    codexLocalSubagents: {
+      version: 1,
+      modelProviderField: "subagents",
+      cliModelOverrides: false
+    },
     structuredTurnSignals: true,
     structuredOutputEvents: true,
     providerFailureContracts: {

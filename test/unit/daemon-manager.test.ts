@@ -261,6 +261,7 @@ describe("DaemonSessionManager", () => {
         sessionTurnIdempotency?: unknown;
         sessionModelProviderRefresh?: boolean;
         codexTurnPolicy?: unknown;
+        codexLocalSubagents?: unknown;
         sessionOwnerCleanup?: unknown;
         sessionOutput?: boolean;
         sessionPurge?: boolean;
@@ -290,6 +291,11 @@ describe("DaemonSessionManager", () => {
         version: 1,
         serverControlled: true,
         userExecutionMarkersTrusted: false
+      });
+      expect(payload.codexLocalSubagents).toEqual({
+        version: 1,
+        modelProviderField: "subagents",
+        cliModelOverrides: false
       });
       expect(payload.sessionOwnerCleanup).toEqual({
         version: 1,

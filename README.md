@@ -323,7 +323,10 @@ With a policy, the one-shot Codex turn passes it to the provider wrapper as
 CLI overrides, because the wrapper writes the main model and effort into `config.toml` next to the
 pinned subagent roles. A session model that differs from the provider's model fails with
 `MODEL_PROVIDER_SUBAGENT_POLICY_CONFLICT`. Without a policy, arguments and environment are
-unchanged, and the daemon never forwards these variables from its own environment.
+unchanged, and the daemon never forwards these variables from its own environment. Daemons that
+support the policy advertise `codexLocalSubagents: { "version": 1, "modelProviderField": "subagents",
+"cliModelOverrides": false }` on `GET /capabilities`; clients should send `subagents` only then,
+because older daemons reject the unknown field.
 
 ### Config Notes
 
