@@ -120,6 +120,7 @@ export class AdvancedRuntime {
     if (req.method === "POST" && path === "/bulk/submit") { json(await this.submit(p, "bulk", bulkSubmitZod.parse(JSON.parse((await body(req)).toString())))); return; }
     const route = /^\/jobs\/([a-f0-9-]+)(?:\/(cancel|resume))?$/u.exec(path);
     if (route) {
+      if (p.jobId && req.method === "POST" && route[2]) throw new PuppenclawError("WORKER_CONTROL_DENIED", "Only the parent controller can cancel or resume worker jobs.");
       const job = this.requireJob(route[1]!, p);
       if (req.method === "GET" && !route[2]) { json(publicJob(job)); return; }
       if (req.method === "POST" && route[2] === "cancel") { await this.cancel(job.jobId); json(publicJob(this.store.job(job.jobId)!)); return; }
