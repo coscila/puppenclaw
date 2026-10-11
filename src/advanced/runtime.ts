@@ -1,0 +1,288 @@
+import { createHash, randomUUID } from "node:crypto";
+import { chmod, mkdir, unlink } from "node:fs/promises";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import type { Socket } from "node:net";
+import { Ajv, type ValidateFunction } from "ajv";
+import { PuppenclawError } from "../shared/errors.js";
+import { redactSensitiveText } from "../shared/utils.js";
+import type { AdvancedOrchestration, ModelProviderConfig, SessionInfo, StartParams, SendParams } from "../shared/types.js";
+import { AdvancedStore } from "./store.js";
+import { EgressPolicy, proxyConnect, proxyHttp } from "./egress.js";
+import { noUsage, UsageParser } from "./usage.js";
+import { agentSubmitZod, bulkSubmitZod, type AgentSubmit, type BulkSubmit, type ItemResult, type RuntimeDriver, type RuntimeParticipant, type UsageReceipt, type WorkerConfig, type WorkerJob } from "./types.js";
+
+const timestamp = () => new Date().toISOString();
+const hash = (input: unknown) => createHash("sha256").update(typeof input === "string" ? input : stable(input)).digest("hex");
+function stable(value: unknown): string { if (Array.isArray(value)) return `[${value.map(stable).join(",")}]`; if (value && typeof value === "object") return `{${Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => `${JSON.stringify(k)}:${stable(v)}`).join(",")}}`; return JSON.stringify(value) ?? "null"; }
+const object = (x: unknown): Record<string, unknown> | null => x && typeof x === "object" && !Array.isArray(x) ? x as Record<string, unknown> : null;
+const message = (error: unknown) => redactSensitiveText(error instanceof Error ? error.message : String(error));
+const terminal = (state: string) => ["completed", "failed", "cancelled", "interrupted"].includes(state);
+const normalizeModel = (value: string) => value.replace(/\[1m\]$/u, "");
+export function aggregateUsage(parts: UsageReceipt["usage"][]): UsageReceipt["usage"] {
+  const result = noUsage(); for (const key of ["input", "output", "cacheRead", "cacheWrite", "reasoning", "total"] as const) { const values = parts.map((p) => p[key]); const total = values.reduce<number>((a,b) => a + (b ?? 0), 0); result[key] = values.some((v) => v === null) || !Number.isSafeInteger(total) ? null : total; }
+  result.quality = parts.every((p) => p.quality === "measured") ? "measured" : parts.every((p) => p.quality === "unavailable") ? "unavailable" : "partial"; return result;
+}
+const ajv = new Ajv({ strict: false, allErrors: true, validateFormats: false });
+
+async function body(req: IncomingMessage): Promise<Buffer> {
+  const chunks: Buffer[] = []; let length = 0;
+  for await (const chunk of req) { const data = Buffer.from(chunk); length += data.length; if (length > 64 * 1024 * 1024) throw new PuppenclawError("REQUEST_TOO_LARGE", "Worker request exceeds 64 MiB."); chunks.push(data); }
+  return Buffer.concat(chunks);
+}
+function upstreamUrl(provider: ModelProviderConfig, path: string): URL {
+  const base = new URL(provider.baseUrl ?? (provider.kind === "claude-code" ? "https://api.anthropic.com" : provider.kind === "codex-openai" ? "https://chatgpt.com/backend-api/codex" : "https://api.openai.com/v1"));
+  if (provider.kind === "codex-openai") { base.pathname = path.split("?")[0]!; base.search = path.includes("?") ? path.slice(path.indexOf("?")) : ""; return base; }
+  if (base.username || base.password || !["http:", "https:"].includes(base.protocol)) throw new Error("Invalid registered model endpoint.");
+  const resource = path.replace(/^\/?v1\//u, "").replace(/^\//u, "");
+  base.pathname = `${base.pathname.replace(/\/$/u, "").replace(/\/v1$/u, "")}/v1/${resource.split("?")[0]}`;
+  base.search = resource.includes("?") ? resource.slice(resource.indexOf("?")) : "";
+  return base;
+}
+function publicJob(job: WorkerJob): Record<string, unknown> {
+  return { jobId: job.jobId, kind: job.kind, state: job.state, configId: job.config.id, configRevision: job.configRevision,
+    providerId: job.config.modelProvider.id, model: job.config.modelProvider.model, attemptId: job.attemptId, results: job.results,
+    ...(job.error ? { error: job.error } : {}), progress: { total: job.results.length, completed: job.results.filter((r) => r.state === "completed").length, failed: job.results.filter((r) => r.state === "failed").length } };
+}
+export class AdvancedRuntime {
+  private driver: RuntimeDriver | null = null;
+  private readonly participants = new Map<string, RuntimeParticipant>();
+  private readonly servers = new Map<string, { server: Server; path: string; sockets: Set<Socket> }>();
+  private readonly executions = new Map<string, Promise<void>>();
+  private readonly requests = new Map<string, { participant: RuntimeParticipant; abort: AbortController; done: Promise<void> }>();
+  private readonly barriers = new Map<string, Promise<void>>();
+  private readonly pausedProviders = new Map<string, string>();
+  private readonly policy = new EgressPolicy();
+  private readonly socketRoot: string;
+  private constructor(readonly store: AdvancedStore, root: string) { this.socketRoot = join(tmpdir(), `ocsl-model-broker-${process.getuid?.() ?? "user"}-${hash(root).slice(0, 12)}`); }
+  static async open(root: string): Promise<AdvancedRuntime> { const runtime = new AdvancedRuntime(await AdvancedStore.open(root), root); await mkdir(runtime.socketRoot, { recursive: true, mode: 0o700 }); await chmod(runtime.socketRoot, 0o700); return runtime; }
+  attach(driver: RuntimeDriver): void { this.driver = driver; }
+  private runtimeDriver(): RuntimeDriver { if (!this.driver) throw new Error("Worker driver is unavailable."); return this.driver; }
+  async recover(): Promise<void> { for (const child of this.store.recover()) await this.runtimeDriver().quiesce(child); }
+  metered(name: string): boolean { return this.participants.has(name); }
+  parent(name: string): string | undefined { const p = this.participants.get(name); return p?.jobId ? p.parentSessionName : undefined; }
+  socket(name: string): string | undefined { return this.servers.get(name)?.path; }
+  environment(name: string): NodeJS.ProcessEnv {
+    const participant = this.participants.get(name), socket = this.socket(name); if (!participant || !socket) return {};
+    return { PUPPENCLAW_ORCHESTRATION_SOCKET: socket, PUPPENCLAW_ORCHESTRATION_NATIVE_BASE_PATH: "/native", PUPPENCLAW_ORCHESTRATION_ATTEMPT_ID: participant.attemptId,
+      ...(participant.jobId ? { PUPPENCLAW_ORCHESTRATION_JOB_ID: participant.jobId } : {}),
+      ...(participant.provider.kind === "claude-code" ? { ANTHROPIC_DEFAULT_HAIKU_MODEL: participant.provider.model } : participant.provider.authTokenEnv ? { [participant.provider.authTokenEnv]: "ocsl-scoped-broker" } : {}) };
+  }
+  /** Admission runs after durable main-turn claim and before any external runtime process starts. */
+  async begin(session: SessionInfo, params: StartParams | SendParams, permissionMode: RuntimeParticipant["permissionMode"]): Promise<void> {
+    if (this.participants.get(session.name)?.jobId) { this.requireParticipant(session.name); return; }
+    const config = params.orchestration ?? session.orchestration; if (!config) return;
+    if (this.barriers.has(session.name)) await this.barriers.get(session.name);
+    if (this.participants.get(session.name)?.admissionOpen) throw new PuppenclawError("ORCHESTRATION_BUSY", "A previous advanced attempt is still active.");
+    if (!params.statisticsContext || !session.modelProvider) throw new PuppenclawError("ORCHESTRATION_CONTEXT_REQUIRED", "Advanced turns require statistics context and a registered model provider.");
+    const ownerKey = "ownerKey" in params ? params.ownerKey : this.runtimeDriver().getOwner?.(session.name);
+    const p: RuntimeParticipant = { sessionName: session.name, parentSessionName: session.name, attemptId: params.statisticsContext.attemptId,
+      directory: session.directory, provider: session.modelProvider, permissionMode, interactionMode: params.interactionMode ?? "plan", config,
+      ...(ownerKey ? { ownerKey } : {}), admissionOpen: true };
+    this.participants.set(session.name, p);
+    await this.listen(session.name);
+    this.policy.denyUrl(p.provider.baseUrl ?? "https://api.anthropic.com");
+    for (const worker of config.workers) if (worker.modelProvider.baseUrl) this.policy.denyUrl(worker.modelProvider.baseUrl);
+    // Register the real upstreams behind local compatibility proxies too.
+    for (const [key, value] of Object.entries(process.env)) if (value && /(?:LANGDOCK|QWEN|PAIS|ANTHROPIC|OPENAI).*(?:BASE_URL|API_URL|ENDPOINT)$/u.test(key)) this.policy.denyUrl(value);
+  }
+  private requireParticipant(name: string): RuntimeParticipant {
+    const p = this.participants.get(name);
+    if (!p || !p.admissionOpen || !this.participants.get(p.parentSessionName)?.admissionOpen || p.attemptId !== this.participants.get(p.parentSessionName)?.attemptId) throw new PuppenclawError("ORCHESTRATION_TURN_CLOSED", "This worker transport is not attached to an active parent turn.");
+    return p;
+  }
+  private async listen(name: string): Promise<void> {
+    if (this.servers.has(name)) return;
+    const path = join(this.socketRoot, `${hash(name).slice(0, 24)}.sock`);
+    await unlink(path).catch((e) => { if (e.code !== "ENOENT") throw e; });
+    const server = createServer((req, res) => { void this.handle(name, req, res).catch((error) => { if (!res.headersSent) { res.writeHead(error instanceof PuppenclawError ? 409 : 400, { "content-type": "application/json" }); res.end(JSON.stringify({ error: message(error), code: error instanceof PuppenclawError ? error.code : "INVALID_REQUEST" })); } else res.destroy(); }); });
+    server.on("connect", (req, socket, head) => { try { this.requireParticipant(name); } catch { socket.destroy(); return; } void proxyConnect(this.policy, req, socket, head).catch(() => socket.destroy()); });
+    await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(path, () => { server.removeListener("error", reject); resolve(); }); });
+    const sockets = new Set<Socket>(); server.on("connection", (socket) => { sockets.add(socket); socket.once("close", () => sockets.delete(socket)); });
+    await chmod(path, 0o600); this.servers.set(name, { server, path, sockets });
+  }
+  private async handle(name: string, req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const p = this.requireParticipant(name), path = (req.url ?? "/").split("?")[0]!;
+    const json = (value: unknown) => { res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" }); res.end(JSON.stringify(value)); };
+    if (/^http:\/\//u.test(req.url ?? "")) { await proxyHttp(this.policy, req, res); return; }
+    if (path.startsWith("/native/")) { await this.native(p, req, res); return; }
+    if (req.method === "GET" && ["/configs", "/configs/list"].includes(path)) { json({ version: 1, revision: p.config.revision, workers: p.config.workers.map((w) => ({ id: w.id, assignment: w.assignment, providerId: w.modelProvider.id, model: w.modelProvider.model, modelProvider: { id: w.modelProvider.id, model: w.modelProvider.model, kind: w.modelProvider.kind, label: w.modelProvider.label, reasoningProfile: w.modelProvider.reasoningProfile }, agent: w.agent, effort: w.effort, bulkAvailable: w.modelProvider.kind === "codex-openai-compatible" })) }); return; }
+    if (req.method === "GET" && path === "/jobs") { json({ jobs: this.jobs(p.parentSessionName) }); return; }
+    if (req.method === "POST" && path === "/agent/submit") { json(await this.submit(p, "agent", agentSubmitZod.parse(JSON.parse((await body(req)).toString())))); return; }
+    if (req.method === "POST" && path === "/bulk/submit") { json(await this.submit(p, "bulk", bulkSubmitZod.parse(JSON.parse((await body(req)).toString())))); return; }
+    const route = /^\/jobs\/([a-f0-9-]+)(?:\/(cancel|resume))?$/u.exec(path);
+    if (route) {
+      const job = this.requireJob(route[1]!, p);
+      if (req.method === "GET" && !route[2]) { json(publicJob(job)); return; }
+      if (req.method === "POST" && route[2] === "cancel") { await this.cancel(job.jobId); json(publicJob(this.store.job(job.jobId)!)); return; }
+      if (req.method === "POST" && route[2] === "resume") { json(await this.resume(p, job)); return; }
+    }
+    throw new PuppenclawError("UNKNOWN_WORKER_ROUTE", "Only scoped worker, native model and public web routes are exposed.");
+  }
+  private requireJob(id: string, p: RuntimeParticipant): WorkerJob { const job = this.store.job(id); if (!job || job.parentSessionName !== p.parentSessionName) throw new PuppenclawError("WORKER_NOT_FOUND", "Worker job is not in this chat."); return job; }
+  jobs(parent?: string): Record<string, unknown>[] { return this.store.jobs(parent).map(publicJob); }
+  private worker(p: RuntimeParticipant, configId: string): WorkerConfig { const config = p.config.workers.find((w) => w.id === configId); if (!config) throw new PuppenclawError("WORKER_CONFIG_NOT_FOUND", "Select a configured worker id."); return config; }
+  async submit(p: RuntimeParticipant, kind: "agent" | "bulk", request: AgentSubmit | BulkSubmit): Promise<Record<string, unknown>> {
+    if (this.requireParticipant(p.sessionName).attemptId !== p.attemptId) throw new PuppenclawError("ORCHESTRATION_TURN_CLOSED", "Attempt ownership changed."); if (p.jobId) throw new PuppenclawError("WORKER_DELEGATION_DENIED", "Worker jobs cannot expand the parent's worker allocation.");
+    const config = this.worker(p, request.configId), fingerprint = hash({ kind, config, request });
+    const duplicate = this.store.duplicate(p.parentSessionName, p.attemptId, request.idempotencyKey);
+    if (duplicate) { if (duplicate.fingerprint !== fingerprint) throw new PuppenclawError("WORKER_KEY_CONFLICT", "Idempotency key was used for different work."); return publicJob(duplicate); }
+    if (kind === "bulk" && (config.modelProvider.kind !== "codex-openai-compatible" || !config.modelProvider.baseUrl || !config.modelProvider.authTokenEnv)) throw new PuppenclawError("BULK_UNAVAILABLE", "This provider supports native agent workers; no configured direct API bulk adapter is available.");
+    if (kind === "bulk" && (p.interactionMode !== "execute" || p.permissionMode !== "approve-all")) throw new PuppenclawError("BULK_EXECUTION_REQUIRED", "Bulk scientific work requires an approved execution turn.");
+    if (p.permissionMode === "deny-all") throw new PuppenclawError("WORKER_PERMISSION_DENIED", "This parent turn cannot launch worker tools.");
+    if (kind === "bulk" && (request as BulkSubmit).schema) ajv.compile((request as BulkSubmit).schema!);
+    const job: WorkerJob = { jobId: randomUUID(), kind, state: "queued", parentSessionName: p.parentSessionName, attemptId: p.attemptId,
+      configRevision: p.config.revision, config, idempotencyKey: request.idempotencyKey, fingerprint, createdAt: timestamp(), updatedAt: timestamp(), request, results: [], ...(p.ownerKey ? { ownerKey: p.ownerKey } : {}) };
+    if (kind === "agent") job.childSessionName = `worker-${job.jobId}`;
+    job.results = kind === "bulk" ? (request as BulkSubmit).items.map((item) => ({ id: item.id, state: "queued", providerId: config.modelProvider.id, model: config.modelProvider.model, promptSha256: hash(item.input), usage: null }))
+      : [{ id: job.jobId, state: "queued", providerId: config.modelProvider.id, model: config.modelProvider.model, promptSha256: hash((request as AgentSubmit).task), usage: null }];
+    this.store.putJob(job); this.launch(job, p); return publicJob(job);
+  }
+  private launch(job: WorkerJob, p: RuntimeParticipant): void {
+    const execution = Promise.resolve().then(async () => { if (this.store.job(job.jobId)?.state === "cancelled") return; job.state = "running"; this.store.putJob(job); await (job.kind === "agent" ? this.runAgent(job, p) : this.runBulk(job, p)); })
+      .catch((error) => { const current = this.store.job(job.jobId)!; if (current.state !== "cancelled") { current.state = "failed"; current.error = message(error); current.updatedAt = timestamp(); this.store.putJob(current); } })
+      .finally(() => { this.executions.delete(job.jobId); });
+    this.executions.set(job.jobId, execution);
+  }
+  private async runAgent(job: WorkerJob, parent: RuntimeParticipant): Promise<void> {
+    const child: RuntimeParticipant = { ...parent, sessionName: job.childSessionName!, provider: job.config.modelProvider, jobId: job.jobId, admissionOpen: true };
+    this.requireParticipant(parent.sessionName); this.participants.set(child.sessionName, child); await this.listen(child.sessionName);
+    if (this.store.job(job.jobId)?.state === "cancelled") return;
+    const result = await this.runtimeDriver().start({ name: child.sessionName, agent: job.config.agent, directory: child.directory,
+      task: `${job.config.assignment}\n\n${(job.request as AgentSubmit).task}`, permissionMode: child.permissionMode, interactionMode: child.interactionMode,
+      modelProvider: job.config.modelProvider, modelProviderId: job.config.modelProvider.id, model: job.config.modelProvider.model,
+      ...(job.config.effort ? { effort: job.config.effort } : {}), ...(job.ownerKey ? { ownerKey: job.ownerKey } : {}), turnKey: `worker-${job.jobId}`, contextFiles: [], skills: [],
+    });
+    const current = this.store.job(job.jobId)!; if (current.state === "cancelled") return;
+    const details = object(result.details), session = object(details?.session);
+    const paused = this.pausedProviders.get(job.config.modelProvider.id);
+    const state = paused || session?.state === "waiting_input" ? "paused" : ["failed", "stopped"].includes(String(session?.state)) || result.isError ? "failed" : "completed";
+    current.results[0]!.state = state; current.results[0]!.output = details?.output ?? result.content.filter((b) => b.type === "text").map((b) => b.text).join("\n");
+    if (state !== "completed") { current.error = paused ?? String(session?.lastError ?? (state === "paused" ? "Worker requires parent approval before continuing." : "Worker harness failed.")); current.results[0]!.error = current.error; }
+    const receipts = this.store.receipts(parent.parentSessionName, parent.attemptId).filter((r) => r.jobId === job.jobId);
+    current.results[0]!.usage = receipts.length ? aggregateUsage(receipts.map((r) => r.usage)) : null;
+    current.results[0]!.model = receipts.at(-1)?.model ?? "unknown"; current.results[0]!.promptSha256 = receipts[0]?.promptSha256 ?? "unknown";
+    current.results[0]!.receiptDigests = receipts.map((r) => ({ requestId: r.requestId, model: r.model, promptSha256: r.promptSha256 }));
+    current.state = state; current.updatedAt = timestamp(); this.store.putJob(current); child.admissionOpen = false;
+    await this.runtimeDriver().quiesce(child.sessionName);
+    for (const socket of this.servers.get(child.sessionName)?.sockets ?? []) socket.destroy();
+  }
+  private async runBulk(job: WorkerJob, p: RuntimeParticipant): Promise<void> {
+    const request = job.request as BulkSubmit, validate: ValidateFunction | undefined = request.schema ? ajv.compile(request.schema) : undefined;
+    let index = 0;
+    const run = async () => { while (index < request.items.length) {
+      const i = index++, item = request.items[i]!;
+      const current = this.store.job(job.jobId)!;
+      if (current.state === "cancelled" || current.results[i]?.state === "completed") continue;
+      const pause = this.pausedProviders.get(job.config.modelProvider.id); if (pause) { current.state = "paused"; current.error = pause; this.store.putJob(current); break; }
+      this.requireParticipant(p.sessionName);
+      current.results[i]!.state = "running"; this.store.putJob(current);
+      const participant: RuntimeParticipant = { ...p, provider: job.config.modelProvider, jobId: job.jobId };
+      try {
+      const input = typeof item.input === "string" ? { messages: [{ role: "user", content: item.input }] } : item.input;
+      const allowed = ["messages", "max_tokens", "max_output_tokens", "temperature", "top_p", "seed", "reasoning", "thinking", "chat_template_kwargs"];
+      if (Object.keys(input).some((key) => !allowed.includes(key))) throw new Error("Bulk item contains unsupported request settings.");
+      const messages = input.messages; if (!Array.isArray(messages)) throw new Error("Bulk items require messages or string input.");
+      const payload: Record<string, unknown> = { model: job.config.modelProvider.model, input: [{ role: "system", content: job.config.assignment }, ...messages], stream: false,
+        ...(typeof input.max_output_tokens === "number" ? { max_output_tokens: input.max_output_tokens } : typeof input.max_tokens === "number" ? { max_output_tokens: input.max_tokens } : {}),
+        ...(typeof input.temperature === "number" ? { temperature: input.temperature } : { temperature: 0 }),
+        ...Object.fromEntries(Object.entries(input).filter(([key]) => ["top_p", "seed", "thinking", "chat_template_kwargs"].includes(key))),
+        ...(input.reasoning ? { reasoning: input.reasoning } : job.config.effort ? { reasoning: { effort: job.config.effort } } : {}),
+        ...(request.schema ? { text: { format: { type: "json_schema", name: "worker_result", strict: true, schema: request.schema } } } : {}) };
+        const response = await this.call(participant, "/v1/responses", Buffer.from(JSON.stringify(payload)), {}, undefined, item.id);
+        const measured = this.store.job(job.jobId)!; measured.results[i]!.usage = response.receipt.usage; measured.results[i]!.model = response.receipt.model; measured.results[i]!.promptSha256 = response.receipt.promptSha256; this.store.putJob(measured);
+        const root = object(response.payload); let output: unknown = root?.output_text;
+        if (typeof output !== "string") output = (Array.isArray(root?.output) ? root.output : []).flatMap((x) => Array.isArray(object(x)?.content) ? object(x)!.content as unknown[] : []).map((x) => object(x)?.text ?? "").join("");
+        if (validate) { try { output = JSON.parse(String(output)); } catch { throw new Error("Provider returned malformed structured JSON."); } if (!validate(output)) throw new Error(`Provider output failed schema validation: ${ajv.errorsText(validate.errors)}`); }
+        const fresh = this.store.job(job.jobId)!; const entry = fresh.results[i]!; if (fresh.state === "cancelled") continue;
+        entry.state = "completed"; entry.output = output; entry.usage = response.receipt.usage; entry.model = response.receipt.model; fresh.updatedAt = timestamp(); this.store.putJob(fresh);
+      } catch (error) {
+        const fresh = this.store.job(job.jobId)!; if (fresh.state === "cancelled") continue;
+        const receipt = this.store.receipts(job.parentSessionName, job.attemptId).findLast((r) => r.jobId === job.jobId && r.itemId === item.id);
+        if (receipt) { fresh.results[i]!.usage = receipt.usage; fresh.results[i]!.model = receipt.model; fresh.results[i]!.promptSha256 = receipt.promptSha256; }
+        const paused = this.pausedProviders.get(job.config.modelProvider.id); fresh.results[i]!.state = paused ? "paused" : "failed"; fresh.results[i]!.error = message(error); if (paused) { fresh.state = "paused"; fresh.error = paused; } this.store.putJob(fresh);
+      }
+    } };
+    await Promise.allSettled(Array.from({ length: Math.min(request.concurrency, request.items.length) }, run));
+    const current = this.store.job(job.jobId)!;
+    if (!["cancelled", "paused"].includes(current.state)) { current.state = current.results.every((r) => r.state === "completed") ? "completed" : "failed"; current.updatedAt = timestamp(); this.store.putJob(current); }
+  }
+  private async resume(p: RuntimeParticipant, old: WorkerJob): Promise<Record<string, unknown>> {
+    if (!["paused", "interrupted", "failed", "cancelled"].includes(old.state)) throw new Error("Only settled or paused jobs can resume.");
+    const config = this.worker(p, old.config.id); if (hash(config) !== hash(old.config)) throw new Error("Worker configuration changed; submit an explicit new job.");
+    this.pausedProviders.delete(config.modelProvider.id);
+    const request = old.kind === "bulk" ? { ...old.request, items: (old.request as BulkSubmit).items.filter((item) => old.results.find((r) => r.id === item.id)?.state !== "completed") } : old.request;
+    if (old.kind === "bulk" && !(request as BulkSubmit).items.length) return publicJob(old);
+    return this.submit(p, old.kind, { ...request, idempotencyKey: `${hash(old.idempotencyKey).slice(0, 48)}-resume-${old.jobId}` });
+  }
+  async cancel(id: string): Promise<void> {
+    const job = this.store.job(id); if (!job || terminal(job.state)) return;
+    job.state = "cancelled"; job.updatedAt = timestamp(); for (const r of job.results) if (!terminal(r.state)) r.state = "cancelled"; this.store.putJob(job);
+    for (const operation of this.requests.values()) if (operation.participant.jobId === id) operation.abort.abort();
+    if (job.childSessionName) { const p = this.participants.get(job.childSessionName); if (p) p.admissionOpen = false; await this.runtimeDriver().quiesce(job.childSessionName); }
+    await this.executions.get(id);
+  }
+  async closeTurn(name: string): Promise<void> {
+    const p = this.participants.get(name); if (!p || p.jobId) return;
+    const existing = this.barriers.get(name); if (existing) return existing;
+    p.admissionOpen = false;
+    const operation = (async () => {
+      for (const child of this.participants.values()) if (child.parentSessionName === name && child.attemptId === p.attemptId) { child.admissionOpen = false; for (const socket of this.servers.get(child.sessionName)?.sockets ?? []) socket.destroy(); }
+      const activeRequests = [...this.requests.values()].filter((r) => r.participant.parentSessionName === name && r.participant.attemptId === p.attemptId);
+      for (const request of activeRequests) request.abort.abort();
+      const jobs = this.store.jobs(name).filter((job) => job.attemptId === p.attemptId && ["queued", "running", "paused"].includes(job.state));
+      await Promise.all(jobs.map((job) => this.cancel(job.jobId)));
+      await Promise.allSettled(activeRequests.map((r) => r.done));
+    })();
+    this.barriers.set(name, operation);
+    try { await operation; } finally { if (this.barriers.get(name) === operation) this.barriers.delete(name); }
+  }
+  private publish(receipt: UsageReceipt): void { receipt.updatedAt = timestamp(); this.store.putReceipt(receipt); this.runtimeDriver().contribution(receipt); }
+  private async native(p: RuntimeParticipant, req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const path = req.url!.slice("/native".length);
+    if (req.method === "HEAD" && path === "/api/hello") { res.writeHead(200); res.end(); return; }
+    if (req.method !== "POST" || !/^\/(?:v1\/(messages(?:\/count_tokens)?|responses(?:\/compact)?|chat\/completions)|backend-api\/codex\/responses(?:\/compact)?)(?:\?|$)/u.test(path)) throw new Error("Native model route is not supported.");
+    const headers: Record<string, string> = {}; for (const [key, value] of Object.entries(req.headers)) if (typeof value === "string" && !["host", "content-length", "connection", "proxy-authorization"].includes(key)) headers[key] = value;
+    await this.call(p, path, await body(req), headers, res);
+  }
+  private async call(p: RuntimeParticipant, path: string, bytes: Buffer, headers: Record<string, string>, downstream?: ServerResponse, itemId?: string): Promise<{ payload: unknown; receipt: UsageReceipt }> {
+    if (this.requireParticipant(p.sessionName).attemptId !== p.attemptId) throw new PuppenclawError("ORCHESTRATION_TURN_CLOSED", "Attempt ownership changed.");
+    const parsed = object(JSON.parse(bytes.toString())); if (!parsed) throw new Error("Model payload must be an object.");
+    const model = String(parsed.model ?? p.provider.model);
+    const allowedModels = [p.provider.model].map(normalizeModel);
+    if (!allowedModels.includes(normalizeModel(model))) throw new PuppenclawError("MODEL_NOT_CONFIGURED", "The requested model is not configured for this attempt.");
+    const paused = this.pausedProviders.get(p.provider.id); if (paused) throw new PuppenclawError("PROVIDER_PAUSED", paused);
+    const requestId = randomUUID(), abort = new AbortController(), anthropic = p.provider.kind === "claude-code";
+    const receipt: UsageReceipt = { version: 1, requestId, parentSessionName: p.parentSessionName, sessionName: p.sessionName, attemptId: p.attemptId,
+      ...(p.jobId ? { jobId: p.jobId } : {}), ...(itemId ? { itemId } : {}), providerId: p.provider.id, model, role: p.jobId ? "subagent" : "main", promptSha256: hash(bytes.toString()), state: "running", usage: noUsage(), createdAt: timestamp(), updatedAt: timestamp() };
+    const counting = path.startsWith("/v1/messages/count_tokens");
+    let complete!: () => void; const done = new Promise<void>((resolve) => { complete = resolve; });
+    this.requests.set(requestId, { participant: p, abort, done }); if (!counting) this.publish(receipt);
+    const onClose = () => { if (!downstream?.writableFinished) abort.abort(); }; downstream?.once("close", onClose);
+    const parser = new UsageParser(anthropic); let payload: unknown = null;
+    try {
+    if (p.provider.kind === "codex-openai-compatible") { const key = p.provider.authTokenEnv && process.env[p.provider.authTokenEnv]; if (!key) throw new Error("Provider API credential is unavailable."); headers.authorization = `Bearer ${key}`; delete headers["x-api-key"]; }
+    headers["content-type"] = "application/json";
+      const response = await fetch(upstreamUrl(p.provider, path), { method: "POST", headers, body: bytes, signal: abort.signal, redirect: "manual" });
+      if (downstream) { const outgoing: Record<string, string> = {}; response.headers.forEach((value, key) => { if (!["connection", "transfer-encoding", "content-length", "content-encoding"].includes(key)) outgoing[key] = value; }); downstream.writeHead(response.status, outgoing); }
+      const streaming = response.headers.get("content-type")?.includes("text/event-stream"), chunks: Buffer[] = []; let length = 0; const decoder = new TextDecoder();
+      if (response.body) for await (const chunk of response.body) {
+        const data = Buffer.from(chunk); if (streaming) parser.feed(decoder.decode(data, { stream: true })); else { length += data.length; if (length > 16 * 1024 * 1024) throw new Error("Provider JSON exceeded 16 MiB."); chunks.push(data); }
+        if (downstream && !downstream.write(data)) await new Promise<void>((resolve, reject) => { const done = () => { downstream.removeListener("close", closed); resolve(); }; const closed = () => { downstream.removeListener("drain", done); reject(new Error("Downstream closed.")); }; downstream.once("drain", done); downstream.once("close", closed); });
+      }
+      if (!streaming) { const text = Buffer.concat(chunks).toString(); try { payload = JSON.parse(text); parser.event(payload); } catch { if (response.ok) throw new Error("Provider did not return valid JSON."); } }
+      parser.finish(response.ok); receipt.usage = parser.usage; receipt.model = parser.model ?? receipt.model; receipt.state = response.ok ? "completed" : "failed";
+      if ([401, 403, 429, 503].includes(response.status)) this.pausedProviders.set(p.provider.id, `Provider ${p.provider.id} requires attention (HTTP ${response.status}); resume explicitly after access or quota recovers.`);
+      if (!counting) this.publish(receipt); downstream?.end();
+      if (!response.ok) throw new Error(`Provider request failed with HTTP ${response.status}.`);
+      return { payload, receipt };
+    } catch (error) { receipt.usage = parser.usage; parser.finish(false); receipt.state = abort.signal.aborted ? "cancelled" : "failed"; if (!counting) this.publish(receipt); throw error; }
+    finally { downstream?.removeListener("close", onClose); this.requests.delete(requestId); complete(); }
+  }
+  async close(): Promise<void> {
+    await Promise.all([...this.participants.values()].filter((p) => !p.jobId).map((p) => this.closeTurn(p.sessionName)));
+    await Promise.all([...this.servers.values()].map(async ({ server, path, sockets }) => { for (const socket of sockets) socket.destroy(); server.closeAllConnections(); await new Promise<void>((resolve) => server.close(() => resolve())); await unlink(path).catch(() => {}); }));
+    this.store.close();
+  }
+}
