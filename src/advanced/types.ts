@@ -12,14 +12,14 @@ export type AgentSubmit = z.infer<typeof agentSubmitZod>;
 export type BulkSubmit = z.infer<typeof bulkSubmitZod>;
 export type JobState = "queued" | "running" | "paused" | "completed" | "failed" | "cancelled" | "interrupted";
 export type WorkerConfig = AdvancedOrchestration["workers"][number];
-export type ItemResult = { id: string; state: JobState; output?: unknown; providerId: string; model: string; promptSha256: string; usage: StatisticsTokens | null; receiptDigests?: { requestId: string; model: string; promptSha256: string }[]; error?: string };
+export type ItemResult = { id: string; state: JobState; output?: unknown; providerId: string; model: string; promptSha256: string; inputSha256?: string; usage: StatisticsTokens | null; receiptDigests?: { requestId: string; model: string; promptSha256: string }[]; error?: string };
 export type WorkerJob = {
   jobId: string; kind: "agent" | "bulk"; state: JobState; parentSessionName: string; attemptId: string; ownerKey?: string;
   configRevision: number; config: WorkerConfig; idempotencyKey: string; fingerprint: string; createdAt: string; updatedAt: string;
   request: AgentSubmit | BulkSubmit; childSessionName?: string; results: ItemResult[]; error?: string;
 };
 export type UsageReceipt = {
-  version: 1; requestId: string; parentSessionName: string; sessionName: string; attemptId: string; jobId?: string; itemId?: string;
+  version: 1; requestId: string; parentSessionName: string; sessionName: string; attemptId: string; jobId?: string; itemId?: string; ownerKey?: string;
   providerId: string; model: string; role: "main" | "subagent"; promptSha256: string;
   state: "running" | "completed" | "failed" | "cancelled" | "interrupted"; usage: StatisticsTokens; createdAt: string; updatedAt: string;
 };
@@ -31,6 +31,7 @@ export type RuntimeParticipant = {
 export type RuntimeDriver = {
   start: (params: StartParams) => Promise<ToolResult>;
   quiesce: (name: string) => Promise<void>;
+  purge?: (name: string) => Promise<void>;
   getSession: (name: string) => SessionInfo | null;
   getOwner?: (name: string) => string | undefined;
   contribution: (receipt: UsageReceipt) => void;

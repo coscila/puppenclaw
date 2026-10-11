@@ -1,3 +1,4 @@
+import { AdvancedRuntime } from "../advanced/runtime.js";
 import { timingSafeEqual } from "node:crypto";
 import { join } from "node:path";
 
@@ -148,6 +149,7 @@ export async function createDaemonServer(params: {
     let computeRuntime: ComputeRuntime | undefined;
     let resourceMonitor: ResourceMonitor | undefined;
     let statistics: TurnStatisticsRecorder | undefined;
+    let advanced: AdvancedRuntime | undefined;
     try {
       orchestratorStore = await OrchestratorStore.open(join(params.dataDir, "orchestrator"));
       usageLedger = await UsageLedgerStore.open(join(params.dataDir, "usage"));
@@ -172,6 +174,7 @@ export async function createDaemonServer(params: {
       });
       resourceMonitor.start();
       const outputRouter = new OutputRouter(logger);
+      advanced = await AdvancedRuntime.open(join(params.dataDir, "advanced"));
       const manager = new AcpxSessionManager({
         config: {
           ...params.config,
@@ -181,9 +184,25 @@ export async function createDaemonServer(params: {
         store,
         outputRouter,
         ledger: usageLedger,
-        statistics
+        statistics,
+        advanced
+      });
+      advanced.attach({
+        start: (request) => manager.start(request), quiesce: async (name) => { await manager.quiesce({ name }); },
+        purge: async (name) => { await manager.purge({ name }); },
+        getSession: (name) => store.getSession(name), getOwner: (name) => store.getSessionOwner(name) ?? undefined,
+        contribution: (receipt) => {
+          statistics!.observeBrokerUsage(receipt.parentSessionName, advanced!.store.receipts(receipt.parentSessionName, receipt.attemptId));
+          if (receipt.state === "running" || receipt.usage.input === null || receipt.usage.output === null) return;
+          const session = store.getSession(receipt.sessionName) ?? store.getSession(receipt.parentSessionName);
+          if (!session) return;
+          usageLedger!.append({ id: `advanced-${receipt.requestId}`, sessionName: receipt.parentSessionName, agent: session.agent, provider: receipt.providerId, model: receipt.model,
+            usage: { input: Math.max(0, receipt.usage.input - (receipt.usage.cacheRead ?? 0) - (receipt.usage.cacheWrite ?? 0)), output: receipt.usage.output, cacheRead: receipt.usage.cacheRead ?? 0, cacheWrite: receipt.usage.cacheWrite ?? 0, total: receipt.usage.total ?? receipt.usage.input + receipt.usage.output },
+            durationMs: Date.parse(receipt.updatedAt) - Date.parse(receipt.createdAt), timestamp: receipt.updatedAt, turnId: receipt.attemptId, role: receipt.role, threads: 1 });
+        },
       });
       await manager.reconcilePersistedSessions();
+      await advanced.recover();
       const orchestrator = new OrchestratorRuntime({
         config: {
           ...params.config,
@@ -201,12 +220,14 @@ export async function createDaemonServer(params: {
         computeRuntime,
         resourceMonitor,
         statistics,
+        advanced,
         outputRouter,
         manager,
         orchestrator
       };
     } catch (error) {
       resourceMonitor?.close();
+      await advanced?.close();
       await statistics?.close();
       computeRuntime?.close();
       usageLedger?.close();
@@ -221,6 +242,7 @@ export async function createDaemonServer(params: {
     computeRuntime,
     resourceMonitor,
     statistics,
+    advanced,
     outputRouter,
     manager,
     orchestrator
@@ -241,6 +263,7 @@ export async function createDaemonServer(params: {
   app.get("/capabilities", async () => ({
     ok: true,
     version: 1,
+    advancedOrchestration: { version: 1, durableJobs: true, recordedTransport: true, namespaceRequired: true },
     sessionStart: true,
     sessionStartStream: true,
     sessionSend: true,
@@ -355,6 +378,7 @@ export async function createDaemonServer(params: {
 
   app.addHook("onClose", async () => {
     resourceMonitor.close();
+    await advanced.close();
     await statistics.close();
     computeRuntime.close();
     orchestratorStore.close();
@@ -429,11 +453,12 @@ export async function createDaemonServer(params: {
       const sessions = store.listSessionsByOwner(parsed.ownerKey);
       try {
         for (const session of sessions) {
-          await manager.purge({ name: session.name });
+          if (store.getSession(session.name)) await manager.purge({ name: session.name });
         }
       } catch (error) {
         throw ownerCleanupIncomplete("purge", sessions.length, error);
       }
+      await advanced.purgeOwner(parsed.ownerKey);
       const remaining = store.listSessionsByOwner(parsed.ownerKey);
       if (remaining.length > 0) {
         throw ownerCleanupIncomplete("purge", sessions.length, undefined, remaining.length);
@@ -499,6 +524,9 @@ export async function createDaemonServer(params: {
   app.get("/resources", async () =>
     ok(jsonToolResult(await resourceMonitor.snapshot(), "Resource usage"))
   );
+
+  app.get("/orchestration/jobs", async (request) => ({ jobs: advanced.jobs((request.query as { session?: string }).session) }));
+  app.get("/orchestration/receipts", async (request) => { const query = request.query as { session?: string; attempt?: string }; return { receipts: advanced.store.receipts(query.session, query.attempt) }; });
 
   app.get("/statistics/turns", async (request, reply) => {
     const query = request.query as { cursor?: string; limit?: string };

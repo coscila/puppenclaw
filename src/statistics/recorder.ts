@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { performance } from "node:perf_hooks";
+import type { UsageReceipt } from "../advanced/types.js";
 import type { ComputeJobRecord } from "../compute/types.js";
 import {
   collectDescendants,
@@ -33,6 +34,7 @@ type Meter = {
   usageBridgeSeen: boolean;
   /** Set once a valid wrapper model-usage line arrived; it then owns the totals. */
   modelUsageSeen: boolean;
+  brokerUsageOwned: boolean;
 };
 const record = (value: unknown): Record<string, unknown> | null =>
   value !== null && typeof value === "object" && !Array.isArray(value)
@@ -146,6 +148,7 @@ export class TurnStatisticsRecorder {
       usageResults: new Map(),
       usageBridgeSeen: false,
       modelUsageSeen: false,
+      brokerUsageOwned: false,
     });
     return row.runnerTurnId;
   }
@@ -193,7 +196,7 @@ export class TurnStatisticsRecorder {
   }
   observeEvent(name: string, raw: unknown, format: "acp" | "codex"): void {
     const meter = this.active.get(name);
-    if (!meter || meter.ended) return;
+    if (!meter || meter.ended || meter.brokerUsageOwned) return;
     const event = record(raw);
     if (!event) return;
     let usage: unknown,
@@ -302,7 +305,7 @@ export class TurnStatisticsRecorder {
     options: { localWorkers?: boolean } = {},
   ): void {
     const meter = this.active.get(name);
-    if (!meter || meter.ended || groups.length === 0) return;
+    if (!meter || meter.ended || meter.brokerUsageOwned || groups.length === 0) return;
     const models: RunnerTurnModelStatistics[] = groups.map((group) => ({
       role: group.role,
       model: group.model,
@@ -325,6 +328,18 @@ export class TurnStatisticsRecorder {
     meter.row.coverageReasons = meter.row.coverageReasons.filter(
       (reason) => reason !== "cumulative_usage_without_baseline",
     );
+  }
+  /** Request receipts replace native SDK counters; a request id is represented once. */
+  observeBrokerUsage(name: string, receipts: readonly UsageReceipt[]): void {
+    const meter = this.active.get(name); if (!meter || meter.ended) return;
+    meter.brokerUsageOwned = true;
+    const groups = new Map<string, UsageReceipt[]>();
+    for (const receipt of receipts) { const key = JSON.stringify([receipt.role, receipt.providerId, receipt.model]); const group = groups.get(key) ?? []; group.push(receipt); groups.set(key, group); }
+    meter.row.models = [...groups.values()].map((group) => ({ role: group[0]!.role, model: group[0]!.model, modelProviderId: group[0]!.providerId, threads: new Set(group.map((r) => r.jobId ?? r.sessionName)).size, tokens: sumTokens(group.map((r) => r.usage), group.every((r) => r.state !== "running")) }));
+    meter.row.tokens = receipts.length ? sumTokens(receipts.map((r) => r.usage), receipts.every((r) => r.state !== "running")) : unavailableTokens();
+    meter.row.coverageReasons = meter.row.coverageReasons.filter((r) => r !== "cumulative_usage_without_baseline" && r !== "broker_usage_incomplete");
+    if (receipts.some((r) => r.usage.quality !== "measured")) this.reason(meter, "broker_usage_incomplete");
+    this.checkpoint(meter);
   }
   private reason(meter: Meter, reason: string): void {
     if (!meter.row.coverageReasons.includes(reason))

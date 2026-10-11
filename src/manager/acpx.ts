@@ -1,3 +1,4 @@
+import type { AdvancedRuntime } from "../advanced/runtime.js";
 import { type ChildProcess, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { copyFile, mkdir, readFile, readdir, stat, unlink } from "node:fs/promises";
@@ -1427,10 +1428,12 @@ export class AcpxSessionManager implements ISessionManager {
       outputRouter: OutputRouter;
       ledger?: UsageLedgerStore;
       statistics?: TurnStatisticsRecorder;
+      advanced?: AdvancedRuntime;
     }
   ) {}
 
   private recordTurnUsage(session: SessionInfo, turn: TurnResult): void {
+    if (this.deps.advanced?.metered(session.name)) return;
     if (this.deps.ledger == null || turn.state === "failed") {
       return;
     }
@@ -1512,10 +1515,12 @@ export class AcpxSessionManager implements ISessionManager {
     this.activeTurnIds.set(params.name, turnId);
     try {
       const result = await run();
+      await this.deps.advanced?.closeTurn(params.name);
       await statistics.settle(params.name, "completed");
       return result;
     } catch (error) {
       const stopped = this.stopRequests.has(params.name) || this.deps.store.getSession(params.name)?.state === "stopped";
+      await this.deps.advanced?.closeTurn(params.name);
       await statistics.settle(params.name, stopped ? "cancelled" : "failed");
       throw error;
     } finally {
@@ -1621,7 +1626,7 @@ export class AcpxSessionManager implements ISessionManager {
           ? { ...baseSession, effort: params.effort }
           : baseSession;
       const reasoning = this.resolveSessionReasoning(requestedSession);
-      const session = reasoning.session;
+      const session = { ...reasoning.session, ...(params.orchestration ? { orchestration: params.orchestration } : {}) };
       const sessionSkills = dedupeSkillNames([...(session.skills ?? []), ...installedSkillNames]);
 
       const warnings = dedupeWarnings([
@@ -1652,6 +1657,7 @@ export class AcpxSessionManager implements ISessionManager {
       // request racing an ambiguous start response can then fence this runtime.
       await this.deps.store.upsertSession(provisionalSession, params.ownerKey);
       this.assertTurnWasNotStopped(params.name);
+      await this.deps.advanced?.begin(provisionalSession, params, permissionModes.turn);
 
       try {
         if (!this.usesOneShotRuntime(session)) {
@@ -1791,7 +1797,7 @@ export class AcpxSessionManager implements ISessionManager {
         );
         this.recordTurnUsage(nextSession, turn);
         return textToolResult(`Started session ${params.name}.`, {
-          session: nextSession,
+          session: this.withBrokerSocket(nextSession),
           output: turn.output,
           outputRole: outputRoleForTurn(turn),
           ...(turn.failureCode != null ? { failureCode: turn.failureCode } : {}),
@@ -1849,8 +1855,9 @@ export class AcpxSessionManager implements ISessionManager {
       const requestedSession =
         params.effort == null ? session : { ...session, effort: params.effort };
       const reasoning = this.resolveSessionReasoning(requestedSession);
-      const effectiveSession = reasoning.session;
-      if (providerRefresh.refreshed) {
+      const effectiveSession = { ...reasoning.session, ...(params.orchestration ? { orchestration: params.orchestration } : {}) };
+      await this.deps.advanced?.begin(effectiveSession, params, turnPermissionMode(this.effectivePermissionMode(session), params.permissionMode));
+      if (providerRefresh.refreshed || params.orchestration) {
         // Persist the daemon-validated provider selection before launching the
         // external turn. A failed provider turn must not make the next retry
         // silently fall back to stale endpoint or model metadata.
@@ -2015,7 +2022,7 @@ export class AcpxSessionManager implements ISessionManager {
       );
       this.recordTurnUsage(nextSession, turn);
       return textToolResult(`Updated session ${params.name}.`, {
-        session: nextSession,
+        session: this.withBrokerSocket(nextSession),
         output: turn.output,
         outputRole: outputRoleForTurn(turn),
         ...(turn.failureCode != null ? { failureCode: turn.failureCode } : {}),
@@ -2030,6 +2037,8 @@ export class AcpxSessionManager implements ISessionManager {
   async stop(params: StopParams): Promise<ToolResult> {
     return await this.withLifecycleLock(params.name, async () => {
       this.deps.store.assertSessionMutable(params.name);
+      if (this.activeTurns.has(params.name)) this.stopRequests.add(params.name);
+      await this.deps.advanced?.closeTurn(params.name);
       let runningReceipt = Object.values(this.deps.store.getTurnRequests(params.name)).find(
         (receipt) => receipt.state === "running"
       );
@@ -2078,7 +2087,7 @@ export class AcpxSessionManager implements ISessionManager {
           turnReceipt: { turnKey: runningReceipt.turnKey, state: "accepted" }
         });
       }
-      const runtimeEnv = this.modelProviderRuntimeEnv(session.modelProvider);
+      const runtimeEnv = this.modelProviderRuntimeEnv(session.modelProvider, session.name);
       this.stopRequests.add(params.name);
       const hadActiveTurn = this.activeTurns.has(params.name);
       await this.runControlCommand({
@@ -2660,6 +2669,7 @@ export class AcpxSessionManager implements ISessionManager {
       }
       const reservation = await this.deps.store.reserveQuiescence(params.name, "purge");
       const epoch = reservation.epoch;
+      await this.deps.advanced?.closeTurn(params.name);
       const session = this.deps.store.getSession(params.name);
       if (session != null) {
         await this.closeQuiescedRuntime(session, epoch, { locallyTrackedTurn });
@@ -2671,6 +2681,7 @@ export class AcpxSessionManager implements ISessionManager {
           });
         }
       }
+      await this.deps.advanced?.purge(params.name);
       await purgeSessionDiagnostics(this.deps.store.rootDir, params.name);
       await this.deps.store.removeSession(params.name);
       this.deps.outputRouter.clear(params.name);
@@ -2694,6 +2705,7 @@ export class AcpxSessionManager implements ISessionManager {
     return await this.withLifecycleLock(params.name, async () => {
       const reservation = await this.deps.store.reserveQuiescence(params.name, "external");
       const epoch = reservation.epoch;
+      await this.deps.advanced?.closeTurn(params.name);
       const locallyTrackedTurn =
         this.activeTurns.has(params.name) || this.activeTurnProcesses.has(params.name);
       const session = this.deps.store.getSession(params.name);
@@ -3305,7 +3317,7 @@ export class AcpxSessionManager implements ISessionManager {
     }
 
     if (!this.usesOneShotRuntime(session)) {
-      const runtimeEnv = this.modelProviderRuntimeEnv(session.modelProvider);
+      const runtimeEnv = this.modelProviderRuntimeEnv(session.modelProvider, session.name);
       await this.runControlCommand({
         args: this.buildVerbArgs(session.agent, session.directory, [
           "sessions",
@@ -3393,7 +3405,7 @@ export class AcpxSessionManager implements ISessionManager {
       options.locallyTrackedTurn ??
       (this.activeTurns.has(session.name) || this.activeTurnProcesses.has(session.name));
     this.stopRequests.add(session.name);
-    const runtimeEnv = this.modelProviderRuntimeEnv(session.modelProvider);
+    const runtimeEnv = this.modelProviderRuntimeEnv(session.modelProvider, session.name);
     this.terminateActiveTurnProcess(session.name, "SIGTERM");
     await this.runControlCommand({
       args: this.buildVerbArgs(session.agent, session.directory, [
@@ -3533,7 +3545,13 @@ export class AcpxSessionManager implements ISessionManager {
     );
   }
 
+  private withBrokerSocket(session: SessionInfo): SessionInfo {
+    const brokerSocket = this.deps.advanced?.socket(session.name);
+    return brokerSocket ? { ...session, brokerSocket } : session;
+  }
+
   private decorateVisibleSession(session: SessionInfo): SessionInfo {
+    session = this.withBrokerSocket(session);
     const activeQuiescence = this.deps.store.getQuiescence(session.name);
     if (activeQuiescence != null) {
       return {
@@ -3776,7 +3794,7 @@ export class AcpxSessionManager implements ISessionManager {
   }
 
   private async suspendTrackedSession(session: SessionInfo, reason: string): Promise<SessionInfo> {
-    const runtimeEnv = this.modelProviderRuntimeEnv(session.modelProvider);
+    const runtimeEnv = this.modelProviderRuntimeEnv(session.modelProvider, session.name);
     await this.runControlCommand({
       args: this.buildVerbArgs(session.agent, session.directory, [
         "sessions",
@@ -3977,12 +3995,13 @@ export class AcpxSessionManager implements ISessionManager {
   }
 
   private modelProviderRuntimeEnv(
-    modelProvider: ModelProviderConfig | undefined
+    modelProvider: ModelProviderConfig | undefined, sessionName?: string
   ): NodeJS.ProcessEnv | undefined {
     if (modelProvider == null) {
       return undefined;
     }
     return {
+      ...(sessionName ? this.deps.advanced?.environment(sessionName) : {}),
       PUPPENCLAW_MODEL_PROVIDER_ID: modelProvider.id,
       PUPPENCLAW_MODEL_PROVIDER_MODEL: modelProvider.model,
       ...(modelProvider.label != null
@@ -4242,7 +4261,7 @@ export class AcpxSessionManager implements ISessionManager {
      */
     tolerateModelRejection?: boolean;
   }): Promise<void> {
-    const runtimeEnv = this.modelProviderRuntimeEnv(params.modelProvider);
+    const runtimeEnv = this.modelProviderRuntimeEnv(params.modelProvider, params.name);
     const status = await this.getRuntimeStatus(params);
     const createdRuntime = !status.exists || status.status === "dead";
     if (createdRuntime) {
@@ -4431,7 +4450,7 @@ export class AcpxSessionManager implements ISessionManager {
     modelProvider?: ModelProviderConfig;
     timeoutMs?: number;
   }): Promise<RuntimeStatus> {
-    const runtimeEnv = this.modelProviderRuntimeEnv(params.modelProvider);
+    const runtimeEnv = this.modelProviderRuntimeEnv(params.modelProvider, params.name);
     const result = await this.runControlCommand({
       args: this.buildVerbArgs(params.agent, params.directory, [
         "status",
@@ -4461,7 +4480,7 @@ export class AcpxSessionManager implements ISessionManager {
   }
 
   private async getRuntimeSessionRecord(session: SessionInfo): Promise<JsonRecord | null> {
-    const runtimeEnv = this.modelProviderRuntimeEnv(session.modelProvider);
+    const runtimeEnv = this.modelProviderRuntimeEnv(session.modelProvider, session.name);
     const result = await this.runControlCommand({
       args: this.buildVerbArgs(session.agent, session.directory, [
         "sessions",
@@ -4556,7 +4575,7 @@ export class AcpxSessionManager implements ISessionManager {
       return { activeMode: modeState.currentMode };
     }
 
-    const runtimeEnv = this.modelProviderRuntimeEnv(params.session.modelProvider);
+    const runtimeEnv = this.modelProviderRuntimeEnv(params.session.modelProvider, params.session.name);
     try {
       await this.runControlCommand({
         args: this.buildVerbArgs(params.session.agent, params.session.directory, [
@@ -4599,7 +4618,7 @@ export class AcpxSessionManager implements ISessionManager {
     if (preparation.restoreMode == null || preparation.restoreMode === preparation.activeMode) {
       return;
     }
-    const runtimeEnv = this.modelProviderRuntimeEnv(session.modelProvider);
+    const runtimeEnv = this.modelProviderRuntimeEnv(session.modelProvider, session.name);
     await this.runControlCommand({
       args: this.buildVerbArgs(session.agent, session.directory, [
         "set-mode",
@@ -4681,7 +4700,7 @@ export class AcpxSessionManager implements ISessionManager {
       params.permissionMode
     );
     const spawnCommand = resolveSpawnCommand(this.deps.config.acpxCommand ?? "acpx", args);
-    const runtimeEnv = this.modelProviderRuntimeEnv(params.session.modelProvider);
+    const runtimeEnv = this.modelProviderRuntimeEnv(params.session.modelProvider, params.session.name);
     const env = runtimeEnv != null ? { ...process.env, ...runtimeEnv } : process.env;
     const child = spawnCommand.shell
       ? spawn(spawnCommand.command, {
@@ -5131,7 +5150,7 @@ export class AcpxSessionManager implements ISessionManager {
         ? ["--cwd", params.session.directory, "--", ...providerLauncherParts, ...codexArgs]
         : codexArgs;
     const spawnCommand = resolveSpawnCommand(codexCommand ?? providerLauncher, directCommandArgs);
-    const runtimeEnv = this.modelProviderRuntimeEnv(params.session.modelProvider);
+    const runtimeEnv = this.modelProviderRuntimeEnv(params.session.modelProvider, params.session.name);
     const env = {
       ...withoutInheritedCodexSubagentPolicy(process.env),
       ...(runtimeEnv ?? {}),
@@ -5583,7 +5602,7 @@ export class AcpxSessionManager implements ISessionManager {
     const pid = child.pid;
     const identity = pid != null ? await readLinuxProcessIdentity(pid) : null;
     if (pid != null && identity != null) {
-      this.deps.statistics?.registerRoot(sessionName, { pid, startTicks: identity.processStartIdentity.split(":")[1]! });
+      this.deps.statistics?.registerRoot(this.deps.advanced?.parent(sessionName) ?? sessionName, { pid, startTicks: identity.processStartIdentity.split(":")[1]! });
     }
     await this.patchActiveTurn(sessionName, turnId, (activeTurn) => ({
       ...activeTurn,
@@ -5654,6 +5673,7 @@ export class AcpxSessionManager implements ISessionManager {
     receiptOutcome?: Omit<TurnRequestSuccessOutcome, "session"> | TurnRequestErrorOutcome,
     failureMetadata?: { code: string; retryable?: boolean }
   ): Promise<SessionInfo> {
+    await this.deps.advanced?.closeTurn(sessionName);
     const stoppedForStatistics = this.stopRequests.has(sessionName) || this.deps.store.getSession(sessionName)?.state === "stopped";
     await this.deps.statistics?.settle(sessionName, stoppedForStatistics ? "cancelled" : state === "failed" ? "failed" : "completed");
     this.checkpointActiveTurnOutput(sessionName, true);
