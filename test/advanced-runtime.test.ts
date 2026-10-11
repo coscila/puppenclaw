@@ -57,6 +57,11 @@ describe("advanced usage", () => {
 });
 
 describe("scoped worker broker", () => {
+  it("keeps the trusted short socket root under literal /tmp when daemon TMPDIR changes", async () => {
+    const custom = await root(), previous = process.env.TMPDIR; process.env.TMPDIR = custom;
+    try { const { socket } = await setup("http://127.0.0.1:1/v1"); expect(socket).toMatch(/^\/tmp\/ocsl-model-broker-[0-9]+-[a-f0-9]{12}\/[a-f0-9]{24}\.sock$/); }
+    finally { if (previous === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = previous; }
+  });
   it("runs idempotent structured bulk once, keeps caller IDs and blocks unconfigured native models", async () => {
     let calls = 0; const { url } = await upstream((req, res) => { expect(req.headers.authorization).toBe("Bearer test-secret"); calls++; res.setHeader("content-type", "application/json"); res.end(JSON.stringify({ model: "test-model", output_text: '{"verdict":true}', usage: { input_tokens: 12, output_tokens: 3 } })); });
     const { runtime, socket } = await setup(url);

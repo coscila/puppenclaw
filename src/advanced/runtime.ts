@@ -2,7 +2,6 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmod, mkdir, unlink } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import type { Socket } from "node:net";
 import { Ajv, type ValidateFunction } from "ajv";
 import { Ajv2020 } from "ajv/dist/2020.js";
@@ -60,7 +59,7 @@ export class AdvancedRuntime {
   private readonly pausedProviders = new Map<string, string>();
   private readonly policy = new EgressPolicy();
   private readonly socketRoot: string;
-  private constructor(readonly store: AdvancedStore, root: string) { this.socketRoot = join(tmpdir(), `ocsl-model-broker-${process.getuid?.() ?? "user"}-${hash(root).slice(0, 12)}`); }
+  private constructor(readonly store: AdvancedStore, root: string) { this.socketRoot = join("/tmp", `ocsl-model-broker-${process.getuid?.() ?? "user"}-${hash(root).slice(0, 12)}`); }
   static async open(root: string): Promise<AdvancedRuntime> { const runtime = new AdvancedRuntime(await AdvancedStore.open(root), root); await mkdir(runtime.socketRoot, { recursive: true, mode: 0o700 }); await chmod(runtime.socketRoot, 0o700); return runtime; }
   attach(driver: RuntimeDriver): void { this.driver = driver; }
   private runtimeDriver(): RuntimeDriver { if (!this.driver) throw new Error("Worker driver is unavailable."); return this.driver; }
