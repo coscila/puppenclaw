@@ -8,7 +8,7 @@ import { Ajv2020 } from "ajv/dist/2020.js";
 import { PuppenclawError } from "../shared/errors.js";
 import { claudeAcpModelSelector } from "../shared/model-compatibility.js";
 import { redactSensitiveText } from "../shared/utils.js";
-import type { AdvancedOrchestration, ModelProviderConfig, SessionInfo, StartParams, SendParams } from "../shared/types.js";
+import type { AdvancedOrchestration, ModelProviderConfig, SessionInfo, StartParams, SendParams, ToolResult } from "../shared/types.js";
 import { AdvancedStore } from "./store.js";
 import { EgressPolicy, proxyConnect, proxyHttp } from "./egress.js";
 import { noUsage, UsageParser } from "./usage.js";
@@ -148,7 +148,7 @@ export class AdvancedRuntime {
   }
   private launch(job: WorkerJob, p: RuntimeParticipant): void {
     const execution = Promise.resolve().then(async () => { if (this.store.job(job.jobId)?.state === "cancelled") return; job.state = "running"; this.store.putJob(job); await (job.kind === "agent" ? this.runAgent(job, p) : this.runBulk(job, p)); })
-      .catch((error) => { const current = this.store.job(job.jobId)!; if (current.state !== "cancelled") { current.state = "failed"; current.error = message(error); current.updatedAt = timestamp(); this.store.putJob(current); } })
+      .catch((error) => { const current = this.store.job(job.jobId)!; if (current.state !== "cancelled") { current.state = "failed"; current.error = message(error); for (const entry of current.results) if (!terminal(entry.state)) { entry.state = "failed"; entry.error = current.error; } if (current.kind === "agent") this.recordAgentReceipts(current); current.updatedAt = timestamp(); this.store.putJob(current); } })
       .finally(() => { this.executions.delete(job.jobId); });
     this.executions.set(job.jobId, execution);
   }
@@ -156,31 +156,42 @@ export class AdvancedRuntime {
     const child: RuntimeParticipant = { ...parent, sessionName: job.childSessionName!, provider: job.config.modelProvider, jobId: job.jobId, admissionOpen: true };
     this.requireParticipant(parent.sessionName); this.participants.set(child.sessionName, child); await this.listen(child.sessionName);
     if (this.store.job(job.jobId)?.state === "cancelled") return;
-    const result = await this.runtimeDriver().start({ name: child.sessionName, agent: job.config.agent, directory: child.directory,
+    let result: ToolResult;
+    try { result = await this.runtimeDriver().start({ name: child.sessionName, agent: job.config.agent, directory: child.directory,
       task: `${WORKER_POLICY}\n\nQuoted worker task data:\n${JSON.stringify({ assignment: job.config.assignment, task: (job.request as AgentSubmit).task })}`, permissionMode: child.permissionMode, interactionMode: child.interactionMode,
       modelProvider: job.config.modelProvider, modelProviderId: job.config.modelProvider.id, model: job.config.agent === "claude" ? claudeAcpModelSelector(job.config.modelProvider.model) : job.config.modelProvider.model,
       ...(job.config.effort ? { effort: job.config.effort } : {}), ...(job.ownerKey ? { ownerKey: job.ownerKey } : {}), turnKey: `worker-${job.jobId}`, contextFiles: [], skills: [],
-    });
+    }); } catch (error) {
+      await this.drainParticipant(child);
+      await this.runtimeDriver().quiesce(child.sessionName);
+      throw error;
+    }
     // A harness may finish as soon as its SSE completion event arrives, before the HTTP peer closes.
     // Close child admission and join its transports before publishing a settled job or reading usage.
-    child.admissionOpen = false;
-    const activeRequests = [...this.requests.values()].filter((r) => r.participant.sessionName === child.sessionName);
-    for (const request of activeRequests) request.abort.abort();
-    for (const socket of this.servers.get(child.sessionName)?.sockets ?? []) socket.destroy();
-    await Promise.allSettled(activeRequests.map((r) => r.done));
+    await this.drainParticipant(child);
     const current = this.store.job(job.jobId)!; if (current.state === "cancelled") return;
     const details = object(result.details), session = object(details?.session);
     const paused = this.pausedProviders.get(providerPauseKey(parent, job.config.modelProvider.id));
     const state = paused || session?.state === "waiting_input" ? "paused" : ["failed", "stopped"].includes(String(session?.state)) ? "failed" : "completed";
     current.results[0]!.state = state; current.results[0]!.output = details?.output ?? result.content.filter((b) => b.type === "text").map((b) => b.text).join("\n");
     if (state !== "completed") { current.error = paused ?? String(session?.lastError ?? (state === "paused" ? "Worker requires parent approval before continuing." : "Worker harness failed.")); current.results[0]!.error = current.error; }
-    const receipts = this.store.receipts(parent.parentSessionName, parent.attemptId).filter((r) => r.jobId === job.jobId);
-    current.results[0]!.usage = receipts.length ? aggregateUsage(receipts.map((r) => r.usage)) : null;
-    current.results[0]!.model = receipts.at(-1)?.model ?? "unknown"; current.results[0]!.promptSha256 = receipts[0]?.promptSha256 ?? "unknown";
-    current.results[0]!.receiptDigests = receipts.map((r) => ({ requestId: r.requestId, model: r.model, promptSha256: r.promptSha256 }));
+    this.recordAgentReceipts(current);
     current.state = state; current.updatedAt = timestamp(); this.store.putJob(current); child.admissionOpen = false;
     await this.runtimeDriver().quiesce(child.sessionName);
     for (const socket of this.servers.get(child.sessionName)?.sockets ?? []) socket.destroy();
+  }
+  private async drainParticipant(participant: RuntimeParticipant): Promise<void> {
+    participant.admissionOpen = false;
+    const activeRequests = [...this.requests.values()].filter((r) => r.participant.sessionName === participant.sessionName);
+    for (const request of activeRequests) request.abort.abort();
+    for (const socket of this.servers.get(participant.sessionName)?.sockets ?? []) socket.destroy();
+    await Promise.allSettled(activeRequests.map((r) => r.done));
+  }
+  private recordAgentReceipts(job: WorkerJob): void {
+    const receipts = this.store.receipts(job.parentSessionName, job.attemptId).filter((r) => r.jobId === job.jobId);
+    job.results[0]!.usage = receipts.length ? aggregateUsage(receipts.map((r) => r.usage)) : null;
+    job.results[0]!.model = receipts.at(-1)?.model ?? "unknown"; job.results[0]!.promptSha256 = receipts[0]?.promptSha256 ?? "unknown";
+    job.results[0]!.receiptDigests = receipts.map((r) => ({ requestId: r.requestId, model: r.model, promptSha256: r.promptSha256 }));
   }
   private async runBulk(job: WorkerJob, p: RuntimeParticipant): Promise<void> {
     const request = job.request as BulkSubmit, validate: ValidateFunction | undefined = request.schema ? compileSchema(request.schema) : undefined;
@@ -256,6 +267,7 @@ export class AdvancedRuntime {
   private publish(receipt: UsageReceipt): void { receipt.updatedAt = timestamp(); this.store.putReceipt(receipt); this.runtimeDriver().contribution(receipt); }
   private async native(p: RuntimeParticipant, req: IncomingMessage, res: ServerResponse): Promise<void> {
     const path = req.url!.slice("/native".length);
+    if (p.provider.kind === "claude-code" && req.headers["x-api-key"] !== undefined) throw new PuppenclawError("PROVIDER_AUTHENTICATION_REQUIRED", "Native Claude calls require subscription OAuth; API-key authentication is disabled.");
     if (req.method === "HEAD" && path === "/api/hello") { res.writeHead(200); res.end(); return; }
     if (req.method !== "POST" || !/^\/(?:v1\/(messages(?:\/count_tokens)?|responses(?:\/compact)?|chat\/completions)|backend-api\/codex\/responses(?:\/compact)?)(?:\?|$)/u.test(path)) throw new Error("Native model route is not supported.");
     const headers: Record<string, string> = {}; for (const [key, value] of Object.entries(req.headers)) if (typeof value === "string" && !["host", "content-length", "connection", "proxy-authorization"].includes(key)) headers[key] = value;

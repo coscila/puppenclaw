@@ -121,6 +121,14 @@ describe("scoped worker broker", () => {
     const job = (await unix(socket, "/agent/submit", { configId: "refs", idempotencyKey: "early-harness", task: "Review" })).body; const result = await settled(socket, job.jobId); await call;
     expect(result).toMatchObject({ state: "completed", results: [{ usage: { input: 10, output: 2, quality: "partial" } }] }); expect(runtime.store.receipts("main")[0]).toMatchObject({ state: "cancelled", usage: { quality: "partial" } });
   });
+  it("closes and quiesces a child before publishing a thrown harness failure", async () => {
+    let entered!: () => void; const started = new Promise<void>((done) => { entered = done; });
+    const { url } = await upstream((_req, res) => { res.setHeader("content-type", "text/event-stream"); res.write('data: {"response":{"model":"test-model","usage":{"input_tokens":10,"output_tokens":2}}}\n\n'); entered(); });
+    const { runtime, socket, session } = await setup(url); let child!: string; let call: Promise<unknown> | undefined; const quiesced: string[] = [];
+    runtime.attach({ start: async (params) => { child = params.name; call = unix(runtime.socket(child)!, "/native/v1/responses", { model: "test-model", stream: true }).catch(() => null); await started; for (let i = 0; i < 100 && runtime.store.receipts("main")[0]?.usage.input === null; i++) await new Promise((done) => setTimeout(done, 5)); throw new Error("Native harness failed"); }, quiesce: async (name) => { quiesced.push(name); }, getSession: () => session, contribution: () => {} });
+    const job = (await unix(socket, "/agent/submit", { configId: "refs", idempotencyKey: "failed-harness", task: "Review" })).body; const result = await settled(socket, job.jobId); await call;
+    expect(result).toMatchObject({ state: "failed", results: [{ state: "failed", error: "Native harness failed", usage: { quality: "partial" }, receiptDigests: [{ model: "test-model" }] }] }); expect(quiesced).toEqual([child]); expect(runtime.store.receipts("main")[0]!.state).not.toBe("running"); expect((await unix(runtime.socket(child)!, "/configs")).status).toBe(409);
+  });
   it("forwards managed Codex OAuth on its native endpoint without replacing auth", async () => {
     const { url } = await upstream((req, res) => { expect(req.url).toBe("/backend-api/codex/responses"); expect(req.headers.authorization).toBe("Bearer oauth-fixture"); res.setHeader("content-type", "application/json"); res.end('{"model":"test-model","output_text":"ok","usage":{"input_tokens":10,"output_tokens":2}}'); });
     const { runtime, socket, params, session } = await setup(url); await runtime.closeTurn("main"); const provider = { ...params.modelProvider!, kind: "codex-openai" as const }; await runtime.begin({ ...session, modelProvider: provider }, { ...params, modelProvider: provider, statisticsContext: { version: 1, chatId: "chat", attemptId: "oauth" } }, "approve-all");
@@ -131,6 +139,12 @@ describe("scoped worker broker", () => {
     const { runtime, socket, params, session } = await setup(url); await runtime.closeTurn("main"); const provider = { ...params.modelProvider!, kind: "claude-code" as const }; await runtime.begin({ ...session, modelProvider: provider }, { ...params, modelProvider: provider, statisticsContext: { version: 1, chatId: "chat", attemptId: "auth" } }, "approve-all");
     expect((await unix(socket, "/native/v1/messages", { model: "test-model", messages: [] })).status).toBe(401);
     const receipt = runtime.store.receipts("main", "auth")[0]!; expect(receipt).toMatchObject({ state: "failed", httpStatus: 401, errorCode: "authentication_error", authTransport: "missing" }); expect(JSON.stringify(receipt)).not.toContain("secret diagnostic body");
+  });
+  it("rejects native Claude API keys before dispatch while preserving subscription OAuth", async () => {
+    let calls = 0; const { url } = await upstream((req, res) => { calls++; expect(req.headers.authorization).toBe("Bearer subscription-fixture"); expect(req.headers["x-api-key"]).toBeUndefined(); expect(req.headers["anthropic-beta"]).toBe("oauth-fixture"); res.setHeader("content-type", "application/json"); res.end('{"model":"test-model","usage":{"input_tokens":10,"output_tokens":2}}'); });
+    const { runtime, socket, params, session } = await setup(url); await runtime.closeTurn("main"); const provider = { ...params.modelProvider!, kind: "claude-code" as const }; await runtime.begin({ ...session, modelProvider: provider }, { ...params, modelProvider: provider, statisticsContext: { version: 1, chatId: "chat", attemptId: "subscription" } }, "approve-all");
+    const denied = await unix(socket, "/native/v1/messages", { model: "test-model", messages: [] }, { "x-api-key": "forbidden-api-key" }); expect(denied.status).toBe(409); expect(denied.body.code).toBe("PROVIDER_AUTHENTICATION_REQUIRED"); expect(calls).toBe(0); expect(runtime.store.receipts("main", "subscription")).toEqual([]);
+    expect((await unix(socket, "/native/v1/messages", { model: "test-model", messages: [] }, { authorization: "Bearer subscription-fixture", "anthropic-beta": "oauth-fixture" })).status).toBe(200); expect(calls).toBe(1); expect(runtime.store.receipts("main", "subscription")[0]).toMatchObject({ state: "completed", authTransport: "authorization" });
   });
   it("records transport error codes separately from upstream HTTP rejection", async () => {
     const { server, url } = await upstream(() => {}); await new Promise<void>((done) => server.close(() => done()));
