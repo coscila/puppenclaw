@@ -341,6 +341,8 @@ export type SessionInfo = {
   model?: string;
   modelProviderId?: string;
   modelProvider?: ModelProviderConfig;
+  orchestration?: AdvancedOrchestration;
+  brokerSocket?: string;
   skills?: string[];
   tokenUsage?: TokenUsage;
   pendingQuestion?: string;
@@ -588,3 +590,5 @@ export type CommandParseResult =
       ok: false;
       message: string;
     };
+
+export type AdvancedOrchestration = import("zod").infer<typeof import("./schema.js").advancedOrchestrationZod>;

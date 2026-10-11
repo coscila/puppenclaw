@@ -67,7 +67,8 @@ export function fingerprintStartRequest(params: StartParams): string {
     modelProviderId: params.modelProviderId ?? null,
     modelProvider: canonicalProvider(params.modelProvider),
     contextFiles: (params.contextFiles ?? []).map((entry) => entry.trim()),
-    skills: [...new Set((params.skills ?? []).map((entry) => entry.trim()))].sort()
+    skills: [...new Set((params.skills ?? []).map((entry) => entry.trim()))].sort(),
+    ...(params.orchestration != null ? { orchestration: params.orchestration as unknown as CanonicalValue } : {})
   };
   if (params.ownerKey == null) {
     // This is the exact v1 shape used before account-scoped ownership existed.
@@ -96,6 +97,7 @@ export function fingerprintSendRequest(params: SendParams): string {
     modelProviderId: params.modelProviderId ?? null,
     modelProvider: canonicalProvider(params.modelProvider),
     contextFiles: (params.contextFiles ?? []).map((entry) => entry.trim()),
+    ...(params.orchestration != null ? { orchestration: params.orchestration as unknown as CanonicalValue } : {}),
     ...(params.statisticsContext != null ? { version: 2, statisticsContext: params.statisticsContext } : {})
   });
 }

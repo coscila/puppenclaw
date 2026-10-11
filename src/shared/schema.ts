@@ -103,6 +103,25 @@ export const modelProviderConfigZod = z
       });
     }
   });
+export const advancedOrchestrationZod = z.object({
+  version: z.literal(1),
+  revision: z.number().int().nonnegative().safe(),
+  workers: z.array(z.object({
+    id: skillNameString.max(128),
+    assignment: nonEmptyString.max(50_000),
+    agent: agentKindZod,
+    effort: effortLevelZod.optional(),
+    modelProvider: modelProviderConfigZod,
+  }).strict()).min(1).max(128),
+}).strict().superRefine((value, context) => {
+  if (new Set(value.workers.map((worker) => worker.id)).size !== value.workers.length)
+    context.addIssue({ code: 'custom', path: ['workers'], message: 'Worker configuration ids must be unique.' });
+  for (const [i, worker] of value.workers.entries()) {
+    if ((worker.agent === 'claude') !== (worker.modelProvider.kind === 'claude-code'))
+      context.addIssue({ code: 'custom', path: ['workers', i, 'agent'], message: 'Worker agent must match its model provider harness.' });
+  }
+});
+
 export const orchestrationStepKindZod = z.enum([
   "judge",
   "research",
@@ -516,6 +535,7 @@ export const startParamsZod = z
     ownerKey: ownerKeyZod.optional(),
     turnKey: turnKeyZod.optional(),
     statisticsContext: statisticsContextZod.optional(),
+    orchestration: advancedOrchestrationZod.optional(),
     lifecycleEpoch: z.number().int().positive().safe().optional(),
     contextFiles: z.array(nonEmptyString).default([]),
     skills: z.array(skillNameString).default([])
@@ -558,6 +578,7 @@ export const sendParamsZod = z
     interactionMode: interactionModeZod.optional(),
     turnKey: turnKeyZod.optional(),
     statisticsContext: statisticsContextZod.optional(),
+    orchestration: advancedOrchestrationZod.optional(),
     lifecycleEpoch: z.number().int().positive().safe().optional(),
     modelProviderId: skillNameString.optional(),
     modelProvider: modelProviderConfigZod.optional(),
