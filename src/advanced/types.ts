@@ -21,6 +21,7 @@ export type WorkerJob = {
 export type UsageReceipt = {
   version: 1; requestId: string; parentSessionName: string; sessionName: string; attemptId: string; jobId?: string; itemId?: string; ownerKey?: string;
   providerId: string; model: string; role: "main" | "subagent"; promptSha256: string;
+  httpStatus?: number; errorCode?: string; authTransport?: "authorization" | "api-key" | "missing";
   state: "running" | "completed" | "failed" | "cancelled" | "interrupted"; usage: StatisticsTokens; createdAt: string; updatedAt: string;
 };
 export type RuntimeParticipant = {

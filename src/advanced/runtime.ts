@@ -19,6 +19,8 @@ const timestamp = () => new Date().toISOString();
 const hash = (input: unknown) => createHash("sha256").update(typeof input === "string" ? input : stable(input)).digest("hex");
 function stable(value: unknown): string { if (Array.isArray(value)) return `[${value.map(stable).join(",")}]`; if (value && typeof value === "object") return `{${Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => `${JSON.stringify(k)}:${stable(v)}`).join(",")}}`; return JSON.stringify(value) ?? "null"; }
 const object = (x: unknown): Record<string, unknown> | null => x && typeof x === "object" && !Array.isArray(x) ? x as Record<string, unknown> : null;
+// Retain only bounded diagnostic identifiers, never provider messages or response bodies.
+const safeErrorCode = (value: unknown): string | undefined => typeof value === "string" && /^[A-Za-z][A-Za-z0-9_.-]{0,95}$/u.test(value) ? value : undefined;
 const message = (error: unknown) => redactSensitiveText(error instanceof Error ? error.message : String(error));
 const terminal = (state: string) => ["completed", "failed", "cancelled", "interrupted"].includes(state);
 const normalizeModel = (value: string) => value.replace(/\[1m\]$/u, "");
@@ -100,10 +102,10 @@ export class AdvancedRuntime {
     if (this.servers.has(name)) return;
     const path = join(this.socketRoot, `${hash(name).slice(0, 24)}.sock`);
     await unlink(path).catch((e) => { if (e.code !== "ENOENT") throw e; });
-    const server = createServer((req, res) => { void this.handle(name, req, res).catch((error) => { if (!res.headersSent) { res.writeHead(error instanceof PuppenclawError ? 409 : 400, { "content-type": "application/json" }); res.end(JSON.stringify({ error: message(error), code: error instanceof PuppenclawError ? error.code : "INVALID_REQUEST" })); } else res.destroy(); }); });
+    const server = createServer((req, res) => { req.on("error", () => res.destroy()); res.on("error", () => res.destroy()); void this.handle(name, req, res).catch((error) => { if (!res.headersSent) { res.writeHead(error instanceof PuppenclawError ? 409 : 400, { "content-type": "application/json" }); res.end(JSON.stringify({ error: message(error), code: error instanceof PuppenclawError ? error.code : "INVALID_REQUEST" })); } else res.destroy(); }); });
     server.on("connect", (req, socket, head) => { try { this.requireParticipant(name); } catch { socket.destroy(); return; } void proxyConnect(this.policy, req, socket, head).catch(() => socket.destroy()); });
     await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(path, () => { server.removeListener("error", reject); resolve(); }); });
-    const sockets = new Set<Socket>(); server.on("connection", (socket) => { sockets.add(socket); socket.once("close", () => sockets.delete(socket)); });
+    const sockets = new Set<Socket>(); server.on("connection", (socket) => { socket.on("error", () => socket.destroy()); sockets.add(socket); socket.once("close", () => sockets.delete(socket)); });
     await chmod(path, 0o600); this.servers.set(name, { server, path, sockets });
   }
   private async handle(name: string, req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -232,7 +234,8 @@ export class AdvancedRuntime {
     const existing = this.barriers.get(name); if (existing) return existing;
     p.admissionOpen = false;
     const operation = (async () => {
-      for (const child of this.participants.values()) if (child.parentSessionName === name && child.attemptId === p.attemptId) { child.admissionOpen = false; for (const socket of this.servers.get(child.sessionName)?.sockets ?? []) socket.destroy(); }
+      for (const socket of this.servers.get(name)?.sockets ?? []) socket.destroy();
+      for (const child of this.participants.values()) if (child.jobId && child.parentSessionName === name && child.attemptId === p.attemptId) { child.admissionOpen = false; for (const socket of this.servers.get(child.sessionName)?.sockets ?? []) socket.destroy(); }
       const activeRequests = [...this.requests.values()].filter((r) => r.participant.parentSessionName === name && r.participant.attemptId === p.attemptId);
       for (const request of activeRequests) request.abort.abort();
       const jobs = this.store.jobs(name).filter((job) => job.attemptId === p.attemptId && ["queued", "running", "paused"].includes(job.state));
@@ -259,7 +262,7 @@ export class AdvancedRuntime {
     const paused = this.pausedProviders.get(p.provider.id); if (paused) throw new PuppenclawError("PROVIDER_PAUSED", paused);
     const requestId = randomUUID(), abort = new AbortController(), anthropic = p.provider.kind === "claude-code";
     const receipt: UsageReceipt = { version: 1, requestId, parentSessionName: p.parentSessionName, sessionName: p.sessionName, attemptId: p.attemptId,
-      ...(p.jobId ? { jobId: p.jobId } : {}), ...(p.ownerKey ? { ownerKey: p.ownerKey } : {}), ...(itemId ? { itemId } : {}), providerId: p.provider.id, model, role: p.jobId ? "subagent" : "main", promptSha256: hash(bytes.toString()), state: "running", usage: noUsage(), createdAt: timestamp(), updatedAt: timestamp() };
+      ...(p.jobId ? { jobId: p.jobId } : {}), ...(p.ownerKey ? { ownerKey: p.ownerKey } : {}), ...(itemId ? { itemId } : {}), providerId: p.provider.id, model, role: p.jobId ? "subagent" : "main", promptSha256: hash(bytes.toString()), state: "running", authTransport: headers.authorization ? "authorization" : headers["x-api-key"] ? "api-key" : "missing", usage: noUsage(), createdAt: timestamp(), updatedAt: timestamp() };
     const counting = path.startsWith("/v1/messages/count_tokens");
     let complete!: () => void; const done = new Promise<void>((resolve) => { complete = resolve; });
     this.requests.set(requestId, { participant: p, abort, done }); if (!counting) this.publish(receipt);
@@ -267,21 +270,25 @@ export class AdvancedRuntime {
     const parser = new UsageParser(anthropic); let payload: unknown = null;
     try {
     if (p.provider.kind === "codex-openai-compatible") { const key = p.provider.authTokenEnv && process.env[p.provider.authTokenEnv]; if (!key) throw new Error("Provider API credential is unavailable."); headers.authorization = `Bearer ${key}`; delete headers["x-api-key"]; }
+    receipt.authTransport = headers.authorization ? "authorization" : headers["x-api-key"] ? "api-key" : "missing";
     headers["content-type"] = "application/json";
       const response = await fetch(upstreamUrl(p.provider, path), { method: "POST", headers, body: bytes, signal: abort.signal, redirect: "manual" });
+      receipt.httpStatus = response.status;
       if (downstream) { const outgoing: Record<string, string> = {}; response.headers.forEach((value, key) => { if (!["connection", "transfer-encoding", "content-length", "content-encoding"].includes(key)) outgoing[key] = value; }); downstream.writeHead(response.status, outgoing); }
       const streaming = response.headers.get("content-type")?.includes("text/event-stream"), chunks: Buffer[] = []; let length = 0; const decoder = new TextDecoder();
       if (response.body) for await (const chunk of response.body) {
         const data = Buffer.from(chunk); if (streaming) { const previous = JSON.stringify([parser.model, parser.usage]); parser.feed(decoder.decode(data, { stream: true })); if (!counting && previous !== JSON.stringify([parser.model, parser.usage])) { receipt.usage = parser.usage; receipt.model = parser.model ?? receipt.model; this.publish(receipt); } } else { length += data.length; if (length > 16 * 1024 * 1024) throw new Error("Provider JSON exceeded 16 MiB."); chunks.push(data); }
+        if (downstream?.destroyed) throw new Error("Downstream closed.");
         if (downstream && !downstream.write(data)) await new Promise<void>((resolve, reject) => { const done = () => { downstream.removeListener("close", closed); resolve(); }; const closed = () => { downstream.removeListener("drain", done); reject(new Error("Downstream closed.")); }; downstream.once("drain", done); downstream.once("close", closed); });
       }
       if (!streaming) { const text = Buffer.concat(chunks).toString(); try { payload = JSON.parse(text); parser.event(payload); } catch { if (response.ok) throw new Error("Provider did not return valid JSON."); } }
       parser.finish(response.ok); receipt.usage = parser.usage; receipt.model = parser.model ?? receipt.model; receipt.state = response.ok ? "completed" : "failed";
+      if (!response.ok) { const providerError = object(object(payload)?.error); receipt.errorCode = safeErrorCode(providerError?.code) ?? safeErrorCode(providerError?.type) ?? "provider_http_error"; }
       if ([401, 403, 429, 503].includes(response.status)) this.pausedProviders.set(p.provider.id, `Provider ${p.provider.id} requires attention (HTTP ${response.status}); resume explicitly after access or quota recovers.`);
       if (!counting) this.publish(receipt); downstream?.end();
       if (!response.ok) throw new Error(`Provider request failed with HTTP ${response.status}.`);
       return { payload, receipt };
-    } catch (error) { receipt.usage = parser.usage; parser.finish(false); receipt.state = abort.signal.aborted ? "cancelled" : "failed"; if (!counting) this.publish(receipt); throw error; }
+    } catch (error) { receipt.usage = parser.usage; parser.finish(false); receipt.state = abort.signal.aborted ? "cancelled" : "failed"; receipt.errorCode ??= abort.signal.aborted ? "request_cancelled" : safeErrorCode(object(error)?.code) ?? safeErrorCode(object(object(error)?.cause)?.code) ?? "transport_error"; if (!counting) this.publish(receipt); throw error; }
     finally { downstream?.removeListener("close", onClose); this.requests.delete(requestId); complete(); }
   }
   /** Permanent session erasure also removes confidential inputs, outputs and transport receipts. */

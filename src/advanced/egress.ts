@@ -60,6 +60,10 @@ export function clientHelloServerName(data: Buffer): { ready: boolean; name?: st
   return { ready: true, ...(name ? { name } : {}), encrypted };
 }
 export async function proxyConnect(policy: EgressPolicy, req: IncomingMessage, socket: Duplex, head: Buffer): Promise<void> {
+  let upstream: Socket | undefined;
+  // pipe() removes its internal error listener on failure; both peers need permanent guards.
+  const failClosed = () => { socket.destroy(); upstream?.destroy(); };
+  socket.on("error", failClosed); socket.once("close", () => upstream?.destroy());
   const target = new URL(`https://${req.url}`);
   const destination = await policy.destination(target.hostname, Number(target.port || 443));
   socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
@@ -71,10 +75,12 @@ export async function proxyConnect(policy: EgressPolicy, req: IncomingMessage, s
     const onData = (chunk: Buffer) => { hello = Buffer.concat([hello, chunk]); check(); }, onError = (error: Error) => done(error), onClose = () => done(new Error("Client disconnected."));
     socket.on("data", onData); socket.once("error", onError); socket.once("close", onClose); if (head.length) check();
   });
-  const upstream = connect({ host: destination.address, port: Number(target.port || 443), family: destination.family });
-  const close = () => upstream.destroy(); socket.once("close", close); upstream.once("error", () => socket.destroy());
-  await new Promise<void>((resolve, reject) => { upstream.once("connect", resolve); upstream.once("error", reject); });
-  upstream.write(readHello); socket.pipe(upstream).pipe(socket); socket.resume();
+  if (socket.destroyed) return;
+  const remote = connect({ host: destination.address, port: Number(target.port || 443), family: destination.family }); upstream = remote;
+  remote.on("error", failClosed); remote.once("close", () => socket.destroy());
+  await new Promise<void>((resolve, reject) => { remote.once("connect", resolve); remote.once("error", reject); remote.once("close", () => reject(new Error("Upstream closed during connection."))); });
+  if (socket.destroyed || remote.destroyed) { failClosed(); return; }
+  remote.write(readHello); socket.pipe(remote).pipe(socket); socket.resume();
 }
 export async function proxyHttp(policy: EgressPolicy, req: IncomingMessage, res: ServerResponse): Promise<void> {
   const target = new URL(req.url!); if (target.protocol !== "http:") throw new Error("Use CONNECT for HTTPS.");
@@ -83,7 +89,8 @@ export async function proxyHttp(policy: EgressPolicy, req: IncomingMessage, res:
   const headers = { ...req.headers }; delete headers["proxy-authorization"]; delete headers["proxy-connection"];
   const upstream = httpRequest(target, { headers, method: req.method,
     lookup: (_name, _options, cb) => cb(null, destination.address, destination.family),
-  }, (response) => { res.writeHead(response.statusCode ?? 502, response.headers); response.pipe(res); });
-  upstream.once("error", () => { if (!res.headersSent) res.writeHead(502); res.end(); });
+  }, (response) => { response.on("error", () => { upstream.destroy(); res.destroy(); }); if (res.destroyed) { response.destroy(); return; } res.writeHead(response.statusCode ?? 502, response.headers); response.pipe(res); });
+  upstream.on("error", () => { if (res.destroyed) return; if (!res.headersSent) res.writeHead(502); res.end(); });
+  req.on("error", () => upstream.destroy()); res.on("error", () => upstream.destroy());
   res.once("close", () => upstream.destroy()); req.pipe(upstream);
 }

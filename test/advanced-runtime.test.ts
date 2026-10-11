@@ -2,6 +2,7 @@ import { createServer, request, type Server, type RequestListener } from "node:h
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { connect } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
 import { AdvancedRuntime } from "../src/advanced/runtime.js";
 import { UsageParser } from "../src/advanced/usage.js";
@@ -83,10 +84,26 @@ describe("scoped worker broker", () => {
     const { runtime, socket } = await setup(url); const call = unix(socket, "/native/v1/responses", { model: "test-model", input: "x", stream: true }).catch(() => null); await started; for (let i = 0; i < 100 && runtime.store.receipts("main")[0]?.usage.input === null; i++) await new Promise((done) => setTimeout(done, 5)); expect(runtime.store.receipts("main")[0]!.usage).toMatchObject({ input: 10, output: 1, quality: "partial" }); await runtime.closeTurn("main"); await call;
     const receipt = runtime.store.receipts("main")[0]!; expect(receipt.state).toBe("cancelled"); expect(receipt.usage.quality).not.toBe("measured"); expect((await unix(socket, "/configs")).status).toBe(409);
   });
+  it("closes established main connections before the parent turn barrier resolves", async () => {
+    const { runtime, socket } = await setup("http://127.0.0.1:1/v1"); const client = connect(socket); client.on("error", () => client.destroy()); await new Promise<void>((done) => client.once("connect", done));
+    const received = new Promise<void>((done) => client.once("data", () => done())); client.write("GET /configs HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n"); await received;
+    const closed = new Promise<void>((done) => client.once("close", () => done())); await runtime.closeTurn("main"); await closed; expect(client.destroyed).toBe(true);
+  });
   it("forwards managed Codex OAuth on its native endpoint without replacing auth", async () => {
     const { url } = await upstream((req, res) => { expect(req.url).toBe("/backend-api/codex/responses"); expect(req.headers.authorization).toBe("Bearer oauth-fixture"); res.setHeader("content-type", "application/json"); res.end('{"model":"test-model","output_text":"ok","usage":{"input_tokens":10,"output_tokens":2}}'); });
     const { runtime, socket, params, session } = await setup(url); await runtime.closeTurn("main"); const provider = { ...params.modelProvider!, kind: "codex-openai" as const }; await runtime.begin({ ...session, modelProvider: provider }, { ...params, modelProvider: provider, statisticsContext: { version: 1, chatId: "chat", attemptId: "oauth" } }, "approve-all");
     const response = await unix(socket, "/native/backend-api/codex/responses", { model: "test-model", input: "hello" }, { authorization: "Bearer oauth-fixture" }); expect(response.status).toBe(200); expect(runtime.store.receipts("main", "oauth")[0]).toMatchObject({ providerId: "local", model: "test-model", usage: { input: 10, output: 2, total: 12 } });
+  });
+  it("records safe native authentication failures without retaining response bodies or credential values", async () => {
+    const { url } = await upstream((req, res) => { expect(req.headers.authorization).toBeUndefined(); res.statusCode = 401; res.setHeader("content-type", "application/json"); res.end('{"error":{"type":"authentication_error","message":"secret diagnostic body"}}'); });
+    const { runtime, socket, params, session } = await setup(url); await runtime.closeTurn("main"); const provider = { ...params.modelProvider!, kind: "claude-code" as const }; await runtime.begin({ ...session, modelProvider: provider }, { ...params, modelProvider: provider, statisticsContext: { version: 1, chatId: "chat", attemptId: "auth" } }, "approve-all");
+    expect((await unix(socket, "/native/v1/messages", { model: "test-model", messages: [] })).status).toBe(401);
+    const receipt = runtime.store.receipts("main", "auth")[0]!; expect(receipt).toMatchObject({ state: "failed", httpStatus: 401, errorCode: "authentication_error", authTransport: "missing" }); expect(JSON.stringify(receipt)).not.toContain("secret diagnostic body");
+  });
+  it("records transport error codes separately from upstream HTTP rejection", async () => {
+    const { server, url } = await upstream(() => {}); await new Promise<void>((done) => server.close(() => done()));
+    const { runtime, socket } = await setup(url); expect((await unix(socket, "/native/v1/responses", { model: "test-model", input: "x" })).status).toBe(400);
+    expect(runtime.store.receipts("main")[0]).toMatchObject({ state: "failed", errorCode: "ECONNREFUSED", authTransport: "authorization" }); expect(runtime.store.receipts("main")[0]!.httpStatus).toBeUndefined();
   });
   it("pins native agent workers to parent planning permissions and records actual calls", async () => {
     const { url } = await upstream((_req, res) => { res.setHeader("content-type", "application/json"); res.end('{"model":"actual-test-model","output_text":"ok","usage":{"input_tokens":10,"output_tokens":2}}'); });
