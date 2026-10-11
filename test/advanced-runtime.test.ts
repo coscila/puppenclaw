@@ -32,7 +32,16 @@ async function setup(baseUrl: string, mode: "plan" | "execute" = "execute") {
   return { runtime, socket: runtime.socket("main")!, params, session };
 }
 function unix(socketPath: string, path: string, value?: unknown, headers: Record<string,string> = {}): Promise<{ status: number; body: any }> {
-  return new Promise((resolve, reject) => { const req = request({ socketPath, path, method: value === undefined ? "GET" : "POST", headers: { "content-type": "application/json", ...headers } }, (res) => { let text = ""; res.once("aborted", () => reject(new Error("Response aborted"))); res.once("error", reject); res.on("data", (chunk) => { text += chunk; }); res.once("end", () => { let body: unknown; try { body = JSON.parse(text); } catch { body = text; } resolve({ status: res.statusCode!, body }); }); }); req.once("error", reject); req.end(value === undefined ? undefined : JSON.stringify(value)); });
+  return new Promise((resolve, reject) => { const req = request({ socketPath, path, agent: false, method: value === undefined ? "GET" : "POST", headers: { "content-type": "application/json", ...headers } }, (res) => { let text = ""; res.once("aborted", () => reject(new Error("Response aborted"))); res.once("error", reject); res.on("data", (chunk) => { text += chunk; }); res.once("end", () => { let body: unknown; try { body = JSON.parse(text); } catch { body = text; } resolve({ status: res.statusCode!, body }); }); }); req.once("error", reject); req.end(value === undefined ? undefined : JSON.stringify(value)); });
+}
+function closeOnCompletion(socketPath: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let completed = false;
+    const req = request({ socketPath, path: "/native/v1/responses", method: "POST", headers: { "content-type": "application/json" } }, (res) => {
+      let text = ""; res.on("data", (chunk) => { text += String(chunk); if (!completed && text.includes('"type":"response.completed"')) { completed = true; res.destroy(); req.destroy(); resolve(); } });
+      res.on("error", (error) => { if (!completed) reject(error); }); res.once("end", () => { if (!completed) reject(new Error("No protocol completion received.")); });
+    }); req.on("error", (error) => { if (!completed) reject(error); }); req.end(JSON.stringify({ model: "test-model", input: "x", stream: true }));
+  });
 }
 async function settled(socket: string, id: string) { for (let i = 0; i < 200; i++) { const result = await unix(socket, `/jobs/${id}`); if (!["queued", "running"].includes(result.body.state)) return result.body; await new Promise((done) => setTimeout(done, 5)); } throw new Error("Job did not settle"); }
 
@@ -89,6 +98,29 @@ describe("scoped worker broker", () => {
     const received = new Promise<void>((done) => client.once("data", () => done())); client.write("GET /configs HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n"); await received;
     const closed = new Promise<void>((done) => client.once("close", () => done())); await runtime.closeTurn("main"); await closed; expect(client.destroyed).toBe(true);
   });
+  it("publishes measured completion before forwarding the terminal SSE frame and preserves it on early client close", async () => {
+    const { url } = await upstream((_req, res) => { res.setHeader("content-type", "text/event-stream"); res.write('data: {"type":"response.completed","response":{"model":"test-model","usage":{"input_tokens":10,"output_tokens":2}}}\n\n'); });
+    const { runtime, socket } = await setup(url); await closeOnCompletion(socket);
+    expect(runtime.store.receipts("main")[0]).toMatchObject({ state: "completed", usage: { input: 10, output: 2, total: 12, quality: "measured" } });
+    await runtime.closeTurn("main"); expect(runtime.store.receipts("main")[0]).toMatchObject({ state: "completed", usage: { quality: "measured" } });
+  });
+  it.each(["response.failed", "response.incomplete", "error"])("keeps HTTP200 %s stream failures failed with partial usage", async (type) => {
+    const { url } = await upstream((_req, res) => { res.setHeader("content-type", "text/event-stream"); res.end(`data: {"response":{"model":"test-model","usage":{"input_tokens":10,"output_tokens":2}}}\n\ndata: ${JSON.stringify({ type, error: { type: "overloaded_error", message: "confidential failure context" } })}\n\ndata: [DONE]\n\n`); });
+    const { runtime, socket } = await setup(url); await unix(socket, "/native/v1/responses", { model: "test-model", stream: true }); const receipt = runtime.store.receipts("main")[0]!;
+    expect(receipt).toMatchObject({ state: "failed", httpStatus: 200, errorCode: "overloaded_error", usage: { input: 10, output: 2, quality: "partial" } }); expect(JSON.stringify(receipt)).not.toContain("confidential failure context");
+  });
+  it("keeps a truncated HTTP200 stream failed and partial after transport EOF", async () => {
+    const { url } = await upstream((_req, res) => { res.setHeader("content-type", "text/event-stream"); res.end('data: {"response":{"model":"test-model","usage":{"input_tokens":10,"output_tokens":2}}}\n\n'); });
+    const { runtime, socket } = await setup(url); await unix(socket, "/native/v1/responses", { model: "test-model", stream: true }); expect(runtime.store.receipts("main")[0]).toMatchObject({ state: "failed", errorCode: "provider_stream_incomplete", usage: { quality: "partial" } });
+  });
+  it("drains child transports before publishing worker results even when its harness returns before HTTP termination", async () => {
+    let entered!: () => void; const started = new Promise<void>((done) => { entered = done; });
+    const { url } = await upstream((_req, res) => { res.setHeader("content-type", "text/event-stream"); res.write('data: {"response":{"model":"test-model","usage":{"input_tokens":10,"output_tokens":2}}}\n\n'); entered(); });
+    const { runtime, socket, session } = await setup(url); let call: Promise<unknown> | undefined;
+    runtime.attach({ start: async (params) => { call = unix(runtime.socket(params.name)!, "/native/v1/responses", { model: "test-model", stream: true }).catch(() => null); await started; for (let i = 0; i < 100 && runtime.store.receipts("main")[0]?.usage.input === null; i++) await new Promise((done) => setTimeout(done, 5)); return { content: [{ type: "text", text: "done" }], details: { output: "done", session: { state: "completed" } } }; }, quiesce: async () => {}, getSession: () => session, contribution: () => {} });
+    const job = (await unix(socket, "/agent/submit", { configId: "refs", idempotencyKey: "early-harness", task: "Review" })).body; const result = await settled(socket, job.jobId); await call;
+    expect(result).toMatchObject({ state: "completed", results: [{ usage: { input: 10, output: 2, quality: "partial" } }] }); expect(runtime.store.receipts("main")[0]).toMatchObject({ state: "cancelled", usage: { quality: "partial" } });
+  });
   it("forwards managed Codex OAuth on its native endpoint without replacing auth", async () => {
     const { url } = await upstream((req, res) => { expect(req.url).toBe("/backend-api/codex/responses"); expect(req.headers.authorization).toBe("Bearer oauth-fixture"); res.setHeader("content-type", "application/json"); res.end('{"model":"test-model","output_text":"ok","usage":{"input_tokens":10,"output_tokens":2}}'); });
     const { runtime, socket, params, session } = await setup(url); await runtime.closeTurn("main"); const provider = { ...params.modelProvider!, kind: "codex-openai" as const }; await runtime.begin({ ...session, modelProvider: provider }, { ...params, modelProvider: provider, statisticsContext: { version: 1, chatId: "chat", attemptId: "oauth" } }, "approve-all");
@@ -104,6 +136,11 @@ describe("scoped worker broker", () => {
     const { server, url } = await upstream(() => {}); await new Promise<void>((done) => server.close(() => done()));
     const { runtime, socket } = await setup(url); expect((await unix(socket, "/native/v1/responses", { model: "test-model", input: "x" })).status).toBe(400);
     expect(runtime.store.receipts("main")[0]).toMatchObject({ state: "failed", errorCode: "ECONNREFUSED", authTransport: "authorization" }); expect(runtime.store.receipts("main")[0]!.httpStatus).toBeUndefined();
+  });
+  it("blocks automatic auth retries in the same attempt but admits an explicit new controller attempt", async () => {
+    let calls = 0; const { url } = await upstream((_req, res) => { calls++; res.setHeader("content-type", "application/json"); if (calls === 1) { res.statusCode = 401; res.end('{"error":{"type":"authentication_error"}}'); } else res.end('{"model":"test-model","output_text":"ok","usage":{"input_tokens":10,"output_tokens":2}}'); });
+    const { runtime, socket, params, session } = await setup(url); expect((await unix(socket, "/native/v1/responses", { model: "test-model" })).status).toBe(401); expect((await unix(socket, "/native/v1/responses", { model: "test-model" })).status).toBe(409); expect(calls).toBe(1);
+    await runtime.closeTurn("main"); await runtime.begin(session, { ...params, statisticsContext: { version: 1, chatId: "chat", attemptId: "explicit-retry" } }, "approve-all"); expect((await unix(socket, "/native/v1/responses", { model: "test-model" })).status).toBe(200); expect(calls).toBe(2); expect(runtime.store.receipts("main", "explicit-retry")[0]!.state).toBe("completed");
   });
   it("pins native agent workers to parent planning permissions and records actual calls", async () => {
     const { url } = await upstream((_req, res) => { res.setHeader("content-type", "application/json"); res.end('{"model":"actual-test-model","output_text":"ok","usage":{"input_tokens":10,"output_tokens":2}}'); });

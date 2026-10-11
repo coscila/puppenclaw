@@ -25,12 +25,18 @@ export function readProviderUsage(raw: unknown, previous: StatisticsTokens, anth
   return result;
 }
 export class UsageParser {
-  usage = noUsage(); model: string | null = null; private tail = ""; private streaming = false; private complete = false;
+  usage = noUsage(); model: string | null = null; private tail = ""; private streaming = false; private complete = false; private failure: string | null = null;
   constructor(private readonly anthropic: boolean) {}
+  get protocolComplete(): boolean { return this.complete && this.failure === null; }
+  get protocolErrorCode(): string | null { return this.failure; }
   event(raw: unknown): void {
     const o = object(raw); if (!o) return;
     if (o.type === "message_stop" || o.type === "response.completed") this.complete = true;
     const message = object(o.message), response = object(o.response);
+    if (["error", "response.failed", "response.incomplete"].includes(String(o.type))) {
+      const error = object(o.error) ?? object(response?.error), code = error?.code ?? error?.type;
+      this.failure = typeof code === "string" && /^[A-Za-z][A-Za-z0-9_.-]{0,95}$/u.test(code) ? code : String(o.type).replaceAll(".", "_");
+    }
     const source = response ?? message ?? o;
     if (typeof source.model === "string") this.model = source.model;
     this.usage = readProviderUsage(source.usage, this.usage, this.anthropic);
@@ -48,5 +54,5 @@ export class UsageParser {
       try { this.event(JSON.parse(data)); } catch (error) { if (!(error instanceof SyntaxError)) throw error; }
     }
   }
-  finish(success: boolean): void { if (this.usage.input !== null && this.usage.output !== null) this.usage.quality = success && (!this.streaming || this.complete) ? "measured" : "partial"; }
+  finish(success: boolean): void { if (this.usage.input !== null && this.usage.output !== null) this.usage.quality = success && this.failure === null && (!this.streaming || this.complete) ? "measured" : "partial"; }
 }

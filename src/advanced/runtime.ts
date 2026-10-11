@@ -24,6 +24,7 @@ const safeErrorCode = (value: unknown): string | undefined => typeof value === "
 const message = (error: unknown) => redactSensitiveText(error instanceof Error ? error.message : String(error));
 const terminal = (state: string) => ["completed", "failed", "cancelled", "interrupted"].includes(state);
 const normalizeModel = (value: string) => value.replace(/\[1m\]$/u, "");
+const providerPauseKey = (p: { parentSessionName: string; attemptId: string }, providerId: string) => JSON.stringify([p.parentSessionName, p.attemptId, providerId]);
 export function aggregateUsage(parts: UsageReceipt["usage"][]): UsageReceipt["usage"] {
   const result = noUsage(); for (const key of ["input", "output", "cacheRead", "cacheWrite", "reasoning", "total"] as const) { const values = parts.map((p) => p[key]); const total = values.reduce<number>((a,b) => a + (b ?? 0), 0); result[key] = values.some((v) => v === null) || !Number.isSafeInteger(total) ? null : total; }
   result.quality = parts.every((p) => p.quality === "measured") ? "measured" : parts.every((p) => p.quality === "unavailable") ? "unavailable" : "partial"; return result;
@@ -160,9 +161,16 @@ export class AdvancedRuntime {
       modelProvider: job.config.modelProvider, modelProviderId: job.config.modelProvider.id, model: job.config.agent === "claude" ? claudeAcpModelSelector(job.config.modelProvider.model) : job.config.modelProvider.model,
       ...(job.config.effort ? { effort: job.config.effort } : {}), ...(job.ownerKey ? { ownerKey: job.ownerKey } : {}), turnKey: `worker-${job.jobId}`, contextFiles: [], skills: [],
     });
+    // A harness may finish as soon as its SSE completion event arrives, before the HTTP peer closes.
+    // Close child admission and join its transports before publishing a settled job or reading usage.
+    child.admissionOpen = false;
+    const activeRequests = [...this.requests.values()].filter((r) => r.participant.sessionName === child.sessionName);
+    for (const request of activeRequests) request.abort.abort();
+    for (const socket of this.servers.get(child.sessionName)?.sockets ?? []) socket.destroy();
+    await Promise.allSettled(activeRequests.map((r) => r.done));
     const current = this.store.job(job.jobId)!; if (current.state === "cancelled") return;
     const details = object(result.details), session = object(details?.session);
-    const paused = this.pausedProviders.get(job.config.modelProvider.id);
+    const paused = this.pausedProviders.get(providerPauseKey(parent, job.config.modelProvider.id));
     const state = paused || session?.state === "waiting_input" ? "paused" : ["failed", "stopped"].includes(String(session?.state)) ? "failed" : "completed";
     current.results[0]!.state = state; current.results[0]!.output = details?.output ?? result.content.filter((b) => b.type === "text").map((b) => b.text).join("\n");
     if (state !== "completed") { current.error = paused ?? String(session?.lastError ?? (state === "paused" ? "Worker requires parent approval before continuing." : "Worker harness failed.")); current.results[0]!.error = current.error; }
@@ -181,7 +189,7 @@ export class AdvancedRuntime {
       const i = index++, item = request.items[i]!;
       const current = this.store.job(job.jobId)!;
       if (current.state === "cancelled" || current.results[i]?.state === "completed") continue;
-      const pause = this.pausedProviders.get(job.config.modelProvider.id); if (pause) { current.state = "paused"; current.error = pause; this.store.putJob(current); break; }
+      const pause = this.pausedProviders.get(providerPauseKey(p, job.config.modelProvider.id)); if (pause) { current.state = "paused"; current.error = pause; this.store.putJob(current); break; }
       this.requireParticipant(p.sessionName);
       current.results[i]!.state = "running"; this.store.putJob(current);
       const participant: RuntimeParticipant = { ...p, provider: job.config.modelProvider, jobId: job.jobId };
@@ -207,7 +215,7 @@ export class AdvancedRuntime {
         const fresh = this.store.job(job.jobId)!; if (fresh.state === "cancelled") continue;
         const receipt = this.store.receipts(job.parentSessionName, job.attemptId).findLast((r) => r.jobId === job.jobId && r.itemId === item.id);
         if (receipt) { fresh.results[i]!.usage = receipt.usage; fresh.results[i]!.model = receipt.model; fresh.results[i]!.promptSha256 = receipt.promptSha256; }
-        const paused = this.pausedProviders.get(job.config.modelProvider.id); fresh.results[i]!.state = paused ? "paused" : "failed"; fresh.results[i]!.error = message(error); if (paused) { fresh.state = "paused"; fresh.error = paused; } this.store.putJob(fresh);
+        const paused = this.pausedProviders.get(providerPauseKey(p, job.config.modelProvider.id)); fresh.results[i]!.state = paused ? "paused" : "failed"; fresh.results[i]!.error = message(error); if (paused) { fresh.state = "paused"; fresh.error = paused; } this.store.putJob(fresh);
       }
     } };
     await Promise.allSettled(Array.from({ length: Math.min(request.concurrency, request.items.length) }, run));
@@ -217,7 +225,7 @@ export class AdvancedRuntime {
   private async resume(p: RuntimeParticipant, old: WorkerJob): Promise<Record<string, unknown>> {
     if (!["paused", "interrupted", "failed", "cancelled"].includes(old.state)) throw new Error("Only settled or paused jobs can resume.");
     const config = this.worker(p, old.config.id); if (hash(config) !== hash(old.config)) throw new Error("Worker configuration changed; submit an explicit new job.");
-    this.pausedProviders.delete(config.modelProvider.id);
+    this.pausedProviders.delete(providerPauseKey(p, config.modelProvider.id));
     const request = old.kind === "bulk" ? { ...old.request, items: (old.request as BulkSubmit).items.filter((item) => old.results.find((r) => r.id === item.id)?.state !== "completed") } : old.request;
     if (old.kind === "bulk" && !(request as BulkSubmit).items.length) return publicJob(old);
     return this.submit(p, old.kind, { ...request, idempotencyKey: `${hash(old.idempotencyKey).slice(0, 48)}-resume-${old.jobId}` });
@@ -259,7 +267,7 @@ export class AdvancedRuntime {
     const model = String(parsed.model ?? p.provider.model);
     const allowedModels = [p.provider.model].map(normalizeModel);
     if (!allowedModels.includes(normalizeModel(model))) throw new PuppenclawError("MODEL_NOT_CONFIGURED", "The requested model is not configured for this attempt.");
-    const paused = this.pausedProviders.get(p.provider.id); if (paused) throw new PuppenclawError("PROVIDER_PAUSED", paused);
+    const paused = this.pausedProviders.get(providerPauseKey(p, p.provider.id)); if (paused) throw new PuppenclawError("PROVIDER_PAUSED", paused);
     const requestId = randomUUID(), abort = new AbortController(), anthropic = p.provider.kind === "claude-code";
     const receipt: UsageReceipt = { version: 1, requestId, parentSessionName: p.parentSessionName, sessionName: p.sessionName, attemptId: p.attemptId,
       ...(p.jobId ? { jobId: p.jobId } : {}), ...(p.ownerKey ? { ownerKey: p.ownerKey } : {}), ...(itemId ? { itemId } : {}), providerId: p.provider.id, model, role: p.jobId ? "subagent" : "main", promptSha256: hash(bytes.toString()), state: "running", authTransport: headers.authorization ? "authorization" : headers["x-api-key"] ? "api-key" : "missing", usage: noUsage(), createdAt: timestamp(), updatedAt: timestamp() };
@@ -277,18 +285,24 @@ export class AdvancedRuntime {
       if (downstream) { const outgoing: Record<string, string> = {}; response.headers.forEach((value, key) => { if (!["connection", "transfer-encoding", "content-length", "content-encoding"].includes(key)) outgoing[key] = value; }); downstream.writeHead(response.status, outgoing); }
       const streaming = response.headers.get("content-type")?.includes("text/event-stream"), chunks: Buffer[] = []; let length = 0; const decoder = new TextDecoder();
       if (response.body) for await (const chunk of response.body) {
-        const data = Buffer.from(chunk); if (streaming) { const previous = JSON.stringify([parser.model, parser.usage]); parser.feed(decoder.decode(data, { stream: true })); if (!counting && previous !== JSON.stringify([parser.model, parser.usage])) { receipt.usage = parser.usage; receipt.model = parser.model ?? receipt.model; this.publish(receipt); } } else { length += data.length; if (length > 16 * 1024 * 1024) throw new Error("Provider JSON exceeded 16 MiB."); chunks.push(data); }
+        const data = Buffer.from(chunk); if (streaming) { const previous = JSON.stringify([parser.model, parser.usage, receipt.state]); parser.feed(decoder.decode(data, { stream: true })); if (response.ok && parser.protocolComplete) { parser.finish(true); receipt.state = "completed"; } else if (parser.protocolErrorCode) { parser.finish(false); receipt.state = "failed"; receipt.errorCode = parser.protocolErrorCode; } if (!counting && previous !== JSON.stringify([parser.model, parser.usage, receipt.state])) { receipt.usage = parser.usage; receipt.model = parser.model ?? receipt.model; this.publish(receipt); } } else { length += data.length; if (length > 16 * 1024 * 1024) throw new Error("Provider JSON exceeded 16 MiB."); chunks.push(data); }
         if (downstream?.destroyed) throw new Error("Downstream closed.");
         if (downstream && !downstream.write(data)) await new Promise<void>((resolve, reject) => { const done = () => { downstream.removeListener("close", closed); resolve(); }; const closed = () => { downstream.removeListener("drain", done); reject(new Error("Downstream closed.")); }; downstream.once("drain", done); downstream.once("close", closed); });
+        if (response.ok && parser.protocolComplete || parser.protocolErrorCode) break;
       }
       if (!streaming) { const text = Buffer.concat(chunks).toString(); try { payload = JSON.parse(text); parser.event(payload); } catch { if (response.ok) throw new Error("Provider did not return valid JSON."); } }
-      parser.finish(response.ok); receipt.usage = parser.usage; receipt.model = parser.model ?? receipt.model; receipt.state = response.ok ? "completed" : "failed";
+      const success = response.ok && !parser.protocolErrorCode && (!streaming || parser.protocolComplete);
+      parser.finish(success); receipt.usage = parser.usage; receipt.model = parser.model ?? receipt.model; receipt.state = success ? "completed" : "failed";
+      if (response.ok && !success) receipt.errorCode = parser.protocolErrorCode ?? "provider_stream_incomplete";
       if (!response.ok) { const providerError = object(object(payload)?.error); receipt.errorCode = safeErrorCode(providerError?.code) ?? safeErrorCode(providerError?.type) ?? "provider_http_error"; }
-      if ([401, 403, 429, 503].includes(response.status)) this.pausedProviders.set(p.provider.id, `Provider ${p.provider.id} requires attention (HTTP ${response.status}); resume explicitly after access or quota recovers.`);
+      if ([401, 403, 429, 503].includes(response.status)) this.pausedProviders.set(providerPauseKey(p, p.provider.id), `Provider ${p.provider.id} requires attention (HTTP ${response.status}); resume explicitly after access or quota recovers.`);
       if (!counting) this.publish(receipt); downstream?.end();
-      if (!response.ok) throw new Error(`Provider request failed with HTTP ${response.status}.`);
+      if (!success) throw new Error(response.ok ? "Provider stream did not complete successfully." : `Provider request failed with HTTP ${response.status}.`);
       return { payload, receipt };
-    } catch (error) { receipt.usage = parser.usage; parser.finish(false); receipt.state = abort.signal.aborted ? "cancelled" : "failed"; receipt.errorCode ??= abort.signal.aborted ? "request_cancelled" : safeErrorCode(object(error)?.code) ?? safeErrorCode(object(object(error)?.cause)?.code) ?? "transport_error"; if (!counting) this.publish(receipt); throw error; }
+    } catch (error) {
+      if (receipt.state === "completed") { parser.finish(true); receipt.usage = parser.usage; if (!counting) this.publish(receipt); downstream?.end(); return { payload, receipt }; }
+      parser.finish(false); receipt.usage = parser.usage; receipt.state = parser.protocolErrorCode ? "failed" : abort.signal.aborted ? "cancelled" : "failed"; receipt.errorCode ??= parser.protocolErrorCode ?? (abort.signal.aborted ? "request_cancelled" : safeErrorCode(object(error)?.code) ?? safeErrorCode(object(object(error)?.cause)?.code) ?? "transport_error"); if (!counting) this.publish(receipt); throw error;
+    }
     finally { downstream?.removeListener("close", onClose); this.requests.delete(requestId); complete(); }
   }
   /** Permanent session erasure also removes confidential inputs, outputs and transport receipts. */
