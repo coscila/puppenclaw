@@ -50,6 +50,7 @@ function upstreamUrl(provider: ModelProviderConfig, path: string): URL {
 function publicJob(job: WorkerJob): Record<string, unknown> {
   return { jobId: job.jobId, kind: job.kind, state: job.state, parentSessionName: job.parentSessionName, createdAt: job.createdAt, updatedAt: job.updatedAt, config: { id: job.config.id, modelProvider: { id: job.config.modelProvider.id, model: job.config.modelProvider.model } }, configId: job.config.id, configRevision: job.configRevision,
     providerId: job.config.modelProvider.id, model: job.config.modelProvider.model, attemptId: job.attemptId, results: job.results,
+    ...(job.resumedFromJobId ? { resumedFromJobId: job.resumedFromJobId } : {}),
     ...(job.error ? { error: job.error } : {}), progress: { total: job.results.length, completed: job.results.filter((r) => r.state === "completed").length, failed: job.results.filter((r) => r.state === "failed").length } };
 }
 export class AdvancedRuntime {
@@ -60,6 +61,7 @@ export class AdvancedRuntime {
   private readonly requests = new Map<string, { participant: RuntimeParticipant; abort: AbortController; done: Promise<void> }>();
   private readonly barriers = new Map<string, Promise<void>>();
   private readonly pausedProviders = new Map<string, string>();
+  private readonly observedJobs = new Set<string>();
   private readonly policy = new EgressPolicy();
   private readonly socketRoot: string;
   private constructor(readonly store: AdvancedStore, root: string) { this.socketRoot = join("/tmp", `ocsl-model-broker-${process.getuid?.() ?? "user"}-${hash(root).slice(0, 12)}`); }
@@ -69,6 +71,38 @@ export class AdvancedRuntime {
   async recover(): Promise<void> { for (const child of this.store.recover()) await this.runtimeDriver().quiesce(child); }
   metered(name: string): boolean { return this.participants.has(name); }
   parent(name: string): string | undefined { const p = this.participants.get(name); return p?.jobId ? p.parentSessionName : undefined; }
+  controller(name: string): boolean { const p = this.participants.get(name); return Boolean(p && !p.jobId && p.admissionOpen); }
+  /** Results already returned to the controller do not need another model turn. */
+  private observeJobs(p: RuntimeParticipant, jobs: WorkerJob[]): void {
+    if (p.jobId) return;
+    for (const job of jobs) if (job.attemptId === p.attemptId && !["queued", "running"].includes(job.state)) this.observedJobs.add(job.jobId);
+  }
+  pendingWorkers(name: string): WorkerJob[] {
+    const p = this.participants.get(name);
+    if (!p || p.jobId || !p.admissionOpen) return [];
+    return this.currentWorkers(p).filter((job) => !this.observedJobs.has(job.jobId));
+  }
+  pausedWorkers(name: string): WorkerJob[] {
+    const p = this.participants.get(name);
+    return !p || p.jobId ? [] : this.currentWorkers(p).filter((job) => job.state === "paused");
+  }
+  private currentWorkers(p: RuntimeParticipant): WorkerJob[] {
+    const jobs = this.store.jobs(p.parentSessionName);
+    const superseded = new Set(jobs.flatMap((job) => job.resumedFromJobId ? [job.resumedFromJobId] : []));
+    return jobs.filter((job) => job.attemptId === p.attemptId && !superseded.has(job.jobId));
+  }
+  /** Join existing work without closing its attempt or polling the parent model. */
+  async joinWorkers(name: string): Promise<WorkerJob[]> {
+    const p = this.participants.get(name);
+    if (!p || p.jobId || !p.admissionOpen) return [];
+    const jobs = this.pendingWorkers(name);
+    await Promise.all(jobs.map((job) => this.executions.get(job.jobId)));
+    // Stop/erase/replacement can win while workers settle. Never revive that turn.
+    if (this.participants.get(name) !== p || !p.admissionOpen) return [];
+    const settled = jobs.map((job) => this.store.job(job.jobId)).filter((job): job is WorkerJob => job != null);
+    this.observeJobs(p, settled);
+    return settled;
+  }
   socket(name: string): string | undefined { return this.servers.get(name)?.path; }
   environment(name: string): NodeJS.ProcessEnv {
     const participant = this.participants.get(name), socket = this.socket(name); if (!participant || !socket) return {};
@@ -115,15 +149,15 @@ export class AdvancedRuntime {
     if (/^http:\/\//u.test(req.url ?? "")) { await proxyHttp(this.policy, req, res); return; }
     if (path.startsWith("/native/")) { await this.native(p, req, res); return; }
     if (req.method === "GET" && ["/configs", "/configs/list"].includes(path)) { json({ version: 1, revision: p.config.revision, workers: p.config.workers.map((w) => ({ id: w.id, assignment: w.assignment, providerId: w.modelProvider.id, model: w.modelProvider.model, modelProvider: { id: w.modelProvider.id, model: w.modelProvider.model, kind: w.modelProvider.kind, label: w.modelProvider.label, reasoningProfile: w.modelProvider.reasoningProfile }, agent: w.agent, effort: w.effort, bulkAvailable: w.modelProvider.kind === "codex-openai-compatible" })) }); return; }
-    if (req.method === "GET" && path === "/jobs") { json({ jobs: this.jobs(p.parentSessionName) }); return; }
+    if (req.method === "GET" && path === "/jobs") { const jobs = this.store.jobs(p.parentSessionName); json({ jobs: jobs.map(publicJob) }); this.observeJobs(p, jobs); return; }
     if (req.method === "POST" && path === "/agent/submit") { json(await this.submit(p, "agent", agentSubmitZod.parse(JSON.parse((await body(req)).toString())))); return; }
     if (req.method === "POST" && path === "/bulk/submit") { json(await this.submit(p, "bulk", bulkSubmitZod.parse(JSON.parse((await body(req)).toString())))); return; }
     const route = /^\/jobs\/([a-f0-9-]+)(?:\/(cancel|resume))?$/u.exec(path);
     if (route) {
       if (p.jobId && req.method === "POST" && route[2]) throw new PuppenclawError("WORKER_CONTROL_DENIED", "Only the parent controller can cancel or resume worker jobs.");
       const job = this.requireJob(route[1]!, p);
-      if (req.method === "GET" && !route[2]) { json(publicJob(job)); return; }
-      if (req.method === "POST" && route[2] === "cancel") { await this.cancel(job.jobId); json(publicJob(this.store.job(job.jobId)!)); return; }
+      if (req.method === "GET" && !route[2]) { json(publicJob(job)); this.observeJobs(p, [job]); return; }
+      if (req.method === "POST" && route[2] === "cancel") { await this.cancel(job.jobId); const cancelled = this.store.job(job.jobId)!; json(publicJob(cancelled)); this.observeJobs(p, [cancelled]); return; }
       if (req.method === "POST" && route[2] === "resume") { json(await this.resume(p, job)); return; }
     }
     throw new PuppenclawError("UNKNOWN_WORKER_ROUTE", "Only scoped worker, native model and public web routes are exposed.");
@@ -131,7 +165,7 @@ export class AdvancedRuntime {
   private requireJob(id: string, p: RuntimeParticipant): WorkerJob { const job = this.store.job(id); if (!job || job.parentSessionName !== p.parentSessionName) throw new PuppenclawError("WORKER_NOT_FOUND", "Worker job is not in this chat."); return job; }
   jobs(parent?: string): Record<string, unknown>[] { return this.store.jobs(parent).map(publicJob); }
   private worker(p: RuntimeParticipant, configId: string): WorkerConfig { const config = p.config.workers.find((w) => w.id === configId); if (!config) throw new PuppenclawError("WORKER_CONFIG_NOT_FOUND", "Select a configured worker id."); return config; }
-  async submit(p: RuntimeParticipant, kind: "agent" | "bulk", request: AgentSubmit | BulkSubmit): Promise<Record<string, unknown>> {
+  async submit(p: RuntimeParticipant, kind: "agent" | "bulk", request: AgentSubmit | BulkSubmit, resumedFromJobId?: string): Promise<Record<string, unknown>> {
     if (this.requireParticipant(p.sessionName).attemptId !== p.attemptId) throw new PuppenclawError("ORCHESTRATION_TURN_CLOSED", "Attempt ownership changed."); if (p.jobId) throw new PuppenclawError("WORKER_DELEGATION_DENIED", "Worker jobs cannot expand the parent's worker allocation.");
     const config = this.worker(p, request.configId), fingerprint = hash({ kind, config, request });
     const duplicate = this.store.duplicate(p.parentSessionName, p.attemptId, request.idempotencyKey);
@@ -141,7 +175,7 @@ export class AdvancedRuntime {
     if (p.permissionMode === "deny-all") throw new PuppenclawError("WORKER_PERMISSION_DENIED", "This parent turn cannot launch worker tools.");
     if (kind === "bulk" && (request as BulkSubmit).schema) compileSchema((request as BulkSubmit).schema!);
     const job: WorkerJob = { jobId: randomUUID(), kind, state: "queued", parentSessionName: p.parentSessionName, attemptId: p.attemptId,
-      configRevision: p.config.revision, config, idempotencyKey: request.idempotencyKey, fingerprint, createdAt: timestamp(), updatedAt: timestamp(), request, results: [], ...(p.ownerKey ? { ownerKey: p.ownerKey } : {}) };
+      configRevision: p.config.revision, config, idempotencyKey: request.idempotencyKey, fingerprint, createdAt: timestamp(), updatedAt: timestamp(), request, results: [], ...(p.ownerKey ? { ownerKey: p.ownerKey } : {}), ...(resumedFromJobId ? { resumedFromJobId } : {}) };
     if (kind === "agent") job.childSessionName = `worker-${job.jobId}`;
     job.results = kind === "bulk" ? (request as BulkSubmit).items.map((item) => ({ id: item.id, state: "queued", providerId: config.modelProvider.id, model: config.modelProvider.model, promptSha256: hash(item.input), inputSha256: hash(item.input), usage: null }))
       : [{ id: job.jobId, state: "queued", providerId: config.modelProvider.id, model: config.modelProvider.model, promptSha256: hash((request as AgentSubmit).task), inputSha256: hash((request as AgentSubmit).task), usage: null }];
@@ -240,14 +274,20 @@ export class AdvancedRuntime {
     this.pausedProviders.delete(providerPauseKey(p, config.modelProvider.id));
     const request = old.kind === "bulk" ? { ...old.request, items: (old.request as BulkSubmit).items.filter((item) => old.results.find((r) => r.id === item.id)?.state !== "completed") } : old.request;
     if (old.kind === "bulk" && !(request as BulkSubmit).items.length) return publicJob(old);
-    return this.submit(p, old.kind, { ...request, idempotencyKey: `${hash(old.idempotencyKey).slice(0, 48)}-resume-${old.jobId}` });
+    return this.submit(p, old.kind, { ...request, idempotencyKey: `${hash(old.idempotencyKey).slice(0, 48)}-resume-${old.jobId}` }, old.jobId);
   }
   async cancel(id: string): Promise<void> {
-    const job = this.store.job(id); if (!job || terminal(job.state)) return;
-    job.state = "cancelled"; job.updatedAt = timestamp(); for (const r of job.results) if (!terminal(r.state)) r.state = "cancelled"; this.store.putJob(job);
+    const job = this.store.job(id); if (!job) return;
+    if (terminal(job.state)) { await this.executions.get(id); return; }
+    job.state = "cancelled"; job.error = "Worker cancelled by its controller or parent turn closure."; job.updatedAt = timestamp();
+    for (const r of job.results) if (!terminal(r.state)) { r.state = "cancelled"; r.error = job.error; }
+    this.store.putJob(job);
     for (const operation of this.requests.values()) if (operation.participant.jobId === id) operation.abort.abort();
     if (job.childSessionName) { const p = this.participants.get(job.childSessionName); if (p) p.admissionOpen = false; await this.runtimeDriver().quiesce(job.childSessionName); }
     await this.executions.get(id);
+    // Broker receipts settle while cancellation drains the native harness.
+    // Preserve that measured/partial work even though no final answer exists.
+    if (job.kind === "agent") { const settled = this.store.job(id); if (settled) { this.recordAgentReceipts(settled); this.store.putJob(settled); } }
   }
   async closeTurn(name: string): Promise<void> {
     const p = this.participants.get(name); if (!p || p.jobId) return;
@@ -260,10 +300,13 @@ export class AdvancedRuntime {
       for (const request of activeRequests) request.abort.abort();
       const jobs = this.store.jobs(name).filter((job) => job.attemptId === p.attemptId && ["queued", "running", "paused"].includes(job.state));
       await Promise.all(jobs.map((job) => job.state === "paused" ? this.executions.get(job.jobId) : this.cancel(job.jobId)));
+      // A terminal result can be read while its native harness is still
+      // quiescing; that cleanup remains owned by this attempt as well.
+      await Promise.all(this.store.jobs(name).filter((job) => job.attemptId === p.attemptId).map((job) => this.executions.get(job.jobId)));
       await Promise.allSettled(activeRequests.map((r) => r.done));
     })();
     this.barriers.set(name, operation);
-    try { await operation; } finally { if (this.barriers.get(name) === operation) this.barriers.delete(name); }
+    try { await operation; } finally { if (this.barriers.get(name) === operation) this.barriers.delete(name); for (const job of this.store.jobs(name)) if (job.attemptId === p.attemptId) this.observedJobs.delete(job.jobId); }
   }
   private publish(receipt: UsageReceipt): void { receipt.updatedAt = timestamp(); this.store.putReceipt(receipt); this.runtimeDriver().contribution(receipt); }
   private async native(p: RuntimeParticipant, req: IncomingMessage, res: ServerResponse): Promise<void> {

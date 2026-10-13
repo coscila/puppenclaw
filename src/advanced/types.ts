@@ -16,7 +16,7 @@ export type ItemResult = { id: string; state: JobState; output?: unknown; provid
 export type WorkerJob = {
   jobId: string; kind: "agent" | "bulk"; state: JobState; parentSessionName: string; attemptId: string; ownerKey?: string;
   configRevision: number; config: WorkerConfig; idempotencyKey: string; fingerprint: string; createdAt: string; updatedAt: string;
-  request: AgentSubmit | BulkSubmit; childSessionName?: string; results: ItemResult[]; error?: string;
+  request: AgentSubmit | BulkSubmit; childSessionName?: string; resumedFromJobId?: string; results: ItemResult[]; error?: string;
 };
 export type UsageReceipt = {
   version: 1; requestId: string; parentSessionName: string; sessionName: string; attemptId: string; jobId?: string; itemId?: string; ownerKey?: string;

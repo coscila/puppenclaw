@@ -1396,6 +1396,7 @@ export class AcpxSessionManager implements ISessionManager {
   private readonly activeTurns = new Set<string>();
   private readonly stopRequests = new Set<string>();
   private readonly activeTurnOutputs = new Map<string, ActiveTurnOutput>();
+  private readonly deferredControllerCompletions = new Set<string>();
   private readonly activeTurnProcesses = new Map<string, ActiveTurnProcess>();
   private readonly lifecycleTails = new Map<string, Promise<void>>();
   private admissionTail: Promise<void> = Promise.resolve();
@@ -3654,7 +3655,12 @@ export class AcpxSessionManager implements ISessionManager {
     let classification: ActiveTurnRuntimeStatus["classification"] = "inactive";
     let conflict: string | null = null;
     if (activeTurn?.state === "running") {
-      if (processAlive === true || trackedChildRunning) {
+      if (lockHeld && this.deferredControllerCompletions.has(session.name)) {
+        // The native controller process has finished, but this same live
+        // attempt still owns its workers or is preparing the continuation.
+        // This evidence never survives restart.
+        classification = "running";
+      } else if (processAlive === true || trackedChildRunning) {
         classification = "running";
       } else if (pid == null && lockHeld) {
         classification = "starting";
@@ -4638,6 +4644,68 @@ export class AcpxSessionManager implements ISessionManager {
     interactionMode?: InteractionMode;
     retryAfterReconnect?: boolean;
   }): Promise<TurnResult> {
+    const advanced = this.deps.advanced;
+    const name = params.session.name;
+    if (!advanced?.controller(name)) return this.runNativeTurn(params);
+    this.deferredControllerCompletions.add(name);
+    try {
+      let turn = await this.runNativeTurn(params);
+      while (turn.state === "idle" && turn.signals?.plan?.source !== "claude-tool" && advanced.pendingWorkers(name).length > 0) {
+        this.assertTurnWasNotStopped(name);
+        await this.deps.outputRouter.onActivity(name, {
+          type: "status", status: "running", title: "Waiting for workers",
+          text: "The controller is waiting for its submitted workers before integrating their results."
+        });
+        const jobs = await advanced.joinWorkers(name);
+        this.assertTurnWasNotStopped(name);
+        this.deps.store.assertSessionMutable(name);
+        if (!advanced.controller(name)) throw new PuppenclawError("ORCHESTRATION_TURN_CLOSED", "The parent worker attempt closed before result integration.");
+        if (jobs.length === 0) break;
+        const notification = [
+          "The worker jobs submitted by this same approved turn have now settled. Continue the existing task by inspecting their stored results and integrating the findings before replying to the user.",
+          "This is a lifecycle notification, not a new user request or approval. Preserve the current permissions and scope. Do not resubmit completed work or automatically retry failed, cancelled, interrupted or paused jobs. If a worker requires access or approval, explain that boundary and wait for the user.",
+          "Worker identifiers and states (quoted data):",
+          JSON.stringify(jobs.map((job) => ({ jobId: job.jobId, configId: job.config.id, kind: job.kind, state: job.state })))
+        ].join("\n\n");
+        const continuationSession = {
+          ...params.session,
+          transcript: mergeTranscript(params.session.transcript, [...makeUserTranscript(params.promptText), ...turn.transcript])
+        };
+        const next = await this.runNativeTurn({
+          ...params, session: continuationSession,
+          promptText: this.usesOneShotRuntime(continuationSession)
+            ? this.buildOneShotContinuationPrompt(continuationSession, notification) : notification
+        });
+        turn = {
+          ...next,
+          transcript: [...turn.transcript, ...next.transcript],
+          warnings: dedupeWarnings([...turn.warnings, ...next.warnings]),
+          durationMs: (turn.durationMs ?? 0) + (next.durationMs ?? 0)
+        };
+      }
+      this.assertTurnWasNotStopped(name);
+      this.deps.store.assertSessionMutable(name);
+      if (!advanced.controller(name)) throw new PuppenclawError("ORCHESTRATION_TURN_CLOSED", "The parent worker attempt closed before completion.");
+      if (advanced.pausedWorkers(name).length > 0 && turn.state === "idle") {
+        turn = { ...turn, state: "waiting_input", question: "A worker is paused and requires your approval or restored provider access before it can resume." };
+      }
+      if (turn.state === "idle" || turn.state === "waiting_input") {
+        await this.publishSuccessfulTurn(name, turn.output, turn.question);
+      }
+      return turn;
+    } finally {
+      this.deferredControllerCompletions.delete(name);
+      this.completeActiveTurnOutput(name);
+    }
+  }
+
+  private async runNativeTurn(params: {
+    session: SessionInfo;
+    promptText: string;
+    permissionMode: PermissionMode;
+    interactionMode?: InteractionMode;
+    retryAfterReconnect?: boolean;
+  }): Promise<TurnResult> {
     const nativeMode = await this.prepareNativeInteractionMode(params);
     let turn: TurnResult;
     try {
@@ -5561,6 +5629,7 @@ export class AcpxSessionManager implements ISessionManager {
   }
 
   private completeActiveTurnOutput(sessionName: string): void {
+    if (this.deferredControllerCompletions.has(sessionName)) return;
     const current = this.activeTurnOutputs.get(sessionName);
     if (current == null) {
       return;
@@ -5823,14 +5892,9 @@ export class AcpxSessionManager implements ISessionManager {
         retryable: false
       };
     }
-    await this.deps.outputRouter.onFinal(params.sessionName, params.output);
-    if (question != null) {
-      await this.deps.outputRouter.onQuestion(params.sessionName, question);
+    if (!this.deferredControllerCompletions.has(params.sessionName)) {
+      await this.publishSuccessfulTurn(params.sessionName, params.output, question);
     }
-    await this.deps.outputRouter.onComplete(
-      params.sessionName,
-      question != null ? "Turn completed and is waiting for user input." : "Turn completed."
-    );
 
     return {
       output: params.output,
@@ -5844,6 +5908,13 @@ export class AcpxSessionManager implements ISessionManager {
       transcript: makeAssistantTranscript(params.output),
       state: question != null ? "waiting_input" : "idle"
     };
+  }
+
+  private async publishSuccessfulTurn(sessionName: string, output: string, question?: string): Promise<void> {
+    await this.deps.outputRouter.onFinal(sessionName, output);
+    if (question != null) await this.deps.outputRouter.onQuestion(sessionName, question);
+    await this.deps.outputRouter.onComplete(sessionName,
+      question != null ? "Turn completed and is waiting for user input." : "Turn completed.");
   }
 
   private async runControlCommand(params: {
