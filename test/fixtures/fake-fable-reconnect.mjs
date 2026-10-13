@@ -33,16 +33,35 @@ if (args.includes("prompt")) {
       const sessionId = "native-plan-session";
       const update = (value) => emit({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: value } });
       emit({ jsonrpc: "2.0", id: 7, method: "session/prompt", params: { sessionId, prompt: [{ type: "text", text: prompt }] } });
+      const tool = (id, name, status, extra = {}) => update({ sessionUpdate: status === "pending" ? "tool_call" : "tool_call_update",
+        toolCallId: id, _meta: { claudeCode: { toolName: name } }, status, ...extra });
+      if (options.recoveryHandoff) {
+        tool("old-mode", "ExitPlanMode", "pending");
+        tool("old-mode", "ExitPlanMode", "failed", { content: [{ type: "content", content: { type: "text", text: "You are not in plan mode." } }] });
+        tool("enter-plan", "EnterPlanMode", "pending");
+        update({ sessionUpdate: "current_mode_update", currentModeId: "plan" });
+        tool("enter-plan", "EnterPlanMode", "completed");
+      }
       for (let index = 0; index < (options.denials ?? 1); index++) {
+        if (options.recoveryHandoff) tool(`plan-${index}`, "ExitPlanMode", "pending");
         emit({ jsonrpc: "2.0", id: index, method: "session/request_permission", params: {
-          sessionId, toolCall: { toolCallId: `plan-${index}`, title: "Ready to code?", kind: options.permissionKind ?? "switch_mode" },
+          sessionId, toolCall: { toolCallId: `plan-${index}`, title: "Ready to code?", kind: options.permissionKind ?? "switch_mode",
+            ...(options.recoveryHandoff ? { content: [{ type: "content", content: { type: "text", text: "# Recovery plan\n\nInspect preserved outputs, then resume after approval." } }] } : {}) },
           options: [{ optionId: "default", kind: "allow_once", name: "Yes" },
             { optionId: "plan", kind: "reject_once", name: "No, keep planning" }]
         } });
         if (!options.missingPermissionResponse) emit({ jsonrpc: "2.0", id: index,
           result: { outcome: { outcome: "selected", optionId: options.selectedOption ?? "plan" } } });
+        if (options.recoveryHandoff) tool(`plan-${index}`, "ExitPlanMode", "failed", {
+          content: [{ type: "content", content: { type: "text", text: "User rejected request to exit plan mode." } }] });
       }
-      if (!options.noFreshOutput) update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "The completed plan is ready for your approval." } });
+      if (options.recoveryHandoff) {
+        tool("ask-change", "AskUserQuestion", "pending", { rawInput: { question: "Which change is needed?" } });
+        if (options.questionStatus !== "pending") tool("ask-change", "AskUserQuestion", options.questionStatus ?? "failed", {
+          content: [{ type: "content", content: { type: "text", text: "AskUserQuestion is disabled for this session." } }] });
+      }
+      if (!options.noFreshOutput) update({ sessionUpdate: "agent_message_chunk", content: { type: "text",
+        text: options.recoveryHandoff ? "You declined the recovery plan. What should change?" : "The completed plan is ready for your approval." } });
       if (!options.missingTerminal) emit({ jsonrpc: "2.0", id: options.wrongTerminal ? 8 : 7, result: { stopReason: "end_turn" } });
       if (options.errorAfterDone) emit({ type: "error", code: "CONNECTION_FAILED", message: "Actual failure after done" });
       if (options.signal) {

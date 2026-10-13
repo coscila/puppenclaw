@@ -49,6 +49,21 @@ function completed(prefix: unknown[] = [permission(), response()]) {
 }
 
 describe("AcpPlanPermissionTracker", () => {
+  it.each([0, 5])("captures only the correlated offered plan on a completed read-only handoff (exit %s)", (exitCode) => {
+    const request = permission();
+    Object.assign(request.params.toolCall, { content: [{ type: "content", content: { type: "text", text: "# Actual offered plan" } }] });
+    const tracker = completed([request, response()]);
+    expect(tracker.completedPlanHandoff({ ...context, exitCode })).toEqual({ text: "# Actual offered plan" });
+    expect(JSON.stringify(tracker)).not.toContain("Actual offered plan");
+    expect(tracker.allowsCompletedPlan({ ...context, exitCode })).toBe(exitCode === 5);
+  });
+
+  it.each([{ exitCode: 1 }, { hasError: true }, { interactionMode: "execute" }, { permissionMode: "approve-all" }])(
+    "never turns another outcome into an approval handoff: %j", (override) => {
+      expect(completed().completedPlanHandoff({ ...context, ...override })).toBeUndefined();
+    },
+  );
+
   it("accepts only a correlated completed planning turn with a declined mode switch", () => {
     const tracker = completed();
     expect(tracker.allowsCompletedPlan(context)).toBe(true);

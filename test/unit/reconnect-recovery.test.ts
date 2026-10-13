@@ -37,6 +37,49 @@ async function fixture(options: Record<string, unknown>, baseline = oldRecord) {
 }
 
 describe("turn-specific ACPX reconnect handling", () => {
+  it.each([0, 5])("publishes the actual recovery plan after automated rejection and a failed question (exit %s)", async (exitCode) => {
+    const env = await fixture({ kind: "plan-permission", recoveryHandoff: true, exitCode });
+    try {
+      const result = await env.run({ interactionMode: "plan", permissionMode: "approve-reads" });
+      expect(result.details).toMatchObject({ output: "# Recovery plan\n\nInspect preserved outputs, then resume after approval.",
+        turnSignals: { nativeMode: "plan", plan: { source: "claude-tool" } }, session: { state: "idle" } });
+      expect((result.details as { turnSignals: { inputRequest?: unknown } }).turnSignals.inputRequest).toBeUndefined();
+      expect(env.store.getSession("reconnect-test")?.pendingQuestion).toBeUndefined();
+      expect(env.store.getSession("reconnect-test")?.transcript.at(-1)?.text).not.toContain("You declined");
+      expect(await env.attempts()).toBe(1);
+    } finally { await env.store.close(); }
+  });
+
+  it.each(["pending", "completed"])("preserves a genuine %s question after a plan handoff", async (questionStatus) => {
+    const env = await fixture({ kind: "plan-permission", recoveryHandoff: true, questionStatus, exitCode: 0 });
+    try {
+      const result = await env.run({ interactionMode: "plan", permissionMode: "approve-reads" });
+      expect(result.details).toMatchObject({ turnSignals: { inputRequest: { toolName: "AskUserQuestion" } }, session: { state: "waiting_input" } });
+      expect(env.store.getSession("reconnect-test")?.pendingQuestion).toBeDefined();
+    } finally { await env.store.close(); }
+  });
+
+  it("clears the previous question when a follow-up offers a confirmed recovery plan", async () => {
+    const env = await fixture({ kind: "plan-permission", recoveryHandoff: true, questionStatus: "pending", exitCode: 0 });
+    try {
+      await env.run({ interactionMode: "plan", permissionMode: "approve-reads" });
+      expect(env.store.getSession("reconnect-test")?.pendingQuestion).toBeDefined();
+      await writeFile(join(env.workspace, ".fake-reconnect-options.json"), JSON.stringify({ kind: "plan-permission", recoveryHandoff: true, exitCode: 0 }));
+      const result = await env.manager.send({ name: "reconnect-test", message: "Please offer the recovery plan.", contextFiles: [], interactionMode: "plan", permissionMode: "approve-reads" });
+      expect(result.details).toMatchObject({ session: { state: "idle" }, output: expect.stringContaining("# Recovery plan") });
+      expect(env.store.getSession("reconnect-test")?.pendingQuestion).toBeUndefined();
+      expect(await env.attempts()).toBe(2);
+    } finally { await env.store.close(); }
+  });
+
+  it("does not suppress a failed question without a correlated automatic plan decision", async () => {
+    const env = await fixture({ kind: "plan-permission", recoveryHandoff: true, missingPermissionResponse: true, exitCode: 0 });
+    try {
+      const result = await env.run({ interactionMode: "plan", permissionMode: "approve-reads" });
+      expect(result.details).toMatchObject({ session: { state: "waiting_input" }, output: expect.stringContaining("You declined") });
+    } finally { await env.store.close(); }
+  });
+
   it.each([1, 2])("publishes a completed plan after %s keep-planning denials without replay", async (denials) => {
     const env = await fixture({ kind: "plan-permission", denials });
     try {

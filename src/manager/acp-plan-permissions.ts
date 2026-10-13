@@ -3,6 +3,16 @@ type JsonRecord = Record<string, unknown>;
 const MAX_ID_CHARS = 1_024;
 const MAX_PERMISSION_REQUESTS = 128;
 const MAX_PERMISSION_OPTIONS = 16;
+const MAX_PLAN_CHARS = 256_000;
+
+type PlanCompletionContext = {
+  exitCode: number | null;
+  signal: string | null;
+  interactionMode?: string | undefined;
+  permissionMode: string;
+  hasFreshOutput: boolean;
+  hasError: boolean;
+};
 
 function record(value: unknown): JsonRecord | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -22,7 +32,8 @@ function identifier(value: unknown): string | undefined {
  * all requested permissions were denied, even after a successful end_turn.
  * Claude represents "No, keep planning" as switch_mode / plan / reject_once.
  * Only that complete, correlated exchange qualifies for this exception.
- * Prompt, plan, assistant and tool payload text is never retained here.
+ * Only bounded plan text from the correlated permission request is retained,
+ * privately, to publish the offered plan instead of an automated rejection.
  */
 export class AcpPlanPermissionTracker {
   private invalid = false;
@@ -31,6 +42,8 @@ export class AcpPlanPermissionTracker {
   private completed = false;
   private sawAssistantOutput = false;
   private requests = new Map<string, boolean>();
+  #requestPlans = new Map<string, string>();
+  #offeredPlan: string | undefined;
 
   get deniedPlanRequests(): number {
     let count = 0;
@@ -100,6 +113,8 @@ export class AcpPlanPermissionTracker {
         return;
       }
       this.requests.set(id, false);
+      const text = permissionPlanText(params);
+      if (text !== undefined) this.#requestPlans.set(id, text);
       return;
     }
 
@@ -133,6 +148,7 @@ export class AcpPlanPermissionTracker {
         return;
       }
       this.requests.set(id, true);
+      this.#offeredPlan = this.#requestPlans.get(id);
       return;
     }
     if (id !== undefined && this.requests.has(id)) {
@@ -150,19 +166,38 @@ export class AcpPlanPermissionTracker {
     }
   }
 
-  allowsCompletedPlan(params: {
-    exitCode: number | null;
-    signal: string | null;
-    interactionMode?: string | undefined;
-    permissionMode: string;
-    hasFreshOutput: boolean;
-    hasError: boolean;
-  }): boolean {
+  allowsCompletedPlan(params: PlanCompletionContext): boolean {
     return !this.invalid && this.completed && this.sawAssistantOutput &&
       this.requests.size > 0 && this.deniedPlanRequests === this.requests.size &&
       params.exitCode === 5 && params.signal === null && params.interactionMode === "plan" &&
       params.permissionMode === "approve-reads" && params.hasFreshOutput && !params.hasError;
   }
+
+  completedPlanHandoff(params: PlanCompletionContext): { text?: string } | undefined {
+    // ACPX exits normally when other tools ran successfully before this
+    // automatic mode-switch rejection. That is the same approval handoff,
+    // but must not relax the separate nonzero-exit exception above.
+    if ((params.exitCode !== 0 && params.exitCode !== 5) ||
+        !this.allowsCompletedPlan({ ...params, exitCode: 5 })) return undefined;
+    return this.#offeredPlan === undefined ? {} : { text: this.#offeredPlan };
+  }
+}
+
+function permissionPlanText(params: JsonRecord | undefined): string | undefined {
+  const content = record(params?.toolCall)?.content;
+  if (!Array.isArray(content)) return undefined;
+  const chunks: string[] = [];
+  let length = 0;
+  for (const item of content) {
+    const block = record(item);
+    const value = block?.type === "content" ? record(block.content) : undefined;
+    if (value?.type !== "text" || typeof value.text !== "string") continue;
+    length += value.text.length + 2;
+    if (length > MAX_PLAN_CHARS) return undefined;
+    chunks.push(value.text);
+  }
+  const text = chunks.join("\n\n").trim();
+  return text || undefined;
 }
 
 function isKeepPlanningRequest(params: JsonRecord | undefined): boolean {
