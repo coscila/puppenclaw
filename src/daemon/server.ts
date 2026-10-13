@@ -263,7 +263,7 @@ export async function createDaemonServer(params: {
   app.get("/capabilities", async () => ({
     ok: true,
     version: 1,
-    advancedOrchestration: { version: 1, durableJobs: true, recordedTransport: true, namespaceRequired: true },
+    advancedOrchestration: { version: 1, durableJobs: true, recordedTransport: true, namespaceRequired: true, workerJoinContinuation: true },
     sessionStart: true,
     sessionStartStream: true,
     sessionSend: true,
@@ -525,7 +525,15 @@ export async function createDaemonServer(params: {
     ok(jsonToolResult(await resourceMonitor.snapshot(), "Resource usage"))
   );
 
-  app.get("/orchestration/jobs", async (request) => ({ jobs: advanced.jobs((request.query as { session?: string }).session) }));
+  app.get("/orchestration/jobs", async (request) => {
+    const query = request.query as { session?: string; "metadata-only"?: string };
+    const jobs = advanced.jobs(query.session);
+    return { jobs: query["metadata-only"] === "true"
+      ? jobs.map(({ jobId, resumedFromJobId, parentSessionName, attemptId, kind, state, createdAt, updatedAt }) => ({
+        jobId, resumedFromJobId, parentSessionName, attemptId, kind, state, createdAt, updatedAt
+      }))
+      : jobs };
+  });
   app.get("/orchestration/receipts", async (request) => { const query = request.query as { session?: string; attempt?: string }; return { receipts: advanced.store.receipts(query.session, query.attempt) }; });
 
   app.get("/statistics/turns", async (request, reply) => {
