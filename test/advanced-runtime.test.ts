@@ -70,6 +70,57 @@ describe("advanced usage", () => {
 });
 
 describe("scoped worker broker", () => {
+  it("records a bounded bulk timeout without shortening native controller requests", async () => {
+    const { url } = await upstream((_req, res) => {
+      const timer = setTimeout(() => {
+        res.setHeader("content-type", "application/json");
+        res.end('{"model":"test-model","output_text":"verified","usage":{"input_tokens":10,"output_tokens":2}}');
+      }, 150);
+      res.once("close", () => clearTimeout(timer));
+    });
+    const previous = process.env.PUPPENCLAW_BULK_RESPONSE_TIMEOUT_MS;
+    process.env.PUPPENCLAW_BULK_RESPONSE_TIMEOUT_MS = "60";
+    let configured: Awaited<ReturnType<typeof setup>>;
+    try { configured = await setup(url); }
+    finally {
+      if (previous === undefined) delete process.env.PUPPENCLAW_BULK_RESPONSE_TIMEOUT_MS;
+      else process.env.PUPPENCLAW_BULK_RESPONSE_TIMEOUT_MS = previous;
+    }
+    const { runtime, socket } = configured;
+    const submitted = (await unix(socket, "/bulk/submit", { configId: "refs", idempotencyKey: "bounded-response", items: [{ id: "one", input: "Review" }] })).body;
+    const finished = await settled(socket, submitted.jobId);
+    expect(finished.results[0]).toMatchObject({ state: "failed", error: "Bulk provider response exceeded its 60 ms deadline." });
+    expect(runtime.store.jobReceipts(submitted.jobId)[0]).toMatchObject({ state: "failed", errorCode: "BULK_RESPONSE_TIMEOUT" });
+    const native = await unix(socket, "/native/v1/responses", { model: "test-model", input: "Review", stream: false });
+    expect(native.status).toBe(200);
+    expect(native.body.output_text).toBe("verified");
+  });
+
+  it("starts each bulk deadline after waiting for shared provider capacity", async () => {
+    let calls = 0;
+    const { url } = await upstream((_req, res) => {
+      if (++calls === 1) return;
+      res.setHeader("content-type", "application/json");
+      res.end('{"model":"test-model","output_text":"verified","usage":{"input_tokens":10,"output_tokens":2}}');
+    });
+    const previous = process.env.PUPPENCLAW_BULK_RESPONSE_TIMEOUT_MS;
+    process.env.PUPPENCLAW_BULK_RESPONSE_TIMEOUT_MS = "100";
+    let configured: Awaited<ReturnType<typeof setup>>;
+    try { configured = await setup(url, "execute", { defaultLimit: 1 }); }
+    finally {
+      if (previous === undefined) delete process.env.PUPPENCLAW_BULK_RESPONSE_TIMEOUT_MS;
+      else process.env.PUPPENCLAW_BULK_RESPONSE_TIMEOUT_MS = previous;
+    }
+    const submitted = (await unix(configured.socket, "/bulk/submit", {
+      configId: "refs", idempotencyKey: "queue-time-excluded", concurrency: 2,
+      items: [{ id: "slow", input: "Review" }, { id: "queued", input: "Review" }]
+    })).body;
+    const finished = await settled(configured.socket, submitted.jobId);
+    expect(finished.results.map((result: { id: string; state: string }) => [result.id, result.state]))
+      .toEqual([["slow", "failed"], ["queued", "completed"]]);
+    expect(calls).toBe(2);
+  });
+
   it("keeps settled jobs pending after summary polls until their final result page is delivered", async () => {
     const { url } = await upstream((_req, res) => { res.setHeader("content-type", "application/json"); res.end('{"model":"test-model","output_text":"verified","usage":{"input_tokens":10,"output_tokens":2}}'); });
     const { runtime, socket } = await setup(url);

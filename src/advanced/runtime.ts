@@ -11,6 +11,7 @@ import { redactSensitiveText } from "../shared/utils.js";
 import type { AdvancedOrchestration, ModelProviderConfig, SessionInfo, StartParams, SendParams, ToolResult } from "../shared/types.js";
 import { AdvancedStore, pageOptions } from "./store.js";
 import { BulkConcurrencyLimiter, type BulkConcurrencyOptions } from "./concurrency.js";
+import { BulkResponseTransport, type BulkRequestScope } from "./bulk-transport.js";
 import { EgressPolicy, proxyConnect, proxyHttp } from "./egress.js";
 import { noUsage, UsageParser } from "./usage.js";
 import { responseOutputText } from "./responses-output.js";
@@ -75,6 +76,7 @@ export class AdvancedRuntime {
   private readonly policy = new EgressPolicy();
   private readonly socketRoot: string;
   private readonly bulkConcurrency: BulkConcurrencyLimiter;
+  private readonly bulkTransport = new BulkResponseTransport();
   private constructor(readonly store: AdvancedStore, root: string, concurrency?: BulkConcurrencyOptions) { this.bulkConcurrency = new BulkConcurrencyLimiter(concurrency); this.socketRoot = join("/tmp", `ocsl-model-broker-${process.getuid?.() ?? "user"}-${hash(root).slice(0, 12)}`); }
   static async open(root: string, concurrency?: BulkConcurrencyOptions): Promise<AdvancedRuntime> { const runtime = new AdvancedRuntime(await AdvancedStore.open(root), root, concurrency); await mkdir(runtime.socketRoot, { recursive: true, mode: 0o700 }); await chmod(runtime.socketRoot, 0o700); return runtime; }
   attach(driver: RuntimeDriver): void { this.driver = driver; }
@@ -160,7 +162,7 @@ export class AdvancedRuntime {
     const json = (value: unknown) => { res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" }); res.end(JSON.stringify(value)); };
     if (/^http:\/\//u.test(req.url ?? "")) { await proxyHttp(this.policy, req, res); return; }
     if (path.startsWith("/native/")) { await this.native(p, req, res); return; }
-    if (req.method === "GET" && ["/configs", "/configs/list"].includes(path)) { json({ version: 1, revision: p.config.revision, authorization: { publicLiteratureAllowed: !p.jobId && p.permissionMode === "approve-all" && p.interactionMode === "execute", attemptId: p.attemptId, workspace: p.directory }, workers: p.config.workers.map((w) => ({ id: w.id, assignment: w.assignment, providerId: w.modelProvider.id, model: w.modelProvider.model, modelProvider: { id: w.modelProvider.id, model: w.modelProvider.model, kind: w.modelProvider.kind, label: w.modelProvider.label, reasoningProfile: w.modelProvider.reasoningProfile }, agent: w.agent, effort: w.effort, ...(w.evidencePolicy ? { evidencePolicy: w.evidencePolicy } : {}), bulkConcurrencyLimit: this.bulkConcurrency.limit(w.modelProvider.id), bulkAvailable: w.modelProvider.kind === "codex-openai-compatible" })) }); return; }
+    if (req.method === "GET" && ["/configs", "/configs/list"].includes(path)) { json({ version: 1, revision: p.config.revision, capacity: { scope: "provider", providers: [...new Set(p.config.workers.map((w) => w.modelProvider.id))].map((providerId) => ({ providerId, ...this.bulkConcurrency.snapshot(providerId) })) }, authorization: { publicLiteratureAllowed: !p.jobId && p.permissionMode === "approve-all" && p.interactionMode === "execute", attemptId: p.attemptId, workspace: p.directory }, workers: p.config.workers.map((w) => ({ id: w.id, assignment: w.assignment, providerId: w.modelProvider.id, model: w.modelProvider.model, modelProvider: { id: w.modelProvider.id, model: w.modelProvider.model, kind: w.modelProvider.kind, label: w.modelProvider.label, reasoningProfile: w.modelProvider.reasoningProfile }, agent: w.agent, effort: w.effort, ...(w.evidencePolicy ? { evidencePolicy: w.evidencePolicy } : {}), bulkConcurrencyLimit: this.bulkConcurrency.limit(w.modelProvider.id), bulkAvailable: w.modelProvider.kind === "codex-openai-compatible" })) }); return; }
     if (req.method === "GET" && path === "/jobs") {
       if (summary) json(this.jobSummaries(p.parentSessionName, queryPage(url)));
       else { const jobs = this.store.jobs(p.parentSessionName); json({ jobs: jobs.map(publicJob) }); this.observeJobs(p, jobs); } return;
@@ -360,17 +362,22 @@ export class AdvancedRuntime {
     const onClose = () => { if (!downstream?.writableFinished) abort.abort(); }; downstream?.once("close", onClose);
     const parser = new UsageParser(anthropic); let payload: unknown = null;
     let releaseCapacity: (() => void) | undefined;
+    let bulkRequest: BulkRequestScope | undefined;
     try {
     if (itemId !== undefined) {
       releaseCapacity = await this.bulkConcurrency.acquire(p.provider.id, abort.signal);
       abort.signal.throwIfAborted(); this.requireParticipant(p.sessionName);
       const pause = this.pausedProviders.get(providerPauseKey(p, p.provider.id));
       if (pause) throw new PuppenclawError("PROVIDER_PAUSED", pause);
+      bulkRequest = this.bulkTransport.start(abort.signal);
     }
     if (p.provider.kind === "codex-openai-compatible") { const key = p.provider.authTokenEnv && process.env[p.provider.authTokenEnv]; if (!key) throw new Error("Provider API credential is unavailable."); headers.authorization = `Bearer ${key}`; delete headers["x-api-key"]; }
     receipt.authTransport = headers.authorization ? "authorization" : headers["x-api-key"] ? "api-key" : "missing";
     headers["content-type"] = "application/json";
-      const response = await fetch(upstreamUrl(p.provider, path), { method: "POST", headers, body: bytes, signal: abort.signal, redirect: "manual" });
+      const init = { method: "POST", headers, body: bytes, redirect: "manual" as const };
+      const response = bulkRequest
+        ? await bulkRequest.fetch(upstreamUrl(p.provider, path), init)
+        : await fetch(upstreamUrl(p.provider, path), { ...init, signal: abort.signal });
       receipt.httpStatus = response.status;
       if (downstream) { const outgoing: Record<string, string> = {}; response.headers.forEach((value, key) => { if (!["connection", "transfer-encoding", "content-length", "content-encoding"].includes(key)) outgoing[key] = value; }); downstream.writeHead(response.status, outgoing); }
       const streaming = response.headers.get("content-type")?.includes("text/event-stream"), chunks: Buffer[] = []; let length = 0; const decoder = new TextDecoder();
@@ -391,9 +398,10 @@ export class AdvancedRuntime {
       return { payload, receipt };
     } catch (error) {
       if (receipt.state === "completed") { parser.finish(true); receipt.usage = parser.usage; if (!counting) this.publish(receipt); downstream?.end(); return { payload, receipt }; }
-      parser.finish(false); receipt.usage = parser.usage; receipt.state = parser.protocolErrorCode ? "failed" : abort.signal.aborted ? "cancelled" : "failed"; receipt.errorCode ??= parser.protocolErrorCode ?? (abort.signal.aborted ? "request_cancelled" : safeErrorCode(object(error)?.code) ?? safeErrorCode(object(object(error)?.cause)?.code) ?? "transport_error"); if (!counting) this.publish(receipt); throw error;
+      const failure = bulkRequest?.timeoutError ?? error;
+      parser.finish(false); receipt.usage = parser.usage; receipt.state = parser.protocolErrorCode ? "failed" : abort.signal.aborted ? "cancelled" : "failed"; receipt.errorCode ??= parser.protocolErrorCode ?? (abort.signal.aborted ? "request_cancelled" : safeErrorCode(object(failure)?.code) ?? safeErrorCode(object(object(failure)?.cause)?.code) ?? "transport_error"); if (!counting) this.publish(receipt); throw failure;
     }
-    finally { releaseCapacity?.(); downstream?.removeListener("close", onClose); this.requests.delete(requestId); complete(); }
+    finally { bulkRequest?.close(); releaseCapacity?.(); downstream?.removeListener("close", onClose); this.requests.delete(requestId); complete(); }
   }
   /** Permanent session erasure also removes confidential inputs, outputs and transport receipts. */
   async purge(name: string): Promise<void> {
@@ -407,6 +415,7 @@ export class AdvancedRuntime {
   async close(): Promise<void> {
     await Promise.all([...this.participants.values()].filter((p) => !p.jobId).map((p) => this.closeTurn(p.sessionName)));
     await Promise.all([...this.servers.values()].map(async ({ server, path, sockets }) => { for (const socket of sockets) socket.destroy(); server.closeAllConnections(); await new Promise<void>((resolve) => server.close(() => resolve())); await unlink(path).catch(() => {}); }));
+    await this.bulkTransport.close();
     this.store.close();
   }
 }
