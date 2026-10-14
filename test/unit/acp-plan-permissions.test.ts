@@ -38,6 +38,22 @@ function response(id: number | string = 0, optionId = "plan") {
   return { jsonrpc: "2.0", id, result: { outcome: { outcome: "selected", optionId } } };
 }
 
+function offeredPlan(id = 0) {
+  const request = permission(id);
+  Object.assign(request.params.toolCall, { content: [{ type: "content", content: { type: "text", text: "# Offered plan" } }] });
+  return request;
+}
+
+function discovery(id = 1) {
+  const request = permission(id);
+  request.params.toolCall.kind = "other";
+  request.params.options = [
+    { optionId: "allow", kind: "allow_once", name: "Allow" },
+    { optionId: "reject", kind: "reject_once", name: "Reject" }
+  ];
+  return request;
+}
+
 function observe(messages: unknown[]) {
   const tracker = new AcpPlanPermissionTracker();
   for (const message of messages) tracker.observeLine(JSON.stringify(message));
@@ -49,6 +65,52 @@ function completed(prefix: unknown[] = [permission(), response()]) {
 }
 
 describe("AcpPlanPermissionTracker", () => {
+  it.each([0, 5])("retains earlier tool denials and offers the completed plan (exit %s)", (exitCode) => {
+    const tracker = completed([
+      discovery(1), response(1, "reject"), discovery(2), response(2, "reject"), offeredPlan(), response()
+    ]);
+    expect(tracker.completedPlanHandoff({ ...context, exitCode })).toEqual({ text: "# Offered plan", deniedToolRequests: 2 });
+    expect(tracker.allowsCompletedPlan({ ...context, exitCode })).toBe(exitCode === 5);
+  });
+
+  it("accepts earlier approved tools only for a normal process exit", () => {
+    const tracker = completed([discovery(1), response(1, "allow"), offeredPlan(), response()]);
+    expect(tracker.completedPlanHandoff({ ...context, exitCode: 0 })).toEqual({ text: "# Offered plan" });
+    expect(tracker.completedPlanHandoff(context)).toBeUndefined();
+    expect(tracker.allowsCompletedPlan(context)).toBe(false);
+  });
+
+  it("correlates interleaved tool replies without replacing the final plan", () => {
+    const tracker = completed([discovery(1), offeredPlan(), response(), response(1, "reject")]);
+    expect(tracker.completedPlanHandoff(context)).toEqual({ text: "# Offered plan", deniedToolRequests: 1 });
+  });
+
+  it("never substitutes an earlier plan when a later offer has no content", () => {
+    const tracker = completed([
+      discovery(2), response(2, "reject"), offeredPlan(0), permission(1), response(1), response(0)
+    ]);
+    expect(tracker.completedPlanHandoff(context)).toBeUndefined();
+  });
+
+  it("requires actual plan content and a final plan permission after ordinary tools", () => {
+    for (const exchanges of [
+      [discovery(1), response(1, "reject"), permission(), response()],
+      [offeredPlan(), response(), discovery(1), response(1, "reject")]
+    ]) expect(completed(exchanges).completedPlanHandoff(context)).toBeUndefined();
+  });
+
+  it("does not hide malformed, cancelled, missing, or orphaned ordinary permission decisions", () => {
+    const malformed = discovery(1);
+    malformed.params.options[1]!.kind = "unknown";
+    for (const exchanges of [
+      [discovery(1)], [response(1, "reject")],
+      [discovery(1), response(1, "unknown")],
+      [discovery(1), response(1, "reject"), response(1, "reject")],
+      [discovery(1), { jsonrpc: "2.0", id: 1, result: { outcome: { outcome: "cancelled" } } }],
+      [malformed, response(1, "reject")]
+    ]) expect(completed([...exchanges, offeredPlan(), response()]).completedPlanHandoff(context)).toBeUndefined();
+  });
+
   it.each([0, 5])("captures only the correlated offered plan on a completed read-only handoff (exit %s)", (exitCode) => {
     const request = permission();
     Object.assign(request.params.toolCall, { content: [{ type: "content", content: { type: "text", text: "# Actual offered plan" } }] });

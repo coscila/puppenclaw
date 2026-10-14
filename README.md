@@ -861,11 +861,14 @@ and partial work are not automatically resubmitted.
 
 Claude planning turns have one narrow exception to ACPX's nonzero-exit handling:
 exit 5 can mean the read-only boundary selected "No, keep planning" when the
-agent requested to leave plan mode. A fresh answer and a correlated `end_turn`,
-with every permission exchange proving that choice, complete the turn and expose
-the plan for user approval. Other denied permissions, missing evidence, errors,
-signals, and `deny-all` remain failures. The actual exit code stays in diagnostics;
-the exception neither approves the plan nor resubmits the prompt.
+agent requested to leave plan mode. A fresh answer, a correlated `end_turn`, and
+a final permission exchange holding the plan expose it for user approval.
+Earlier tool denials are accounted for and reported separately; when other tools
+requested permission, the actual offered plan is required. Every permission must
+have a matched decision, and exit 5 requires that none were approved. Missing
+evidence, errors, signals, later tool requests, and `deny-all` remain failures.
+The actual exit code stays in diagnostics; the exception neither approves the
+plan nor retries a denied tool or resubmits the prompt.
 
 On Linux, one-shot diagnostic summaries are stored in the controller's
 `<data-dir>/diagnostics/` directory, using hashed session/turn identifiers and

@@ -37,6 +37,46 @@ async function fixture(options: Record<string, unknown>, baseline = oldRecord) {
 }
 
 describe("turn-specific ACPX reconnect handling", () => {
+  it.each([0, 5])("offers a plan despite earlier discovery denials without rerunning tools or the prompt (exit %s)", async (exitCode) => {
+    const env = await fixture({ kind: "plan-permission", discoveryPermissions: true, recoveryHandoff: true, exitCode });
+    try {
+      const initial = await env.run({ interactionMode: "plan", permissionMode: "approve-reads", turnKey: "planning:discovery-denials" });
+      const replay = await env.run({ interactionMode: "plan", permissionMode: "approve-reads", turnKey: "planning:discovery-denials" });
+      for (const result of [initial, replay]) {
+        expect(result.details).toMatchObject({ output: "# Recovery plan\n\nInspect preserved outputs, then resume after approval.",
+          turnSignals: { nativeMode: "plan", plan: { source: "claude-tool" } }, session: { state: "idle" } });
+      }
+      expect(env.store.getSession("reconnect-test")?.warnings).toContain(
+        "2 earlier tool permission request(s) were denied during planning. Those denials remain in the diagnostics; execution is still disabled."
+      );
+      expect(replay.details).toMatchObject({ turnReceipt: { state: "replayed" } });
+      expect(env.completed).toHaveBeenCalledTimes(1);
+      expect(await env.attempts()).toBe(1);
+    } finally { await env.store.close(); }
+  });
+
+  it("does not excuse permission-denied exit after an approved ordinary tool", async () => {
+    const env = await fixture({ kind: "plan-permission", discoveryPermissions: true, discoveryDecision: "allow", recoveryHandoff: true, exitCode: 5 });
+    try {
+      expect((await env.run({ interactionMode: "plan", permissionMode: "approve-reads" })).details).toMatchObject({ session: { state: "failed" } });
+      expect(env.completed).not.toHaveBeenCalled();
+      expect(await env.attempts()).toBe(1);
+    } finally { await env.store.close(); }
+  });
+
+  it("offers the completed plan after discovery reads were approved", async () => {
+    const env = await fixture({ kind: "plan-permission", discoveryPermissions: true, discoveryDecision: "allow", recoveryHandoff: true, exitCode: 0 });
+    try {
+      expect((await env.run({ interactionMode: "plan", permissionMode: "approve-reads" })).details).toMatchObject({
+        output: "# Recovery plan\n\nInspect preserved outputs, then resume after approval.",
+        turnSignals: { nativeMode: "plan", plan: { source: "claude-tool" } }, session: { state: "idle" }
+      });
+      expect(env.store.getSession("reconnect-test")?.warnings.some((warning) => warning.includes("earlier tool permission"))).toBe(false);
+      expect(env.completed).toHaveBeenCalledTimes(1);
+      expect(await env.attempts()).toBe(1);
+    } finally { await env.store.close(); }
+  });
+
   it.each([false, true])("classifies refresh contention without replaying a dispatched prompt (activity: %s)", async (activity) => {
     const env = await fixture({ kind: "auth-refresh-busy", activity });
     try {

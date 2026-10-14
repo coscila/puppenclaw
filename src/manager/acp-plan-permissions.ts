@@ -1,4 +1,10 @@
 type JsonRecord = Record<string, unknown>;
+type PermissionKind = "allow_once" | "allow_always" | "reject_once" | "reject_always";
+type PermissionRequest = {
+  plan: boolean;
+  options: Map<string, PermissionKind>;
+  decision?: "allowed" | "denied";
+};
 
 const MAX_ID_CHARS = 1_024;
 const MAX_PERMISSION_REQUESTS = 128;
@@ -31,7 +37,9 @@ function identifier(value: unknown): string | undefined {
  * ACPX 0.12.1 forwards both directions of the ACP wire, then exits 5 when
  * all requested permissions were denied, even after a successful end_turn.
  * Claude represents "No, keep planning" as switch_mode / plan / reject_once.
- * Only that complete, correlated exchange qualifies for this exception.
+ * A completed plan may follow ordinary tool denials during reconnaissance.
+ * Account for every decision, and require the last permission to hold a plan.
+ * Exit 5 is excused only when all observed permissions were denied.
  * Only bounded plan text from the correlated permission request is retained,
  * privately, to publish the offered plan instead of an automated rejection.
  */
@@ -41,13 +49,23 @@ export class AcpPlanPermissionTracker {
   private sessionId: string | undefined;
   private completed = false;
   private sawAssistantOutput = false;
-  private requests = new Map<string, boolean>();
+  private requests = new Map<string, PermissionRequest>();
   #requestPlans = new Map<string, string>();
   #offeredPlan: string | undefined;
 
   get deniedPlanRequests(): number {
     let count = 0;
-    for (const answered of this.requests.values()) if (answered) count += 1;
+    for (const request of this.requests.values()) {
+      if (request.plan && request.decision === "denied") count += 1;
+    }
+    return count;
+  }
+
+  get deniedToolRequests(): number {
+    let count = 0;
+    for (const request of this.requests.values()) {
+      if (!request.plan && request.decision === "denied") count += 1;
+    }
     return count;
   }
 
@@ -105,15 +123,18 @@ export class AcpPlanPermissionTracker {
     }
 
     if (method === "session/request_permission") {
+      const options = permissionOptions(params);
+      const plan = isKeepPlanningRequest(params);
       if (message.jsonrpc !== "2.0" || this.promptId === undefined || this.completed ||
           id === undefined || id === this.promptId || this.requests.has(id) ||
           identifier(params?.sessionId) !== this.sessionId ||
-          this.requests.size >= MAX_PERMISSION_REQUESTS || !isKeepPlanningRequest(params)) {
+          this.requests.size >= MAX_PERMISSION_REQUESTS || options === undefined ||
+          (!plan && !isOrdinaryToolRequest(params))) {
         this.invalid = true;
         return;
       }
-      this.requests.set(id, false);
-      const text = permissionPlanText(params);
+      this.requests.set(id, { plan, options });
+      const text = plan ? permissionPlanText(params) : undefined;
       if (text !== undefined) this.#requestPlans.set(id, text);
       return;
     }
@@ -141,14 +162,20 @@ export class AcpPlanPermissionTracker {
     if (result === undefined) return;
     if (Object.hasOwn(result, "outcome")) {
       const outcome = record(result.outcome);
+      const request = id === undefined ? undefined : this.requests.get(id);
+      const option = typeof outcome?.optionId === "string" ? request?.options.get(outcome.optionId) : undefined;
       if (message.jsonrpc !== "2.0" || id === undefined || this.completed ||
-          !this.requests.has(id) || this.requests.get(id) !== false ||
-          outcome?.outcome !== "selected" || outcome.optionId !== "plan") {
+          request === undefined || request.decision !== undefined ||
+          outcome?.outcome !== "selected" || option === undefined ||
+          (request.plan && outcome.optionId !== "plan")) {
         this.invalid = true;
         return;
       }
-      this.requests.set(id, true);
-      this.#offeredPlan = this.#requestPlans.get(id);
+      request.decision = option === "allow_once" || option === "allow_always" ? "allowed" : "denied";
+      // Use request order, not reply order, to identify the final offered plan.
+      if (request.plan && id === [...this.requests.keys()].at(-1)) {
+        this.#offeredPlan = this.#requestPlans.get(id);
+      }
       return;
     }
     if (id !== undefined && this.requests.has(id)) {
@@ -158,7 +185,7 @@ export class AcpPlanPermissionTracker {
     if (Object.hasOwn(result, "stopReason") || (id !== undefined && id === this.promptId)) {
       if (message.jsonrpc !== "2.0" || this.promptId === undefined || id !== this.promptId ||
           this.completed || result.stopReason !== "end_turn" ||
-          this.requests.size === 0 || this.deniedPlanRequests !== this.requests.size) {
+          this.deniedPlanRequests === 0 || [...this.requests.values()].some((request) => !request.decision)) {
         this.invalid = true;
         return;
       }
@@ -167,20 +194,55 @@ export class AcpPlanPermissionTracker {
   }
 
   allowsCompletedPlan(params: PlanCompletionContext): boolean {
+    return this.isCompletedPlan(params) && params.exitCode === 5 &&
+      [...this.requests.values()].every((request) => request.decision === "denied");
+  }
+
+  private isCompletedPlan(params: PlanCompletionContext): boolean {
+    const requests = [...this.requests.values()];
     return !this.invalid && this.completed && this.sawAssistantOutput &&
-      this.requests.size > 0 && this.deniedPlanRequests === this.requests.size &&
-      params.exitCode === 5 && params.signal === null && params.interactionMode === "plan" &&
+      requests.at(-1)?.plan === true && this.deniedPlanRequests > 0 &&
+      // With other permissions in the turn, require the actual offered plan;
+      // final prose alone cannot establish a successful approval handoff.
+      (requests.every((request) => request.plan) || this.#offeredPlan !== undefined) &&
+      params.signal === null && params.interactionMode === "plan" &&
       params.permissionMode === "approve-reads" && params.hasFreshOutput && !params.hasError;
   }
 
-  completedPlanHandoff(params: PlanCompletionContext): { text?: string } | undefined {
+  completedPlanHandoff(params: PlanCompletionContext): { text?: string; deniedToolRequests?: number } | undefined {
     // ACPX exits normally when other tools ran successfully before this
     // automatic mode-switch rejection. That is the same approval handoff,
     // but must not relax the separate nonzero-exit exception above.
-    if ((params.exitCode !== 0 && params.exitCode !== 5) ||
-        !this.allowsCompletedPlan({ ...params, exitCode: 5 })) return undefined;
-    return this.#offeredPlan === undefined ? {} : { text: this.#offeredPlan };
+    if (!this.isCompletedPlan(params) ||
+        (params.exitCode !== 0 && !this.allowsCompletedPlan(params))) return undefined;
+    return {
+      ...(this.#offeredPlan === undefined ? {} : { text: this.#offeredPlan }),
+      ...(this.deniedToolRequests > 0 ? { deniedToolRequests: this.deniedToolRequests } : {})
+    };
   }
+}
+
+function permissionOptions(params: JsonRecord | undefined): Map<string, PermissionKind> | undefined {
+  const options = params?.options;
+  if (!Array.isArray(options) || options.length === 0 || options.length > MAX_PERMISSION_OPTIONS) return undefined;
+  const result = new Map<string, PermissionKind>();
+  for (const raw of options) {
+    const option = record(raw);
+    if (!option || typeof option.optionId !== "string" || identifier(option.optionId) === undefined ||
+        result.has(option.optionId) ||
+        (option.kind !== "allow_once" && option.kind !== "allow_always" &&
+         option.kind !== "reject_once" && option.kind !== "reject_always")) return undefined;
+    result.set(option.optionId, option.kind);
+  }
+  return result;
+}
+
+function isOrdinaryToolRequest(params: JsonRecord | undefined): boolean {
+  const tool = record(params?.toolCall);
+  return tool !== undefined && identifier(tool.toolCallId) !== undefined &&
+    typeof tool.kind === "string" &&
+    ["read", "edit", "delete", "move", "search", "execute", "think", "fetch", "other"].includes(tool.kind) &&
+    record(record(tool._meta)?.claudeCode)?.toolName !== "ExitPlanMode";
 }
 
 function permissionPlanText(params: JsonRecord | undefined): string | undefined {

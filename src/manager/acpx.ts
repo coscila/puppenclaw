@@ -5078,7 +5078,8 @@ export class AcpxSessionManager implements ISessionManager {
     }
     // ACPX reports PERMISSION_DENIED (5) even when Claude completed a plan
     // after the read-only boundary selected "No, keep planning". Accept only
-    // a complete, current-invocation exchange containing those denials alone.
+    // a complete current invocation whose final permission holds a plan and
+    // whose other permissions were also denied. No denied tool is replayed.
     const planCompletionContext = {
       exitCode,
       signal: exitSignal,
@@ -5186,6 +5187,9 @@ export class AcpxSessionManager implements ISessionManager {
       durationMs: turnDurationMs
     });
     if (planHandoff != null && completedSignals?.inputRequest == null) {
+      if (planHandoff.deniedToolRequests != null) {
+        result.warnings.push(`${planHandoff.deniedToolRequests} earlier tool permission request(s) were denied during planning. Those denials remain in the diagnostics; execution is still disabled.`);
+      }
       result.warnings.push("Plan completed. The read-only planning boundary kept execution disabled; the plan is awaiting user approval.");
       this.deps.logger.info(`ACPX session ${params.session.name} completed a plan after ${planPermissions.deniedPlanRequests} keep-planning permission response(s); exit code ${exitCode} retained in process diagnostics.`);
     }

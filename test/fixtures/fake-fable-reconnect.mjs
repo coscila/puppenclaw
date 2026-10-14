@@ -35,6 +35,17 @@ if (args.includes("prompt")) {
       emit({ jsonrpc: "2.0", id: 7, method: "session/prompt", params: { sessionId, prompt: [{ type: "text", text: prompt }] } });
       const tool = (id, name, status, extra = {}) => update({ sessionUpdate: status === "pending" ? "tool_call" : "tool_call_update",
         toolCallId: id, _meta: { claudeCode: { toolName: name } }, status, ...extra });
+      if (options.discoveryPermissions) {
+        for (const [index, name] of ["describe_skill", "resolve_skill_runtime"].entries()) {
+          const id = 100 + index;
+          emit({ jsonrpc: "2.0", id, method: "session/request_permission", params: {
+            sessionId, toolCall: { toolCallId: `discovery-${id}`, kind: "other", title: `mcp__ocsl_review_catalog__${name}` },
+            options: [{ optionId: "allow", kind: "allow_once", name: "Allow" },
+              { optionId: "reject", kind: "reject_once", name: "Reject" }]
+          } });
+          emit({ jsonrpc: "2.0", id, result: { outcome: { outcome: "selected", optionId: options.discoveryDecision ?? "reject" } } });
+        }
+      }
       if (options.recoveryHandoff) {
         tool("old-mode", "ExitPlanMode", "pending");
         tool("old-mode", "ExitPlanMode", "failed", { content: [{ type: "content", content: { type: "text", text: "You are not in plan mode." } }] });
