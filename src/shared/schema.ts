@@ -109,6 +109,7 @@ export const advancedOrchestrationZod = z.object({
   workers: z.array(z.object({
     id: skillNameString.max(128),
     assignment: nonEmptyString.max(50_000),
+    evidencePolicy: z.literal("public-literature").optional(),
     agent: agentKindZod,
     effort: effortLevelZod.optional(),
     modelProvider: modelProviderConfigZod,

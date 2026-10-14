@@ -192,7 +192,7 @@ export async function createDaemonServer(params: {
         purge: async (name) => { await manager.purge({ name }); },
         getSession: (name) => store.getSession(name), getOwner: (name) => store.getSessionOwner(name) ?? undefined,
         contribution: (receipt) => {
-          statistics!.observeBrokerUsage(receipt.parentSessionName, advanced!.store.receipts(receipt.parentSessionName, receipt.attemptId));
+          statistics!.observeBrokerReceipt(receipt.parentSessionName, receipt);
           if (receipt.state === "running" || receipt.usage.input === null || receipt.usage.output === null) return;
           const session = store.getSession(receipt.sessionName) ?? store.getSession(receipt.parentSessionName);
           if (!session) return;
@@ -263,7 +263,7 @@ export async function createDaemonServer(params: {
   app.get("/capabilities", async () => ({
     ok: true,
     version: 1,
-    advancedOrchestration: { version: 1, durableJobs: true, recordedTransport: true, namespaceRequired: true, workerJoinContinuation: true },
+    advancedOrchestration: { version: 1, durableJobs: true, recordedTransport: true, namespaceRequired: true, workerJoinContinuation: true, incrementalResults: true, aggregateBulkConcurrency: true },
     sessionStart: true,
     sessionStartStream: true,
     sessionSend: true,
@@ -525,14 +525,23 @@ export async function createDaemonServer(params: {
     ok(jsonToolResult(await resourceMonitor.snapshot(), "Resource usage"))
   );
 
-  app.get("/orchestration/jobs", async (request) => {
-    const query = request.query as { session?: string; "metadata-only"?: string };
-    const jobs = advanced.jobs(query.session);
-    return { jobs: query["metadata-only"] === "true"
-      ? jobs.map(({ jobId, resumedFromJobId, parentSessionName, attemptId, kind, state, createdAt, updatedAt }) => ({
-        jobId, resumedFromJobId, parentSessionName, attemptId, kind, state, createdAt, updatedAt
-      }))
-      : jobs };
+  app.get("/orchestration/jobs", async (request, reply) => {
+    const query = request.query as { session?: string; "metadata-only"?: string; view?: string; after?: string; limit?: string };
+    if (query.view === "summary") {
+      try { return advanced.jobSummaries(query.session, { after: Number(query.after ?? 0), limit: Number(query.limit ?? 100) }); }
+      catch (error) { if (!(error instanceof RangeError)) throw error; return reply.code(400).send({ code: "INVALID_WORKER_CURSOR", error: error.message }); }
+    }
+    if (query["metadata-only"] === "true") return { jobs: advanced.store.jobHeaders(query.session).map(({ jobId, resumedFromJobId, parentSessionName, attemptId, kind, state, createdAt, updatedAt }) => ({
+      jobId, resumedFromJobId, parentSessionName, attemptId, kind, state, createdAt, updatedAt
+    })) };
+    return { jobs: advanced.jobs(query.session) };
+  });
+  app.get("/orchestration/jobs/:jobId/results", async (request, reply) => {
+    const { jobId } = request.params as { jobId: string };
+    const query = request.query as { session?: string; after?: string; limit?: string };
+    if (!query.session) throw new PuppenclawError("WORKER_NOT_FOUND", "A parent session is required.");
+    try { return advanced.jobResults(query.session, jobId, { after: Number(query.after ?? 0), limit: Number(query.limit ?? 100) }); }
+    catch (error) { if (!(error instanceof RangeError)) throw error; return reply.code(400).send({ code: "INVALID_WORKER_CURSOR", error: error.message }); }
   });
   app.get("/orchestration/receipts", async (request) => { const query = request.query as { session?: string; attempt?: string }; return { receipts: advanced.store.receipts(query.session, query.attempt) }; });
 

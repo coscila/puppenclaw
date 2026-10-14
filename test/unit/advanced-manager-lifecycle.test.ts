@@ -24,7 +24,7 @@ async function setup() {
   const advanced = await AdvancedRuntime.open(join(root, "advanced"));
   const command = fileURLToPath(new URL("../fixtures/fake-orchestrated-acpx.mjs", import.meta.url));
   const manager = new AcpxSessionManager({ config: makeConfig({ acpxCommand: `node ${command}` }), logger: { info() {}, warn() {}, error() {}, debug() {} }, store, outputRouter, advanced, statistics });
-  advanced.attach({ start: (params) => manager.start(params), quiesce: async (name) => { await manager.quiesce({ name }); }, getSession: (name) => store.getSession(name), contribution: (receipt) => statistics.observeBrokerUsage(receipt.parentSessionName, advanced.store.receipts(receipt.parentSessionName, receipt.attemptId)) });
+  advanced.attach({ start: (params) => manager.start(params), quiesce: async (name) => { await manager.quiesce({ name }); }, getSession: (name) => store.getSession(name), contribution: (receipt) => statistics.observeBrokerReceipt(receipt.parentSessionName, receipt) });
   cleanups.push(async () => { await advanced.close(); await statistics.close(); await store.close(); });
   const events: OutputRouteEvent[] = [];
   outputRouter.attach("parent", (event) => { events.push(event); });

@@ -403,6 +403,37 @@ Stop it:
 node dist/daemon/cli.js stop --host 127.0.0.1 --port 18795
 ```
 
+Advanced worker jobs store each input and result in its own SQLite row. Existing
+job records migrate transactionally at startup; completed items and idempotency
+keys survive the migration. Back up the daemon state before updating it.
+
+For large runs, use `GET /orchestration/jobs?session=NAME&view=summary&after=0&limit=100`
+and `GET /orchestration/jobs/JOB/results?session=NAME&after=0&limit=100`. The scoped
+worker socket exposes the same routes without the `/orchestration` prefix or
+`session` parameter. A single job also supports `GET /jobs/JOB?view=summary`;
+submission routes accept `?view=summary`. Legacy routes retain full responses.
+Summary pages omit prompts and results; result pages contain the latest state of
+each changed item. Both return a durable numeric `nextCursor` and `hasMore`.
+Limits are 1–1000. Consumers upsert by job/item id, retain the returned cursor, and
+continue until `hasMore` is false. An item updated between pages can appear again;
+these pages are a changed-state feed, not an event log. Export settled jobs for a
+stable complete result set. Summary polling does not acknowledge results or
+suppress the managed continuation. Reading the final results page acknowledges
+a settled job; legacy full-result reads retain that behavior. Health metadata
+reads never hydrate item contents.
+
+Bulk dispatch shares a provider-wide concurrency limit across jobs and sessions
+in this daemon. `PUPPENCLAW_BULK_PROVIDER_CONCURRENCY` sets the default (60);
+`PUPPENCLAW_BULK_PROVIDER_LIMITS` accepts per-provider overrides, for example
+`{"remote_qwen38_xhigh":40}`. Values must be integers from 1 to 10000. Configured
+worker listings report the effective `bulkConcurrencyLimit`. This bounds bulk
+inference only; it does not cap native controller requests. Cancellation drains
+queued leases as well as active requests. Chunk submissions below the existing
+64 MiB request limit and keep scientific checkpoints in the workspace database.
+A browser reconnect does not replace the approved worker attempt; explicit stop
+and actual attempt closure still cancel its work. Interrupted jobs need explicit
+resume, which retains completed items.
+
 The authenticated daemon API exposes a fenced lifecycle for callers that must
 stop work or remove a session workspace without allowing a delayed dispatch to
 reopen it:

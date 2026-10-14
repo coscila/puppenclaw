@@ -34,6 +34,16 @@ describe("daemon worker metadata", () => {
       expect(response.body).not.toContain("PRIVATE");
       const full = await app.inject({ method: "GET", url: "/orchestration/jobs?session=chat-a", headers: AUTH });
       expect(full.json().jobs[0].results[0].output).toBe("PRIVATE OUTPUT");
+      const summaries = await app.inject({ method: "GET", url: "/orchestration/jobs?session=chat-a&view=summary&limit=1", headers: AUTH });
+      expect(summaries.json().jobs).toHaveLength(1); expect(summaries.json().jobs[0].results).toBeUndefined();
+      expect(summaries.body).not.toContain("PRIVATE"); expect(summaries.json().jobs[0].progress).toMatchObject({ total: 1, cancelled: 1 });
+      const cursor = summaries.json().nextCursor;
+      const unchanged = await app.inject({ method: "GET", url: `/orchestration/jobs?session=chat-a&view=summary&after=${cursor}`, headers: AUTH });
+      expect(unchanged.json()).toEqual({ jobs: [], nextCursor: cursor, hasMore: false });
+      const results = await app.inject({ method: "GET", url: "/orchestration/jobs/job-a/results?session=chat-a&limit=1", headers: AUTH });
+      expect(results.json().results[0].output).toBe("PRIVATE OUTPUT");
+      expect((await app.inject({ method: "GET", url: "/orchestration/jobs/job-a/results?session=chat-b", headers: AUTH })).statusCode).not.toBe(200);
+      expect((await app.inject({ method: "GET", url: "/orchestration/jobs/job-a/results?session=chat-a" })).statusCode).toBe(401);
       const capabilities = await app.inject({ method: "GET", url: "/capabilities", headers: AUTH });
       expect(capabilities.json().advancedOrchestration.workerJoinContinuation).toBe(true);
     } finally { await app.close(); }

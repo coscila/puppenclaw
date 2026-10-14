@@ -23,8 +23,8 @@ async function upstream(handler: RequestListener): Promise<{ url: string; server
   cleanups.push(async () => { server.closeAllConnections(); await new Promise<void>((done) => server.close(() => done())); });
   return { server, url: `http://127.0.0.1:${address.port}/v1` };
 }
-async function setup(baseUrl: string, mode: "plan" | "execute" = "execute") {
-  const runtime = await AdvancedRuntime.open(await root()); cleanups.push(() => runtime.close()); process.env.TEST_MODEL_KEY = "test-secret";
+async function setup(baseUrl: string, mode: "plan" | "execute" = "execute", concurrency?: { defaultLimit: number }) {
+  const runtime = await AdvancedRuntime.open(await root(), concurrency); cleanups.push(() => runtime.close()); process.env.TEST_MODEL_KEY = "test-secret";
   const params = startParamsZod.parse({ name: "main", agent: "codex", directory: "/tmp", task: "review", interactionMode: mode, permissionMode: mode === "execute" ? "approve-all" : "approve-reads", statisticsContext: { version: 1, chatId: "chat", attemptId: "attempt" }, modelProvider: { id: "local", model: "test-model", kind: "codex-openai-compatible", baseUrl, authTokenEnv: "TEST_MODEL_KEY" }, orchestration: { version: 1, revision: 1, workers: [{ id: "refs", assignment: "Check sources", agent: "codex", modelProvider: { id: "local", model: "test-model", kind: "codex-openai-compatible", baseUrl, authTokenEnv: "TEST_MODEL_KEY" } }] } });
   const session = { ...params, state: "idle", warnings: [], transcript: [], createdAt: new Date().toISOString(), lastActivity: new Date().toISOString() } as SessionInfo;
   runtime.attach({ start: async () => ({ content: [{ type: "text", text: "done" }], details: { output: "done", session: { state: "completed" } } }), quiesce: async () => {}, getSession: () => session, contribution: () => {} });
@@ -54,12 +54,14 @@ describe("advanced usage", () => {
     const incomplete = new UsageParser(false); incomplete.feed('data: {"usage":{"input_tokens":15,"output_tokens":4,"input_tokens_details":{"cached_tokens":5}}}\n\n'); incomplete.finish(true);
     expect(incomplete.usage).toMatchObject({ input: 15, cacheRead: 5, output: 4, total: 19, quality: "partial" });
   });
-  it("replaces receipts before aggregating main, child and bulk models, ignoring repeated SDK totals", async () => {
+  it.each(["snapshot", "incremental"] as const)("replaces %s receipts before aggregating main, child and bulk models, ignoring repeated SDK totals", async (mode) => {
     const store = await TurnStatisticsStore.open(await root()); const recorder = new TurnStatisticsRecorder(store, { listComputeJobs: () => [] }); cleanups.push(() => recorder.close());
     recorder.admit({ version: 1, chatId: "chat", attemptId: "attempt" }, { name: "main", agent: "codex" }, "turn");
     const receipt = (id: string, role: "main" | "subagent", providerId: string, input: number): UsageReceipt => ({ version: 1, requestId: id, parentSessionName: "main", sessionName: role === "main" ? "main" : "worker", attemptId: "attempt", providerId, model: providerId, role, promptSha256: "abc", state: "completed", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), usage: { input, output: 5, cacheRead: 0, cacheWrite: 0, reasoning: 0, total: input + 5, quality: "measured" } });
-    recorder.observeBrokerUsage("main", [receipt("one", "main", "anthropic", 10)]);
-    recorder.observeBrokerUsage("main", [receipt("one", "main", "anthropic", 10), receipt("two", "subagent", "local", 20), receipt("three", "subagent", "langdock", 30)]);
+    const observe = (receipts: UsageReceipt[]) => { if (mode === "snapshot") recorder.observeBrokerUsage("main", receipts); else for (const row of receipts) recorder.observeBrokerReceipt("main", row); };
+    observe([receipt("one", "main", "anthropic", 10)]);
+    observe([receipt("one", "main", "anthropic", 10), receipt("two", "subagent", "local", 20), receipt("three", "subagent", "langdock", 30)]);
+    recorder.observeBrokerReceipt("main", { ...receipt("wrong-attempt", "subagent", "local", 999), attemptId: "another" });
     recorder.observeEvent("main", { type: "turn.completed", usage: { input_tokens: 100000, output_tokens: 50000 } }, "codex"); await recorder.settle("main", "completed");
     expect(store.page().turns[0]!.tokens).toMatchObject({ input: 60, output: 15, total: 75 });
     expect(store.page().turns[0]!.models?.map((m) => m.modelProviderId)).toEqual(["anthropic", "local", "langdock"]);
@@ -67,6 +69,64 @@ describe("advanced usage", () => {
 });
 
 describe("scoped worker broker", () => {
+  it("keeps settled jobs pending after summary polls until their final result page is delivered", async () => {
+    const { url } = await upstream((_req, res) => { res.setHeader("content-type", "application/json"); res.end('{"model":"test-model","output_text":"verified","usage":{"input_tokens":10,"output_tokens":2}}'); });
+    const { runtime, socket } = await setup(url);
+    const job = (await unix(socket, "/bulk/submit?view=summary", { configId: "refs", idempotencyKey: "summary-observation", items: [{ id: "first", input: "Review" }, { id: "second", input: "Review" }] })).body;
+    for (let i = 0; i < 100 && runtime.store.jobHeader(job.jobId)!.state !== "completed"; i++) await new Promise((done) => setTimeout(done, 5));
+    expect(runtime.store.jobHeader(job.jobId)!.state).toBe("completed");
+    await unix(socket, "/jobs?view=summary"); await unix(socket, `/jobs/${job.jobId}?view=summary`);
+    expect(runtime.pendingWorkers("main").map((entry) => entry.jobId)).toEqual([job.jobId]);
+    const first = (await unix(socket, `/jobs/${job.jobId}/results?limit=1`)).body;
+    expect(first.hasMore).toBe(true); expect(runtime.pendingWorkers("main")).toHaveLength(1);
+    const last = (await unix(socket, `/jobs/${job.jobId}/results?after=${first.nextCursor}&limit=1`)).body;
+    expect(last.hasMore).toBe(false); expect(last.results).toHaveLength(1); expect(runtime.pendingWorkers("main")).toEqual([]);
+  });
+  it("caps aggregate bulk calls across jobs and serves compact status and incremental results", async () => {
+    let active = 0, peak = 0, calls = 0, released = false; const pending: (() => void)[] = [];
+    const { url } = await upstream((_req, res) => {
+      calls++; active++; peak = Math.max(peak, active);
+      const finish = () => { active--; res.setHeader("content-type", "application/json"); res.end('{"model":"test-model","output_text":"verified","usage":{"input_tokens":10,"output_tokens":2}}'); };
+      if (released) finish(); else pending.push(finish);
+    });
+    const { runtime, socket } = await setup(url, "execute", { defaultLimit: 2 });
+    const submit = (key: string) => unix(socket, "/bulk/submit?view=summary", { configId: "refs", idempotencyKey: key, concurrency: 3, items: [1, 2, 3].map((i) => ({ id: `${key}-${i}`, input: "Review" })) });
+    const a = (await submit("a")).body, b = (await submit("b")).body;
+    for (let i = 0; i < 100 && calls < 2; i++) await new Promise((done) => setTimeout(done, 5));
+    expect(calls).toBe(2); expect(a.results).toBeUndefined(); expect(a.progress.total).toBe(3);
+    released = true; for (const finish of pending) finish(); await settled(socket, a.jobId); await settled(socket, b.jobId);
+    expect(peak).toBeLessThanOrEqual(2); expect(calls).toBe(6);
+    const summaries = (await unix(socket, "/jobs?view=summary&limit=1")).body; expect(summaries.hasMore).toBe(true); expect(summaries.jobs[0].results).toBeUndefined();
+    const resultPage = (await unix(socket, `/jobs/${a.jobId}/results?limit=2`)).body; expect(resultPage.results).toHaveLength(2); expect(resultPage.hasMore).toBe(true);
+    const last = (await unix(socket, `/jobs/${a.jobId}/results?after=${resultPage.nextCursor}`)).body; expect(last.results).toHaveLength(1); expect(last.results[0].output).toBe("verified");
+    expect((await unix(socket, `/jobs/${a.jobId}?view=summary`)).body.progress).toMatchObject({ total: 3, completed: 3, running: 0 });
+    expect(() => runtime.jobResults("another-chat", a.jobId)).toThrow("not in this chat");
+  });
+  it("cancels queued provider-capacity leases with the parent without dispatching them", async () => {
+    let calls = 0; const { url } = await upstream((_req, res) => { calls++; res.setHeader("content-type", "application/json"); res.write(" "); });
+    const { runtime, socket } = await setup(url, "execute", { defaultLimit: 1 });
+    const submit = (key: string) => unix(socket, "/bulk/submit?view=summary", { configId: "refs", idempotencyKey: key, concurrency: 2, items: [{ id: key, input: "Review" }] });
+    const a = (await submit("held-a")).body, b = (await submit("queued-b")).body;
+    for (let i = 0; i < 100 && calls === 0; i++) await new Promise((done) => setTimeout(done, 5));
+    expect(calls).toBe(1); await runtime.closeTurn("main"); expect(calls).toBe(1);
+    expect(runtime.store.jobHeader(a.jobId)!.state).toBe("cancelled"); expect(runtime.store.jobHeader(b.jobId)!.state).toBe("cancelled");
+    expect(runtime.store.receipts("main").every((receipt) => receipt.state === "cancelled")).toBe(true);
+  });
+  it.each(["execute", "plan"] as const)("publishes bounded public-literature authorization only to an approved %s controller", async (mode) => {
+    const { url } = await upstream((_req, res) => res.end('{}'));
+    const { runtime, socket, params, session } = await setup(url, mode);
+    const config = (await unix(socket, "/configs")).body;
+    expect(config.authorization).toEqual({ publicLiteratureAllowed: mode === "execute", attemptId: "attempt", workspace: "/tmp" });
+    runtime.attach({ start: async (request) => {
+      expect((await unix(runtime.socket(request.name)!, "/configs")).body.authorization.publicLiteratureAllowed).toBe(false);
+      return { content: [{ type: "text", text: "done" }], details: {} };
+    }, quiesce: async () => {}, getSession: () => session, contribution: () => {} });
+    const child = (await unix(socket, "/agent/submit", { configId: "refs", idempotencyKey: "authorization", task: "Read only" })).body; await settled(socket, child.jobId);
+    await runtime.closeTurn("main");
+    const orchestration = { ...params.orchestration!, workers: params.orchestration!.workers.map((worker) => ({ ...worker, evidencePolicy: "public-literature" as const })) };
+    await runtime.begin({ ...session, orchestration }, { ...params, orchestration, statisticsContext: { version: 1, chatId: "chat", attemptId: "readonly" } }, "approve-reads");
+    const readonly = (await unix(socket, "/configs")).body; expect(readonly.authorization.publicLiteratureAllowed).toBe(false); expect(readonly.workers[0].evidencePolicy).toBe("public-literature");
+  });
   it.each(["agent", "bulk"] as const)("joins %s workers without cancelling work or replaying observed results", async (kind) => {
     let entered!: () => void, release!: () => void;
     const started = new Promise<void>((done) => { entered = done; });

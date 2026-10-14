@@ -18,6 +18,13 @@ export type WorkerJob = {
   configRevision: number; config: WorkerConfig; idempotencyKey: string; fingerprint: string; createdAt: string; updatedAt: string;
   request: AgentSubmit | BulkSubmit; childSessionName?: string; resumedFromJobId?: string; results: ItemResult[]; error?: string;
 };
+/** Job metadata stays bounded regardless of the number or size of item inputs. */
+export type WorkerJobHeader = Omit<WorkerJob, "request" | "results"> & {
+  request: AgentSubmit | Omit<BulkSubmit, "items">;
+};
+export type JobProgress = Record<JobState, number> & { total: number };
+export type ResultPage = { jobId: string; results: (ItemResult & { revision: number })[]; nextCursor: number; hasMore: boolean };
+export type PageOptions = { after?: number; limit?: number };
 export type UsageReceipt = {
   version: 1; requestId: string; parentSessionName: string; sessionName: string; attemptId: string; jobId?: string; itemId?: string; ownerKey?: string;
   providerId: string; model: string; role: "main" | "subagent"; promptSha256: string;

@@ -13,6 +13,7 @@ import type { ModelUsageGroup } from "../shared/model-usage.js";
 import type { SessionInfo } from "../shared/types.js";
 import { ProcessCpuCounter, type VerifiedProcessRoot } from "./proc-cpu.js";
 import { statisticsTokens, unavailableTokens } from "./tokens.js";
+import { BrokerUsageAccumulator } from "./broker-usage.js";
 import { TurnStatisticsStore } from "./store.js";
 import type {
   RunnerTurnModelStatistics,
@@ -35,6 +36,7 @@ type Meter = {
   /** Set once a valid wrapper model-usage line arrived; it then owns the totals. */
   modelUsageSeen: boolean;
   brokerUsageOwned: boolean;
+  brokerUsage?: BrokerUsageAccumulator;
 };
 const record = (value: unknown): Record<string, unknown> | null =>
   value !== null && typeof value === "object" && !Array.isArray(value)
@@ -329,16 +331,24 @@ export class TurnStatisticsRecorder {
       (reason) => reason !== "cumulative_usage_without_baseline",
     );
   }
-  /** Request receipts replace native SDK counters; a request id is represented once. */
+  /** Legacy complete-snapshot entry point; incremental broker publishers use one receipt. */
   observeBrokerUsage(name: string, receipts: readonly UsageReceipt[]): void {
     const meter = this.active.get(name); if (!meter || meter.ended) return;
+    meter.brokerUsage = new BrokerUsageAccumulator();
+    for (const receipt of receipts) meter.brokerUsage.update(receipt);
+    this.publishBrokerUsage(meter);
+  }
+  observeBrokerReceipt(name: string, receipt: UsageReceipt): void {
+    const meter = this.active.get(name); if (!meter || meter.ended || meter.row.attemptId !== receipt.attemptId) return;
+    meter.brokerUsage ??= new BrokerUsageAccumulator(); meter.brokerUsage.update(receipt);
+    this.publishBrokerUsage(meter);
+  }
+  private publishBrokerUsage(meter: Meter): void {
     meter.brokerUsageOwned = true;
-    const groups = new Map<string, UsageReceipt[]>();
-    for (const receipt of receipts) { const key = JSON.stringify([receipt.role, receipt.providerId, receipt.model]); const group = groups.get(key) ?? []; group.push(receipt); groups.set(key, group); }
-    meter.row.models = [...groups.values()].map((group) => ({ role: group[0]!.role, model: group[0]!.model, modelProviderId: group[0]!.providerId, threads: new Set(group.map((r) => r.jobId ?? r.sessionName)).size, tokens: sumTokens(group.map((r) => r.usage), group.every((r) => r.state !== "running")) }));
-    meter.row.tokens = receipts.length ? sumTokens(receipts.map((r) => r.usage), receipts.every((r) => r.state !== "running")) : unavailableTokens();
+    const snapshot = meter.brokerUsage!.snapshot();
+    meter.row.models = snapshot.models; meter.row.tokens = snapshot.tokens;
     meter.row.coverageReasons = meter.row.coverageReasons.filter((r) => r !== "cumulative_usage_without_baseline" && r !== "broker_usage_incomplete");
-    if (receipts.some((r) => r.usage.quality !== "measured")) this.reason(meter, "broker_usage_incomplete");
+    if (snapshot.incomplete) this.reason(meter, "broker_usage_incomplete");
     this.checkpoint(meter);
   }
   private reason(meter: Meter, reason: string): void {
