@@ -11,7 +11,7 @@ import { publicAddress } from "../src/advanced/egress.js";
 import { startParamsZod } from "../src/shared/schema.js";
 import { TurnStatisticsStore } from "../src/statistics/store.js";
 import { TurnStatisticsRecorder } from "../src/statistics/recorder.js";
-import type { SessionInfo } from "../src/shared/types.js";
+import type { ModelProviderConfig, SessionInfo } from "../src/shared/types.js";
 import type { UsageReceipt, WorkerJob } from "../src/advanced/types.js";
 
 const cleanups: (() => Promise<void>)[] = [];
@@ -23,9 +23,10 @@ async function upstream(handler: RequestListener): Promise<{ url: string; server
   cleanups.push(async () => { server.closeAllConnections(); await new Promise<void>((done) => server.close(() => done())); });
   return { server, url: `http://127.0.0.1:${address.port}/v1` };
 }
-async function setup(baseUrl: string, mode: "plan" | "execute" = "execute", concurrency?: { defaultLimit: number }) {
+async function setup(baseUrl: string, mode: "plan" | "execute" = "execute", concurrency?: { defaultLimit: number }, reasoningProfile?: ModelProviderConfig["reasoningProfile"]) {
   const runtime = await AdvancedRuntime.open(await root(), concurrency); cleanups.push(() => runtime.close()); process.env.TEST_MODEL_KEY = "test-secret";
   const params = startParamsZod.parse({ name: "main", agent: "codex", directory: "/tmp", task: "review", interactionMode: mode, permissionMode: mode === "execute" ? "approve-all" : "approve-reads", statisticsContext: { version: 1, chatId: "chat", attemptId: "attempt" }, modelProvider: { id: "local", model: "test-model", kind: "codex-openai-compatible", baseUrl, authTokenEnv: "TEST_MODEL_KEY" }, orchestration: { version: 1, revision: 1, workers: [{ id: "refs", assignment: "Check sources", agent: "codex", modelProvider: { id: "local", model: "test-model", kind: "codex-openai-compatible", baseUrl, authTokenEnv: "TEST_MODEL_KEY" } }] } });
+  if (reasoningProfile) params.orchestration!.workers[0]!.modelProvider.reasoningProfile = reasoningProfile;
   const session = { ...params, state: "idle", warnings: [], transcript: [], createdAt: new Date().toISOString(), lastActivity: new Date().toISOString() } as SessionInfo;
   runtime.attach({ start: async () => ({ content: [{ type: "text", text: "done" }], details: { output: "done", session: { state: "completed" } } }), quiesce: async () => {}, getSession: () => session, contribution: () => {} });
   await runtime.begin(session, params, params.permissionMode!);
@@ -192,13 +193,43 @@ describe("scoped worker broker", () => {
     finally { if (previous === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = previous; }
   });
   it("runs idempotent structured bulk once, keeps caller IDs and blocks unconfigured native models", async () => {
-    let calls = 0; const { url } = await upstream((req, res) => { expect(req.headers.authorization).toBe("Bearer test-secret"); calls++; res.setHeader("content-type", "application/json"); res.end(JSON.stringify({ model: "test-model", output_text: '{"verdict":true}', usage: { input_tokens: 12, output_tokens: 3 } })); });
+    let calls = 0; const { url } = await upstream((req, res) => { expect(req.headers.authorization).toBe("Bearer test-secret"); calls++; res.setHeader("content-type", "application/json"); res.end(JSON.stringify({ model: "test-model", output: [
+      { type: "reasoning", content: [{ type: "reasoning_text", text: "Internal analysis must not enter the structured answer." }] },
+      { type: "message", role: "assistant", content: [{ type: "output_text", text: '{"verdict":true}' }] },
+    ], usage: { input_tokens: 12, output_tokens: 3 } })); });
     const { runtime, socket } = await setup(url);
     const data = { configId: "refs", idempotencyKey: "batch", concurrency: 2, items: [{ id: "citation-1", input: "check it" }, { id: "citation-2", input: { messages: [{ role: "user", content: "check this" }] } }], schema: { $schema: "https://json-schema.org/draft/2020-12/schema", type: "object", properties: { verdict: { type: "boolean" } }, required: ["verdict"], additionalProperties: false } };
     const first = (await unix(socket, "/bulk/submit", data)).body; expect((await unix(socket, "/bulk/submit", data)).body.jobId).toBe(first.jobId);
     const result = await settled(socket, first.jobId); expect(result.state).toBe("completed"); expect(result.results.map((r: any) => r.id)).toEqual(["citation-1", "citation-2"]); expect(result.results[0].output).toEqual({ verdict: true }); expect(calls).toBe(2);
     expect((await unix(socket, "/bulk/submit", { ...data, items: [{ id: "different", input: "change" }] })).status).toBe(409);
     expect((await unix(socket, "/native/v1/responses", { model: "unconfigured" })).status).toBe(409); expect(calls).toBe(2); expect(runtime.store.receipts("main")).toHaveLength(2);
+  });
+  it("projects Qwen grammar constraints while validating the unchanged full schema locally", async () => {
+    let calls = 0;
+    const schema = { type: "object", required: ["readUnitIds", "confidence", "rationale"], additionalProperties: false,
+      properties: { readUnitIds: { type: "array", uniqueItems: true, items: { type: "string" } }, confidence: { type: "number", minimum: 0, maximum: 100 }, rationale: { type: "string", minLength: 1 } } };
+    const { url } = await upstream(async (req, res) => {
+      const chunks = []; for await (const chunk of req) chunks.push(Buffer.from(chunk));
+      const payload = JSON.parse(Buffer.concat(chunks).toString());
+      expect(payload.text.format.schema).toEqual({ ...schema, properties: { ...schema.properties, readUnitIds: { type: "array", items: { type: "string" } } } });
+      calls++;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ model: "test-model", output: [
+        { type: "reasoning", content: [{ type: "reasoning_text", text: "Internal reasoning must not corrupt the JSON answer." }] },
+        { type: "message", role: "assistant", content: [{ type: "output_text", text: JSON.stringify({ readUnitIds: calls === 1 ? ["u1"] : ["u1", "u1"], confidence: 80, rationale: "Evidence checked." }) }] },
+      ], usage: { input_tokens: 12, output_tokens: 3 } }));
+    });
+    const { runtime, socket } = await setup(url, "execute", undefined, "qwen-3.8");
+    const data = { configId: "refs", idempotencyKey: "qwen-schema", concurrency: 1,
+      items: [{ id: "valid", input: "Check evidence" }, { id: "duplicate", input: "Check evidence" }], schema };
+    const job = (await unix(socket, "/bulk/submit", data)).body;
+    const result = await settled(socket, job.jobId);
+    expect(result.state).toBe("failed");
+    expect(result.results[0]).toMatchObject({ id: "valid", state: "completed", output: { readUnitIds: ["u1"] } });
+    expect(result.results[1]).toMatchObject({ id: "duplicate", state: "failed", error: expect.stringMatching(/duplicate items/u) });
+    expect(runtime.store.job(job.jobId)?.request).toMatchObject({ schema });
+    expect(schema.properties.readUnitIds.uniqueItems).toBe(true);
+    expect(calls).toBe(2);
   });
   it("pauses on quota, preserves completed items and explicitly resumes only missing work", async () => {
     let calls = 0, failing = true; const { url } = await upstream((_req, res) => { calls++; res.setHeader("content-type", "application/json"); if (calls === 2 && failing) { res.statusCode = 429; res.end('{"error":"quota"}'); } else res.end('{"model":"test-model","output_text":"ok","usage":{"input_tokens":10,"output_tokens":2}}'); });
