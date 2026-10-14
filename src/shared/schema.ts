@@ -113,7 +113,7 @@ export const advancedOrchestrationZod = z.object({
     agent: agentKindZod,
     effort: effortLevelZod.optional(),
     modelProvider: modelProviderConfigZod,
-  }).strict()).min(1).max(128),
+  }).strict()).min(1),
 }).strict().superRefine((value, context) => {
   if (new Set(value.workers.map((worker) => worker.id)).size !== value.workers.length)
     context.addIssue({ code: 'custom', path: ['workers'], message: 'Worker configuration ids must be unique.' });
@@ -259,7 +259,7 @@ export const pluginConfigZod = z
     daemonUrl: nonEmptyString.default(DEFAULT_DAEMON_URL),
     daemonAuthToken: z.string().optional(),
     defaultAgent: agentKindZod.default(DEFAULT_AGENT),
-    maxSessions: z.number().int().min(1).max(100).default(DEFAULT_MAX_SESSIONS),
+    maxSessions: z.number().int().positive().safe().default(DEFAULT_MAX_SESSIONS),
     permissionMode: permissionModeZod.default(DEFAULT_PERMISSION_MODE),
     sessionTtlMinutes: z
       .number()
@@ -723,8 +723,8 @@ export const pluginManifestConfigSchema = {
     maxSessions: {
       type: "integer",
       minimum: 1,
-      maximum: 100,
-      description: "Maximum concurrently tracked sessions."
+      maximum: Number.MAX_SAFE_INTEGER,
+      description: "Configured admission limit for connected persistent runtime sessions; idle sessions may be suspended and retained history is not counted."
     },
     permissionMode: {
       type: "string",

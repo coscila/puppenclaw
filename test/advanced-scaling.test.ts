@@ -53,6 +53,24 @@ describe("incremental worker persistence", () => {
 });
 
 describe("aggregate provider dispatch capacity", () => {
+  it("reports actual shared permits and waiting requests across transfer and cancellation", async () => {
+    const limiter = new BulkConcurrencyLimiter({ defaultLimit: 1, providerLimits: { other: 3 } });
+    expect(limiter.snapshot("qwen")).toEqual({ limit: 1, active: 0, waiting: 0 });
+    const first = await limiter.acquire("qwen", new AbortController().signal);
+    const second = limiter.acquire("qwen", new AbortController().signal);
+    const cancelled = new AbortController();
+    const third = limiter.acquire("qwen", cancelled.signal);
+    expect(limiter.snapshot("qwen")).toEqual({ limit: 1, active: 1, waiting: 2 });
+    expect(limiter.snapshot("other")).toEqual({ limit: 3, active: 0, waiting: 0 });
+    const detached = limiter.snapshot("qwen"); detached.active = 99; detached.waiting = 99;
+    expect(limiter.snapshot("qwen")).toEqual({ limit: 1, active: 1, waiting: 2 });
+    cancelled.abort(); await expect(third).rejects.toThrow("cancelled");
+    expect(limiter.snapshot("qwen")).toEqual({ limit: 1, active: 1, waiting: 1 });
+    first();
+    expect(limiter.snapshot("qwen")).toEqual({ limit: 1, active: 1, waiting: 0 });
+    const release = await second; release(); release();
+    expect(limiter.snapshot("qwen")).toEqual({ limit: 1, active: 0, waiting: 0 });
+  });
   it("shares slots across jobs, isolates providers and aborts waiting dispatch without consuming a slot", async () => {
     const limiter = new BulkConcurrencyLimiter({ defaultLimit: 1, providerLimits: { another: 2 } }); const abort = new AbortController();
     const first = await limiter.acquire("qwen", abort.signal); let admitted = false;
@@ -67,7 +85,19 @@ describe("aggregate provider dispatch capacity", () => {
     expect(new BulkConcurrencyLimiter({ defaultLimit: 3 }).limit("constructor")).toBe(3);
     expect(() => bulkConcurrencyFromEnvironment({ PUPPENCLAW_BULK_PROVIDER_LIMITS: '{"qwen":true}' })).toThrow();
     expect(bulkConcurrencyFromEnvironment({ PUPPENCLAW_BULK_PROVIDER_CONCURRENCY: "3", PUPPENCLAW_BULK_PROVIDER_LIMITS: '{"qwen":2}' })).toEqual({ defaultLimit: 3, providerLimits: { qwen: 2 } });
-    for (const value of ["0", "NaN", "-1", "1.5"]) expect(() => bulkConcurrencyFromEnvironment({ PUPPENCLAW_BULK_PROVIDER_CONCURRENCY: value })).toThrow();
+    for (const value of ["0", "NaN", "-1", "1.5", "Infinity", String(Number.MAX_SAFE_INTEGER + 1)]) expect(() => bulkConcurrencyFromEnvironment({ PUPPENCLAW_BULK_PROVIDER_CONCURRENCY: value })).toThrow();
+  });
+  it("accepts operator capacities above 10000 while preserving provider-specific shared limits", async () => {
+    const options = bulkConcurrencyFromEnvironment({ PUPPENCLAW_BULK_PROVIDER_CONCURRENCY: "10001", PUPPENCLAW_BULK_PROVIDER_LIMITS: JSON.stringify({ qwen: Number.MAX_SAFE_INTEGER, bounded: 1 }) });
+    const limiter = new BulkConcurrencyLimiter(options);
+    expect(limiter.limit("default")).toBe(10001);
+    expect(limiter.limit("qwen")).toBe(Number.MAX_SAFE_INTEGER);
+    expect(limiter.limit("bounded")).toBe(1);
+    const first = await limiter.acquire("bounded", new AbortController().signal);
+    let admitted = false;
+    const second = limiter.acquire("bounded", new AbortController().signal).then((release) => { admitted = true; return release; });
+    await Promise.resolve(); expect(admitted).toBe(false);
+    first(); (await second)(); expect(admitted).toBe(true);
   });
 });
 

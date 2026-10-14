@@ -256,7 +256,7 @@ describe("DaemonSessionManager", () => {
       backend: "daemon",
       acpxCommand,
       daemonAuthToken: "capability-test-token",
-      maxSessions: 7
+      maxSessions: 257
     });
 
     const { app } = await createDaemonServer({
@@ -344,8 +344,8 @@ describe("DaemonSessionManager", () => {
       expect(payload.reasoning).toEqual(REASONING_CAPABILITIES);
       expect(payload.maxSessions).toEqual({
         min: 1,
-        max: 100,
-        current: 7
+        max: Number.MAX_SAFE_INTEGER,
+        current: 257
       });
     } finally {
       await app.close();

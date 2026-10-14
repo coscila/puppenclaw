@@ -425,7 +425,7 @@ reads never hydrate item contents.
 Bulk dispatch shares a provider-wide concurrency limit across jobs and sessions
 in this daemon. `PUPPENCLAW_BULK_PROVIDER_CONCURRENCY` sets the default (60);
 `PUPPENCLAW_BULK_PROVIDER_LIMITS` accepts per-provider overrides, for example
-`{"remote_qwen38_xhigh":40}`. Values must be integers from 1 to 10000. Configured
+`{"remote_qwen38_xhigh":40}`. Values may be any positive safe integer. Configured
 worker listings report the effective `bulkConcurrencyLimit`. This bounds bulk
 inference only; it does not cap native controller requests. Cancellation drains
 queued leases as well as active requests. Chunk submissions below the existing
@@ -433,6 +433,27 @@ queued leases as well as active requests. Chunk submissions below the existing
 A browser reconnect does not replace the approved worker attempt; explicit stop
 and actual attempt closure still cancel its work. Interrupted jobs need explicit
 resume, which retains completed items.
+
+The worker `configs` response also reports provider-wide `capacity` with each
+provider's `limit`, admitted `active` calls, and `waiting` requests. A job item
+can be running while waiting for a permit; it is not evidence of an upstream
+inference slot. Bulk responses use a separate transport with a 30-minute total
+deadline after admission, covering both headers and body. Set
+`PUPPENCLAW_BULK_RESPONSE_TIMEOUT_MS` to a positive integer up to 86400000
+(24 hours) to tune that deadline. Expiry records `BULK_RESPONSE_TIMEOUT`;
+cancellation remains immediate and native controller transport is unchanged.
+This removes the default five-minute header timeout without automatically
+replaying a costly request or masking upstream connection resets.
+
+Worker configurations and submitted job counts have no fixed numeric ceiling;
+reuse a configuration across as many tasks as required. Requested bulk concurrency
+is still bounded by the configured provider-wide capacity. Persistent native
+harnesses use the separate positive-integer `maxSessions` admission setting
+(default 5), without a hardcoded 100-session ceiling. Idle unfocused sessions may
+be suspended to admit new work; retained history and one-shot Codex sessions do
+not consume that capacity. If every persistent slot is active or focused, further
+native admission returns `MAX_SESSIONS_REACHED`; it does not silently exceed the
+configured limit or imply unlimited hardware or provider throughput.
 
 The authenticated daemon API exposes a fenced lifecycle for callers that must
 stop work or remove a session workspace without allowing a delayed dispatch to

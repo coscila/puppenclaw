@@ -339,7 +339,7 @@ export async function createDaemonServer(params: {
     claudeWorkflows: { version: 1, runtimeVerified: true, configId: "ocsl_workflow_v1" },
     maxSessions: {
       min: 1,
-      max: 100,
+      max: Number.MAX_SAFE_INTEGER,
       current: params.config.maxSessions
     },
     streamOutput: params.config.streamOutput,

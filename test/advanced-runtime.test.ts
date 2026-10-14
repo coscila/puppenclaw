@@ -146,8 +146,14 @@ describe("scoped worker broker", () => {
     const a = (await submit("a")).body, b = (await submit("b")).body;
     for (let i = 0; i < 100 && calls < 2; i++) await new Promise((done) => setTimeout(done, 5));
     expect(calls).toBe(2); expect(a.results).toBeUndefined(); expect(a.progress.total).toBe(3);
+    expect((await unix(socket, "/configs")).body.capacity).toEqual({
+      scope: "provider", providers: [{ providerId: "local", limit: 2, active: 2, waiting: 2 }]
+    });
     released = true; for (const finish of pending) finish(); await settled(socket, a.jobId); await settled(socket, b.jobId);
     expect(peak).toBeLessThanOrEqual(2); expect(calls).toBe(6);
+    expect((await unix(socket, "/configs/list")).body.capacity).toEqual({
+      scope: "provider", providers: [{ providerId: "local", limit: 2, active: 0, waiting: 0 }]
+    });
     const summaries = (await unix(socket, "/jobs?view=summary&limit=1")).body; expect(summaries.hasMore).toBe(true); expect(summaries.jobs[0].results).toBeUndefined();
     const resultPage = (await unix(socket, `/jobs/${a.jobId}/results?limit=2`)).body; expect(resultPage.results).toHaveLength(2); expect(resultPage.hasMore).toBe(true);
     const last = (await unix(socket, `/jobs/${a.jobId}/results?after=${resultPage.nextCursor}`)).body; expect(last.results).toHaveLength(1); expect(last.results[0].output).toBe("verified");

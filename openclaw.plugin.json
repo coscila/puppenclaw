@@ -36,8 +36,8 @@
       "maxSessions": {
         "type": "integer",
         "minimum": 1,
-        "maximum": 100,
-        "description": "Maximum concurrently tracked sessions."
+        "maximum": 9007199254740991,
+        "description": "Configured admission limit for connected persistent runtime sessions; idle sessions may be suspended and retained history is not counted."
       },
       "permissionMode": {
         "type": "string",

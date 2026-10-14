@@ -2,7 +2,7 @@
 export type BulkConcurrencyOptions = { defaultLimit: number; providerLimits?: Record<string, number> };
 type Waiter = { resolve: (release: () => void) => void; reject: (error: Error) => void; signal: AbortSignal; abort: () => void };
 type Pool = { active: number; queue: Waiter[] };
-const positive = (value: unknown): number => { const limit = typeof value === "number" || typeof value === "string" ? Number(value) : NaN; if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10000) throw new Error("Bulk provider concurrency must be an integer between 1 and 10000."); return limit; };
+const positive = (value: unknown): number => { const limit = typeof value === "number" || typeof value === "string" ? Number(value) : NaN; if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("Bulk provider concurrency must be a positive safe integer."); return limit; };
 export function bulkConcurrencyFromEnvironment(env: NodeJS.ProcessEnv = process.env): BulkConcurrencyOptions {
   const defaultLimit = positive(env.PUPPENCLAW_BULK_PROVIDER_CONCURRENCY ?? 60);
   const raw: unknown = JSON.parse(env.PUPPENCLAW_BULK_PROVIDER_LIMITS ?? "{}");
@@ -16,6 +16,11 @@ export class BulkConcurrencyLimiter {
     this.options = { defaultLimit: positive(options.defaultLimit), providerLimits: Object.fromEntries(Object.entries(options.providerLimits ?? {}).map(([id, value]) => [id, positive(value)])) };
   }
   limit(provider: string): number { const limits = this.options.providerLimits; return limits && Object.hasOwn(limits, provider) ? limits[provider]! : this.options.defaultLimit; }
+  /** Current provider-wide permits and queued requests, without mutable pool state. */
+  snapshot(provider: string): { limit: number; active: number; waiting: number } {
+    const pool = this.pools.get(provider);
+    return { limit: this.limit(provider), active: pool?.active ?? 0, waiting: pool?.queue.length ?? 0 };
+  }
   async acquire(provider: string, signal: AbortSignal): Promise<() => void> {
     signal.throwIfAborted();
     const pool = this.pools.get(provider) ?? { active: 0, queue: [] }; this.pools.set(provider, pool);
