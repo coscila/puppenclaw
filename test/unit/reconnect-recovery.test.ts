@@ -37,6 +37,26 @@ async function fixture(options: Record<string, unknown>, baseline = oldRecord) {
 }
 
 describe("turn-specific ACPX reconnect handling", () => {
+  it.each([false, true])("classifies refresh contention without replaying a dispatched prompt (activity: %s)", async (activity) => {
+    const env = await fixture({ kind: "auth-refresh-busy", activity });
+    try {
+      const request = { turnKey: "refresh-busy:once" };
+      const initial = await env.run(request);
+      const replay = await env.run(request);
+      for (const result of [initial, replay]) {
+        expect(result.details).toMatchObject({
+          failureCode: "PROVIDER_AUTHENTICATION_BUSY", retryable: true,
+          session: { state: "failed", failureCode: "PROVIDER_AUTHENTICATION_BUSY", retryable: true },
+          outputRole: "status",
+          output: "Claude credentials are temporarily locked while another process refreshes them. Please retry shortly."
+        });
+      }
+      expect(replay.details).toMatchObject({ turnReceipt: { state: "replayed" } });
+      expect(await env.attempts()).toBe(1);
+      expect(env.completed).not.toHaveBeenCalled();
+    } finally { await env.store.close(); }
+  });
+
   it.each([0, 5])("publishes the actual recovery plan after automated rejection and a failed question (exit %s)", async (exitCode) => {
     const env = await fixture({ kind: "plan-permission", recoveryHandoff: true, exitCode });
     try {

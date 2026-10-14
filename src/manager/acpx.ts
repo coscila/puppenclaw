@@ -141,7 +141,8 @@ function normalizeProviderError(session: Pick<SessionInfo, "agent">, error: unkn
   if (
     error instanceof PuppenclawError &&
     (error.code === "PROVIDER_AUTHENTICATION_REQUIRED" ||
-      error.code === "PROVIDER_CONNECTION_FAILED")
+      error.code === "PROVIDER_CONNECTION_FAILED" ||
+      error.code === "PROVIDER_AUTHENTICATION_BUSY")
   ) {
     return error;
   }
@@ -5043,7 +5044,9 @@ export class AcpxSessionManager implements ISessionManager {
       const providerFailure = classifyProviderFailure({
         agent: params.session.agent,
         ...(errorEvent.code != null ? { code: errorEvent.code } : {}),
-        message: safeErrorMessage,
+        // Classify before redaction can hide an OAuth invalid_grant marker.
+        // Only the classifier's fixed public message crosses this boundary.
+        message: errorEvent.message,
         ...(errorEvent.retryable != null ? { retryable: errorEvent.retryable } : {})
       });
       if (providerFailure != null) {
@@ -5096,7 +5099,7 @@ export class AcpxSessionManager implements ISessionManager {
       );
       const providerFailure = classifyProviderFailure({
         agent: params.session.agent,
-        message
+        message: stderr.trim() || message
       });
       if (providerFailure != null) {
         await this.deps.outputRouter.onError(

@@ -293,8 +293,8 @@ export async function createDaemonServer(params: {
     structuredTurnSignals: true,
     structuredOutputEvents: true,
     providerFailureContracts: {
-      version: 1,
-      codes: ["PROVIDER_AUTHENTICATION_REQUIRED", "PROVIDER_CONNECTION_FAILED"],
+      version: 2,
+      codes: ["PROVIDER_AUTHENTICATION_REQUIRED", "PROVIDER_CONNECTION_FAILED", "PROVIDER_AUTHENTICATION_BUSY"],
       retryability: true,
       durableReplay: true
     },
@@ -945,6 +945,7 @@ function daemonStatusForError(code: string): number {
     case "QUIESCENCE_UNAVAILABLE":
     case "ACP_CONTROL_TIMEOUT":
     case "PROVIDER_CONNECTION_FAILED":
+    case "PROVIDER_AUTHENTICATION_BUSY":
     case "STATE_RECOVERY_REQUIRED":
       return 503;
     default:
@@ -1037,7 +1038,8 @@ function daemonLifecycleErrorDetails(error: PuppenclawError): Record<string, unk
   const turnReceipt = parseTurnReceipt(error.details?.turnReceipt);
   if (
     error.code === "PROVIDER_AUTHENTICATION_REQUIRED" ||
-    error.code === "PROVIDER_CONNECTION_FAILED"
+    error.code === "PROVIDER_CONNECTION_FAILED" ||
+    error.code === "PROVIDER_AUTHENTICATION_BUSY"
   ) {
     return {
       ...(typeof error.details?.retryable === "boolean"
@@ -1204,7 +1206,8 @@ async function streamToolResult(params: {
 
 function isProviderFailureCode(code: unknown): code is string {
   return (
-    code === "PROVIDER_AUTHENTICATION_REQUIRED" || code === "PROVIDER_CONNECTION_FAILED"
+    code === "PROVIDER_AUTHENTICATION_REQUIRED" || code === "PROVIDER_CONNECTION_FAILED" ||
+    code === "PROVIDER_AUTHENTICATION_BUSY"
   );
 }
 

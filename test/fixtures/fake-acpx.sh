@@ -251,6 +251,12 @@ if [[ "${command[0]:-}" == "prompt" && "${command[1]:-}" == "--session" && -n "$
   if [[ "$normalized_input" == *"CLAUDE_OAUTH_EXPIRED"* ]]; then
     emit_error "AUTHENTICATION_ERROR" "OAuth access token expired; run claude login again. token=must-not-survive"
     exit 0
+  elif [[ "$normalized_input" == *"CLAUDE_OAUTH_INVALID_GRANT"* ]]; then
+    emit_error "INTERNAL_ERROR" "Failed to refresh OAuth token: invalid_grant token=must-not-survive"
+    exit 0
+  elif [[ "$normalized_input" == *"CLAUDE_OAUTH_REFRESH_BUSY"* ]]; then
+    emit_error "INTERNAL_ERROR" "Internal error: Failed to refresh OAuth token: Another Claude Code process is refreshing it or exited mid-refresh. This is usually transient; retry in a minute, and if it persists close other Claude Code processes or sign in again. token=must-not-survive"
+    exit 0
   elif [[ "$normalized_input" == *"PROVIDER_CONNECTION_FAILED"* ]]; then
     emit_error "CONNECTION_FAILED" "upstream connection reset"
     exit 0

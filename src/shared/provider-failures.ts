@@ -1,7 +1,7 @@
 import type { AgentKind } from "./types.js";
 
 export type ProviderFailure = {
-  code: "PROVIDER_AUTHENTICATION_REQUIRED" | "PROVIDER_CONNECTION_FAILED";
+  code: "PROVIDER_AUTHENTICATION_REQUIRED" | "PROVIDER_CONNECTION_FAILED" | "PROVIDER_AUTHENTICATION_BUSY";
   message: string;
   retryable: boolean;
 };
@@ -10,6 +10,8 @@ const CLAUDE_AUTH_MESSAGE =
   "Claude OAuth credentials have expired or are invalid. Contact the system administrator to sign in to Claude again.";
 const CLAUDE_CONNECTION_MESSAGE =
   "Claude is temporarily unreachable because of a network or provider outage. Please retry.";
+const CLAUDE_AUTH_BUSY_MESSAGE =
+  "Claude credentials are temporarily locked while another process refreshes them. Please retry shortly.";
 
 export function classifyProviderFailure(params: {
   agent: AgentKind;
@@ -21,18 +23,33 @@ export function classifyProviderFailure(params: {
   const message = params.message.trim();
   if (params.agent === "claude") {
     const structuredAuth =
-      /^(?:401|403|AUTH(?:ENTICATION)?(?:_ERROR|_FAILED|_REQUIRED)?|OAUTH(?:_ERROR|_EXPIRED|_INVALID)?|UNAUTHENTICATED|UNAUTHORIZED|TOKEN_(?:EXPIRED|INVALID|REVOKED)|CREDENTIALS?_(?:EXPIRED|INVALID|REVOKED))$/u.test(
+      /^(?:PROVIDER_AUTHENTICATION_REQUIRED|INVALID_GRANT|401|403|AUTH(?:ENTICATION)?(?:_ERROR|_FAILED|_REQUIRED)?|OAUTH(?:_ERROR|_EXPIRED|_INVALID)?|UNAUTHENTICATED|UNAUTHORIZED|TOKEN_(?:EXPIRED|INVALID|REVOKED)|CREDENTIALS?_(?:EXPIRED|INVALID|REVOKED))$/u.test(
         code
       );
     const signalledAuth =
-      /(?:oauth|access token|refresh token|credentials?).{0,80}(?:expired|invalid|revoked|missing|login|log in|authenticate|authentication required)|(?:expired|invalid|revoked|missing).{0,80}(?:oauth|access token|refresh token|credentials?)|(?:not logged in|not authenticated|authentication required|please (?:run|use).{0,40}(?:login|log in)|unauthorized|\b(?:http\s*)?(?:401|403)\b)/iu.test(
+      /(?:oauth|access token|refresh token|credentials?).{0,80}(?:expired|invalid|revoked|missing|login|log in|authenticate|authentication required)|(?:expired|invalid|revoked|missing).{0,80}(?:oauth|access token|refresh token|credentials?)|(?:invalid_grant|not logged in|not authenticated|authentication required|please (?:run|use).{0,40}(?:login|log in)|unauthorized|\b(?:http\s*)?(?:401|403)\b)/iu.test(
         message
       );
-    if (structuredAuth || signalledAuth) {
+    // The native CLI can wrap a refresh-lock timeout in a generic OAuth
+    // error. Recognize only its specific contention diagnostic; a revoked
+    // token or rejected grant remains terminal even alongside that prose.
+    const refreshBusy = code === "PROVIDER_AUTHENTICATION_BUSY" || (
+      /Failed to refresh OAuth token:/iu.test(message) &&
+      /(?:Claude Code process is refreshing it or exited mid-refresh|timed out waiting for (?:the )?(?:OAuth (?:token )?)?refresh lock)/iu.test(message)
+    );
+    const definitiveAuthCode = structuredAuth && !/^(?:AUTH(?:ENTICATION)?(?:_ERROR|_FAILED)?|OAUTH(?:_ERROR)?)$/u.test(code);
+    if (signalledAuth || definitiveAuthCode || (structuredAuth && !refreshBusy)) {
       return {
         code: "PROVIDER_AUTHENTICATION_REQUIRED",
         message: CLAUDE_AUTH_MESSAGE,
         retryable: false
+      };
+    }
+    if (refreshBusy) {
+      return {
+        code: "PROVIDER_AUTHENTICATION_BUSY",
+        message: CLAUDE_AUTH_BUSY_MESSAGE,
+        retryable: true
       };
     }
   }

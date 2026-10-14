@@ -134,6 +134,20 @@ describe("DaemonSessionManager", () => {
       code: "PROVIDER_CONNECTION_FAILED",
       retryable: true,
       message: "Claude is temporarily unreachable because of a network or provider outage. Please retry."
+    },
+    {
+      label: "invalid-grant",
+      task: "CLAUDE_OAUTH_INVALID_GRANT",
+      code: "PROVIDER_AUTHENTICATION_REQUIRED",
+      retryable: false,
+      message: "Claude OAuth credentials have expired or are invalid. Contact the system administrator to sign in to Claude again."
+    },
+    {
+      label: "refresh-busy",
+      task: "CLAUDE_OAUTH_REFRESH_BUSY",
+      code: "PROVIDER_AUTHENTICATION_BUSY",
+      retryable: true,
+      message: "Claude credentials are temporarily locked while another process refreshes them. Please retry shortly."
     }
   ])(
     "preserves Claude $label failure parity across keyed SSE and JSON replay",
@@ -260,6 +274,7 @@ describe("DaemonSessionManager", () => {
         sessionSendStream?: boolean;
         sessionTurnIdempotency?: unknown;
         sessionModelProviderRefresh?: boolean;
+        providerFailureContracts?: unknown;
         codexTurnPolicy?: unknown;
         codexLocalSubagents?: unknown;
         sessionOwnerCleanup?: unknown;
@@ -287,6 +302,12 @@ describe("DaemonSessionManager", () => {
         turnKeyRetention: 4096
       });
       expect(payload.sessionModelProviderRefresh).toBe(true);
+      expect(payload.providerFailureContracts).toEqual({
+        version: 2,
+        codes: ["PROVIDER_AUTHENTICATION_REQUIRED", "PROVIDER_CONNECTION_FAILED", "PROVIDER_AUTHENTICATION_BUSY"],
+        retryability: true,
+        durableReplay: true
+      });
       expect(payload.codexTurnPolicy).toEqual({
         version: 1,
         serverControlled: true,

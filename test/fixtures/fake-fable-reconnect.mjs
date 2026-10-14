@@ -70,6 +70,16 @@ if (args.includes("prompt")) {
       }
       process.exit(options.exitCode ?? 5);
     }
+    if (options.kind === "auth-refresh-busy") {
+      if (options.activity) {
+        saveOutput(prompt, "Partial work.");
+        emit({ type: "tool_call", title: "Synthetic write", toolCallId: "t1" });
+        emit({ type: "agent_message_chunk", content: { type: "text", text: "Partial work." } });
+      }
+      emit({ type: "error", code: options.code ?? "INTERNAL_ERROR", retryable: true,
+        message: "Internal error: Failed to refresh OAuth token: Another Claude Code process is refreshing it or exited mid-refresh. This is usually transient; retry in a minute, and if it persists close other Claude Code processes or sign in again." });
+      process.exit(1);
+    }
     if (options.kind === "stale") {
       writeFileSync(marker, JSON.stringify({ ...record(), updated_at: new Date().toISOString() }));
       emit({ type: "error", code: "CONNECTION_FAILED", message: "ACP agent disconnected during request" });

@@ -287,6 +287,12 @@ if (command[0] === "prompt" && command[1] === "--session" && command[2] != null)
       "OAuth access token expired; run claude login again. token=must-not-survive"
     );
     process.exit(0);
+  } else if (normalizedInput.includes("CLAUDE_OAUTH_INVALID_GRANT")) {
+    emitError("INTERNAL_ERROR", "Failed to refresh OAuth token: invalid_grant token=must-not-survive");
+    process.exit(0);
+  } else if (normalizedInput.includes("CLAUDE_OAUTH_REFRESH_BUSY")) {
+    emitError("INTERNAL_ERROR", "Internal error: Failed to refresh OAuth token: Another Claude Code process is refreshing it or exited mid-refresh. This is usually transient; retry in a minute, and if it persists close other Claude Code processes or sign in again. token=must-not-survive");
+    process.exit(0);
   } else if (normalizedInput.includes("PROVIDER_CONNECTION_FAILED")) {
     emitError("CONNECTION_FAILED", "upstream connection reset");
     process.exit(0);
