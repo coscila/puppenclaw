@@ -434,8 +434,29 @@ A browser reconnect does not replace the approved worker attempt; explicit stop
 and actual attempt closure still cancel its work. Interrupted jobs need explicit
 resume, which retains completed items.
 
+Profiles that address the same physical backend must share a capacity group.
+The operator configures `PUPPENCLAW_BULK_PROVIDER_GROUPS` as a JSON mapping of
+provider IDs to group names, for example:
+
+```json
+{"remote_qwen38_none":"qwen38","remote_qwen38_low":"qwen38","remote_qwen38_medium":"qwen38","remote_qwen38_xhigh":"qwen38"}
+```
+
+Each group uses the lowest effective member limit (including the default for
+members without an override). `PUPPENCLAW_BULK_GROUP_LIMITS`, for example
+`{"qwen38":60}`, explicitly overrides that group limit. Unmapped providers keep
+their existing independent limits. Mappings are flat names, not recursive
+aliases; a group and an ungrouped provider with the same name remain independent.
+Invalid mappings and limits for groups without members fail startup. Changes
+take effect when the daemon restarts. Provider identity, reasoning settings,
+receipts and per-attempt quota pauses remain unchanged. Each study should also
+enforce its own aggregate budget across all worker roles.
+
 The worker `configs` response also reports provider-wide `capacity` with each
-provider's `limit`, admitted `active` calls, and `waiting` requests. A job item
+provider's `limit`, admitted `active` calls, and `waiting` requests. Grouped
+providers include `capacityGroup` and report the same shared counters; do not
+sum those duplicate counters. This metadata is outside the pinned scientific
+worker configurations. A job item
 can be running while waiting for a permit; it is not evidence of an upstream
 inference slot. Bulk responses use a separate transport with a 30-minute total
 deadline after admission, covering both headers and body. Set

@@ -8,6 +8,7 @@ import { AdvancedRuntime } from "../src/advanced/runtime.js";
 import { UsageParser } from "../src/advanced/usage.js";
 import { AdvancedStore } from "../src/advanced/store.js";
 import { publicAddress } from "../src/advanced/egress.js";
+import type { BulkConcurrencyOptions } from "../src/advanced/concurrency.js";
 import { startParamsZod } from "../src/shared/schema.js";
 import { TurnStatisticsStore } from "../src/statistics/store.js";
 import { TurnStatisticsRecorder } from "../src/statistics/recorder.js";
@@ -23,10 +24,11 @@ async function upstream(handler: RequestListener): Promise<{ url: string; server
   cleanups.push(async () => { server.closeAllConnections(); await new Promise<void>((done) => server.close(() => done())); });
   return { server, url: `http://127.0.0.1:${address.port}/v1` };
 }
-async function setup(baseUrl: string, mode: "plan" | "execute" = "execute", concurrency?: { defaultLimit: number }, reasoningProfile?: ModelProviderConfig["reasoningProfile"]) {
+async function setup(baseUrl: string, mode: "plan" | "execute" = "execute", concurrency?: BulkConcurrencyOptions, reasoningProfile?: ModelProviderConfig["reasoningProfile"], workerProviderId?: string) {
   const runtime = await AdvancedRuntime.open(await root(), concurrency); cleanups.push(() => runtime.close()); process.env.TEST_MODEL_KEY = "test-secret";
   const params = startParamsZod.parse({ name: "main", agent: "codex", directory: "/tmp", task: "review", interactionMode: mode, permissionMode: mode === "execute" ? "approve-all" : "approve-reads", statisticsContext: { version: 1, chatId: "chat", attemptId: "attempt" }, modelProvider: { id: "local", model: "test-model", kind: "codex-openai-compatible", baseUrl, authTokenEnv: "TEST_MODEL_KEY" }, orchestration: { version: 1, revision: 1, workers: [{ id: "refs", assignment: "Check sources", agent: "codex", modelProvider: { id: "local", model: "test-model", kind: "codex-openai-compatible", baseUrl, authTokenEnv: "TEST_MODEL_KEY" } }] } });
   if (reasoningProfile) params.orchestration!.workers[0]!.modelProvider.reasoningProfile = reasoningProfile;
+  if (workerProviderId) params.orchestration!.workers[0]!.modelProvider.id = workerProviderId;
   const session = { ...params, state: "idle", warnings: [], transcript: [], createdAt: new Date().toISOString(), lastActivity: new Date().toISOString() } as SessionInfo;
   runtime.attach({ start: async () => ({ content: [{ type: "text", text: "done" }], details: { output: "done", session: { state: "completed" } } }), quiesce: async () => {}, getSession: () => session, contribution: () => {} });
   await runtime.begin(session, params, params.permissionMode!);
@@ -159,6 +161,39 @@ describe("scoped worker broker", () => {
     const last = (await unix(socket, `/jobs/${a.jobId}/results?after=${resultPage.nextCursor}`)).body; expect(last.results).toHaveLength(1); expect(last.results[0].output).toBe("verified");
     expect((await unix(socket, `/jobs/${a.jobId}?view=summary`)).body.progress).toMatchObject({ total: 3, completed: 3, running: 0 });
     expect(() => runtime.jobResults("another-chat", a.jobId)).toThrow("not in this chat");
+  });
+  it("shares one physical backend across profiles and chats without changing worker snapshots", async () => {
+    let active = 0, peak = 0, calls = 0, released = false;
+    const pending: (() => void)[] = [];
+    const { url } = await upstream((_req, res) => {
+      calls++; active++; peak = Math.max(peak, active);
+      const finish = () => { active--; res.setHeader("content-type", "application/json"); res.end('{"model":"test-model","output_text":"verified"}'); };
+      if (released) finish(); else pending.push(finish);
+    });
+    const providerGroups = { remote_qwen38_none: "qwen38", remote_qwen38_low: "qwen38" };
+    const { runtime, socket, params, session } = await setup(url, "execute", { defaultLimit: 2, providerGroups }, undefined, "remote_qwen38_none");
+    const otherParams = structuredClone(params);
+    otherParams.name = "other";
+    otherParams.statisticsContext = { version: 1, chatId: "other-chat", attemptId: "other-attempt" };
+    otherParams.orchestration!.workers[0]!.modelProvider.id = "remote_qwen38_low";
+    await runtime.begin({ ...session, ...otherParams } as SessionInfo, otherParams, "approve-all");
+    const otherSocket = runtime.socket("other")!;
+    const submit = (target: string, key: string) => unix(target, "/bulk/submit?view=summary", { configId: "refs", idempotencyKey: key, concurrency: 2, items: [1, 2].map((i) => ({ id: `${key}-${i}`, input: "Review" })) });
+    const a = (await submit(socket, "a")).body, b = (await submit(otherSocket, "b")).body;
+    for (let i = 0; i < 100 && calls < 2; i++) await new Promise((done) => setTimeout(done, 5));
+    expect(calls).toBe(2);
+    for (const [target, providerId] of [[socket, "remote_qwen38_none"], [otherSocket, "remote_qwen38_low"]]) {
+      const catalog = (await unix(target!, "/configs")).body;
+      expect(catalog.capacity.providers).toEqual([{ providerId, capacityGroup: "qwen38", limit: 2, active: 2, waiting: 2 }]);
+      expect(catalog.workers[0]).not.toHaveProperty("capacityGroup");
+      expect(catalog.workers[0].providerId).toBe(providerId);
+    }
+    released = true; for (const finish of pending) finish();
+    await settled(socket, a.jobId); await settled(otherSocket, b.jobId);
+    expect(peak).toBe(2); expect(calls).toBe(4);
+    expect(runtime.store.jobReceipts(a.jobId).every((receipt) => receipt.providerId === "remote_qwen38_none")).toBe(true);
+    expect(runtime.store.jobReceipts(b.jobId).every((receipt) => receipt.providerId === "remote_qwen38_low")).toBe(true);
+    expect((await unix(socket, "/configs")).body.capacity.providers[0]).toMatchObject({ active: 0, waiting: 0 });
   });
   it("cancels queued provider-capacity leases with the parent without dispatching them", async () => {
     let calls = 0; const { url } = await upstream((_req, res) => { calls++; res.setHeader("content-type", "application/json"); res.write(" "); });
