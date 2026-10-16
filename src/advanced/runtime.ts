@@ -13,6 +13,7 @@ import { AdvancedStore, pageOptions } from "./store.js";
 import { BulkConcurrencyLimiter, type BulkConcurrencyOptions } from "./concurrency.js";
 import { BulkResponseTransport, type BulkRequestScope } from "./bulk-transport.js";
 import { EgressPolicy, proxyConnect, proxyHttp } from "./egress.js";
+import { ClaudeOAuthRelay } from "./claude-oauth-relay.js";
 import { noUsage, UsageParser } from "./usage.js";
 import { responseOutputText } from "./responses-output.js";
 import { responseSchemaForProvider } from "./response-schema.js";
@@ -78,6 +79,11 @@ export class AdvancedRuntime {
   private readonly nativeOAuthRecovery = new Map<string, { rejectedTokenSha256: string; retryClaimed: boolean }>();
   private readonly observedJobs = new Set<string>();
   private readonly policy = new EgressPolicy();
+  private oauthRelay: ClaudeOAuthRelay | undefined;
+  private oauthRelayOpening: Promise<ClaudeOAuthRelay> | undefined;
+  private readonly admissionEpochs = new Map<string, number>();
+  private closed = false;
+  private closing: Promise<void> | undefined;
   private readonly socketRoot: string;
   private readonly bulkConcurrency: BulkConcurrencyLimiter;
   private readonly bulkTransport = new BulkResponseTransport();
@@ -124,11 +130,14 @@ export class AdvancedRuntime {
   environment(name: string): NodeJS.ProcessEnv {
     const participant = this.participants.get(name), socket = this.socket(name); if (!participant || !socket) return {};
     return { PUPPENCLAW_ORCHESTRATION_SOCKET: socket, PUPPENCLAW_ORCHESTRATION_NATIVE_BASE_PATH: "/native", PUPPENCLAW_ORCHESTRATION_ATTEMPT_ID: participant.attemptId,
+      ...(participant.provider.kind === "claude-code" && this.oauthRelay ? { PUPPENCLAW_ORCHESTRATION_CLAUDE_OAUTH_CERT: this.oauthRelay.certificatePath } : {}),
       ...(participant.jobId ? { PUPPENCLAW_ORCHESTRATION_JOB_ID: participant.jobId } : {}),
       ...(participant.provider.kind === "claude-code" ? { ANTHROPIC_DEFAULT_HAIKU_MODEL: participant.provider.model } : participant.provider.authTokenEnv ? { [participant.provider.authTokenEnv]: "ocsl-scoped-broker" } : {}) };
   }
   /** Admission runs after durable main-turn claim and before any external runtime process starts. */
   async begin(session: SessionInfo, params: StartParams | SendParams, permissionMode: RuntimeParticipant["permissionMode"]): Promise<void> {
+    if (this.closed) throw new PuppenclawError("ORCHESTRATION_TURN_CLOSED", "The advanced runtime has closed.");
+    const epoch = this.admissionEpochs.get(session.name) ?? 0;
     if (this.participants.get(session.name)?.jobId) { this.requireParticipant(session.name); return; }
     const config = params.orchestration ?? session.orchestration; if (!config) return;
     if (this.barriers.has(session.name)) await this.barriers.get(session.name);
@@ -138,6 +147,8 @@ export class AdvancedRuntime {
     const p: RuntimeParticipant = { sessionName: session.name, parentSessionName: session.name, attemptId: params.statisticsContext.attemptId,
       directory: session.directory, provider: session.modelProvider, permissionMode, interactionMode: params.interactionMode ?? "plan", config,
       ...(ownerKey ? { ownerKey } : {}), admissionOpen: true };
+    if (p.provider.kind === "claude-code") await this.ensureOAuthRelay();
+    if (this.closed || (this.admissionEpochs.get(session.name) ?? 0) !== epoch) throw new PuppenclawError("ORCHESTRATION_TURN_CLOSED", "This advanced admission was cancelled.");
     this.participants.set(session.name, p);
     await this.listen(session.name);
     this.policy.denyUrl(p.provider.baseUrl ?? "https://api.anthropic.com");
@@ -150,12 +161,23 @@ export class AdvancedRuntime {
     if (!p || !p.admissionOpen || !this.participants.get(p.parentSessionName)?.admissionOpen || p.attemptId !== this.participants.get(p.parentSessionName)?.attemptId) throw new PuppenclawError("ORCHESTRATION_TURN_CLOSED", "This worker transport is not attached to an active parent turn.");
     return p;
   }
+  private async ensureOAuthRelay(): Promise<ClaudeOAuthRelay> {
+    this.oauthRelayOpening ??= ClaudeOAuthRelay.open(this.socketRoot).then((relay) => { this.oauthRelay = relay; return relay; }).catch((error) => { this.oauthRelayOpening = undefined; throw error; });
+    return this.oauthRelayOpening;
+  }
   private async listen(name: string): Promise<void> {
     if (this.servers.has(name)) return;
     const path = join(this.socketRoot, `${hash(name).slice(0, 24)}.sock`);
     await unlink(path).catch((e) => { if (e.code !== "ENOENT") throw e; });
     const server = createServer((req, res) => { req.on("error", () => res.destroy()); res.on("error", () => res.destroy()); void this.handle(name, req, res).catch((error) => { if (!res.headersSent) { res.writeHead(error instanceof PuppenclawError ? 409 : 400, { "content-type": "application/json" }); res.end(JSON.stringify({ error: message(error), code: error instanceof PuppenclawError ? error.code : "INVALID_REQUEST" })); } else res.destroy(); }); });
-    server.on("connect", (req, socket, head) => { try { this.requireParticipant(name); } catch { socket.destroy(); return; } void proxyConnect(this.policy, req, socket, head).catch(() => socket.destroy()); });
+    server.on("connect", (req, socket, head) => {
+      let participant: RuntimeParticipant; try { participant = this.requireParticipant(name); } catch { socket.destroy(); return; }
+      if (participant.provider.kind === "claude-code" && ClaudeOAuthRelay.accepts(req.url) && this.oauthRelay) {
+        this.oauthRelay.connect(socket, head, { id: JSON.stringify([participant.sessionName, participant.attemptId]), active: () => { try { return this.requireParticipant(name) === participant; } catch { return false; } } });
+        return;
+      }
+      void proxyConnect(this.policy, req, socket, head).catch(() => socket.destroy());
+    });
     await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(path, () => { server.removeListener("error", reject); resolve(); }); });
     const sockets = new Set<Socket>(); server.on("connection", (socket) => { socket.on("error", () => socket.destroy()); sockets.add(socket); socket.once("close", () => sockets.delete(socket)); });
     await chmod(path, 0o600); this.servers.set(name, { server, path, sockets });
@@ -222,7 +244,7 @@ export class AdvancedRuntime {
   }
   private async runAgent(job: WorkerJob, parent: RuntimeParticipant): Promise<void> {
     const child: RuntimeParticipant = { ...parent, sessionName: job.childSessionName!, provider: job.config.modelProvider, jobId: job.jobId, admissionOpen: true };
-    this.requireParticipant(parent.sessionName); this.participants.set(child.sessionName, child); await this.listen(child.sessionName);
+    this.requireParticipant(parent.sessionName); if (child.provider.kind === "claude-code") await this.ensureOAuthRelay(); this.requireParticipant(parent.sessionName); this.participants.set(child.sessionName, child); await this.listen(child.sessionName);
     if (this.store.jobHeader(job.jobId)?.state === "cancelled") return;
     let result: ToolResult;
     try { result = await this.runtimeDriver().start({ name: child.sessionName, agent: job.config.agent, directory: child.directory,
@@ -324,6 +346,7 @@ export class AdvancedRuntime {
     if (job.kind === "agent") { const settled = this.store.job(id); if (settled) { this.recordAgentReceipts(settled); this.store.putJob(settled); } }
   }
   async closeTurn(name: string): Promise<void> {
+    this.admissionEpochs.set(name, (this.admissionEpochs.get(name) ?? 0) + 1);
     const p = this.participants.get(name); if (!p || p.jobId) return;
     const existing = this.barriers.get(name); if (existing) return existing;
     p.admissionOpen = false;
@@ -442,10 +465,14 @@ export class AdvancedRuntime {
     this.store.purgeSession(name);
   }
   async purgeOwner(owner: string): Promise<void> { for (const parent of this.store.ownedParents(owner)) await this.purge(parent); }
-  async close(): Promise<void> {
+  close(): Promise<void> { return this.closing ??= this.performClose(); }
+  private async performClose(): Promise<void> {
+    this.closed = true;
     await Promise.all([...this.participants.values()].filter((p) => !p.jobId).map((p) => this.closeTurn(p.sessionName)));
     await Promise.all([...this.servers.values()].map(async ({ server, path, sockets }) => { for (const socket of sockets) socket.destroy(); server.closeAllConnections(); await new Promise<void>((resolve) => server.close(() => resolve())); await unlink(path).catch(() => {}); }));
     await this.bulkTransport.close();
+    await this.oauthRelayOpening?.catch(() => undefined);
+    await this.oauthRelay?.close();
     this.store.close();
   }
 }

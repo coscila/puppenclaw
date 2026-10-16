@@ -1,10 +1,12 @@
 import { createServer, request, type Server, type RequestListener } from "node:http";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { connect } from "node:net";
-import { afterEach, describe, expect, it } from "vitest";
+import { connect as connectTls } from "node:tls";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { AdvancedRuntime } from "../src/advanced/runtime.js";
+import { ClaudeOAuthRelay } from "../src/advanced/claude-oauth-relay.js";
 import { UsageParser } from "../src/advanced/usage.js";
 import { AdvancedStore } from "../src/advanced/store.js";
 import { publicAddress } from "../src/advanced/egress.js";
@@ -72,6 +74,48 @@ describe("advanced usage", () => {
 });
 
 describe("scoped worker broker", () => {
+  it.each(["turn", "runtime"] as const)("cancels %s admission during first OAuth certificate issuance", async (scope) => {
+    const { runtime, params, session } = await setup("http://127.0.0.1:9/v1");
+    await runtime.closeTurn("main");
+    let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; });
+    let entered!: () => void; const started = new Promise<void>((resolve) => { entered = resolve; });
+    const open = ClaudeOAuthRelay.open.bind(ClaudeOAuthRelay); let certificatePath = "";
+    const mock = vi.spyOn(ClaudeOAuthRelay, "open").mockImplementation(async (root) => { entered(); await gate; const relay = await open(root); certificatePath = relay.certificatePath; return relay; });
+    try {
+      const provider = { ...params.modelProvider!, kind: "claude-code" as const };
+      const admission = runtime.begin({ ...session, modelProvider: provider }, { ...params, modelProvider: provider }, "approve-all");
+      const rejected = expect(admission).rejects.toMatchObject({ code: "ORCHESTRATION_TURN_CLOSED" });
+      await started;
+      const closing = scope === "turn" ? runtime.closeTurn("main") : runtime.close();
+      release(); await rejected; await closing;
+      expect(runtime.controller("main")).toBe(false);
+      await runtime.close();
+      await expect(readFile(certificatePath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally { release(); mock.mockRestore(); }
+  });
+  it("only grants active native Claude participants the OAuth TLS route and certificate", async () => {
+    const { runtime, socket, params, session } = await setup("http://127.0.0.1:9/v1");
+    const tunnel = () => new Promise<import("node:net").Socket>((resolve, reject) => {
+      const req = request({ socketPath: socket, method: "CONNECT", path: "platform.claude.com:443" });
+      req.on("error", reject); req.on("connect", (_res, peer) => resolve(peer)); req.end();
+    });
+    expect(runtime.environment("main").PUPPENCLAW_ORCHESTRATION_CLAUDE_OAUTH_CERT).toBeUndefined();
+    await expect(tunnel()).rejects.toThrow();
+    await runtime.closeTurn("main");
+    const provider = { ...params.modelProvider!, kind: "claude-code" as const };
+    await runtime.begin({ ...session, modelProvider: provider }, { ...params, modelProvider: provider }, "approve-all");
+    const certificatePath = runtime.environment("main").PUPPENCLAW_ORCHESTRATION_CLAUDE_OAUTH_CERT!;
+    expect(certificatePath).toMatch(/claude-oauth-[a-f0-9]{32}\.pem$/u);
+    const peer = await tunnel();
+    const tls = connectTls({ socket: peer, servername: "platform.claude.com", ca: await readFile(certificatePath), rejectUnauthorized: true });
+    await new Promise<void>((resolve, reject) => { tls.once("secureConnect", resolve); tls.once("error", reject); });
+    const reply = new Promise<string>((resolve) => { let value = ""; tls.on("data", (data) => { value += data; }); tls.on("end", () => resolve(value)); });
+    tls.end("GET /v1/messages HTTP/1.1\r\nHost: platform.claude.com\r\nConnection: close\r\n\r\n");
+    expect(await reply).toContain("403 Forbidden");
+    const stale = await tunnel(); const closed = new Promise<void>((resolve) => stale.once("close", () => resolve())); stale.resume();
+    await runtime.closeTurn("main"); await closed;
+    await expect(tunnel()).rejects.toThrow();
+  });
   it("records a bounded bulk timeout without shortening native controller requests", async () => {
     const { url } = await upstream((_req, res) => {
       const timer = setTimeout(() => {

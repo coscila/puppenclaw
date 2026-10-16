@@ -282,6 +282,7 @@ describe("DaemonSessionManager", () => {
         sessionTurnIdempotency?: unknown;
         sessionModelProviderRefresh?: boolean;
         providerFailureContracts?: unknown;
+        advancedOrchestration?: { nativeClaudeOAuthRefresh?: number };
         codexTurnPolicy?: unknown;
         codexLocalSubagents?: unknown;
         sessionOwnerCleanup?: unknown;
@@ -309,6 +310,7 @@ describe("DaemonSessionManager", () => {
         turnKeyRetention: 4096
       });
       expect(payload.sessionModelProviderRefresh).toBe(true);
+      expect(payload.advancedOrchestration?.nativeClaudeOAuthRefresh).toBe(1);
       expect(payload.providerFailureContracts).toEqual({
         version: 3,
         codes: ["PROVIDER_AUTHENTICATION_REQUIRED", "PROVIDER_CONNECTION_FAILED", "PROVIDER_AUTHENTICATION_BUSY", "PROVIDER_PAUSED"],

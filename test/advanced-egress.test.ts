@@ -19,6 +19,10 @@ function hello(): Buffer {
 const policy = () => { const p = new EgressPolicy(); vi.spyOn(p, "destination").mockResolvedValue({ address: "8.8.8.8", family: 4, hostname: "research.test" }); return p; };
 async function tunnel() { const remote = new Peer(); connectMock.mockImplementation(() => { queueMicrotask(() => remote.emit("connect")); return remote; }); const incoming = new Peer(); await proxyConnect(policy(), { url: "research.test:443" } as IncomingMessage, incoming, hello()); return { incoming, remote }; }
 describe("CONNECT peer failure isolation", () => {
+  it("denies the native OAuth authority independently of its DNS or model IP aliases", async () => {
+    const egress = new EgressPolicy();
+    await expect(egress.destination("platform.claude.com", 443)).rejects.toMatchObject({ code: "EGRESS_DENIED" });
+  });
   it("retains permanent incoming and outbound error listeners after TLS inspection", async () => {
     const { incoming, remote } = await tunnel(); expect(incoming.listenerCount("error")).toBeGreaterThan(0); expect(remote.listenerCount("error")).toBeGreaterThan(0);
     expect(() => incoming.emit("error", Object.assign(new Error("write EPIPE"), { code: "EPIPE" }))).not.toThrow(); expect(incoming.destroyed).toBe(true); expect(remote.destroyed).toBe(true);

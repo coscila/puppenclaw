@@ -16,7 +16,7 @@ export function publicAddress(address: string): boolean {
 function hostName(host: string): string { return host.toLowerCase().replace(/^\[|\]$/gu, "").replace(/\.$/u, ""); }
 /** Broker owns DNS and pins the address used by the socket; clients cannot select an alternate resolver/address. */
 export class EgressPolicy {
-  private readonly hosts = new Set(["api.anthropic.com", "api.openai.com", "chatgpt.com", "api.langdock.com"]);
+  private readonly hosts = new Set(["api.anthropic.com", "platform.claude.com", "api.openai.com", "chatgpt.com", "api.langdock.com"]);
   constructor(private readonly extraHosts: string[] = []) { for (const h of extraHosts) this.denyUrl(h); }
   denyUrl(raw: string): void { try { this.hosts.add(hostName(new URL(raw).hostname)); } catch { this.hosts.add(hostName(raw)); } }
   async destination(raw: string, port: number): Promise<{ address: string; family: number; hostname: string }> {
