@@ -293,6 +293,9 @@ if (command[0] === "prompt" && command[1] === "--session" && command[2] != null)
   } else if (normalizedInput.includes("CLAUDE_OAUTH_REFRESH_BUSY")) {
     emitError("INTERNAL_ERROR", "Internal error: Failed to refresh OAuth token: Another Claude Code process is refreshing it or exited mid-refresh. This is usually transient; retry in a minute, and if it persists close other Claude Code processes or sign in again. token=must-not-survive");
     process.exit(0);
+  } else if (normalizedInput.includes("CLAUDE_BROKER_PAUSED")) {
+    emitError("INTERNAL_ERROR", 'Internal error: API Error: 409 {"error":"Provider claude requires attention (HTTP 401); resume explicitly after access or quota recovers.","code":"PROVIDER_PAUSED"}');
+    process.exit(0);
   } else if (normalizedInput.includes("PROVIDER_CONNECTION_FAILED")) {
     emitError("CONNECTION_FAILED", "upstream connection reset");
     process.exit(0);

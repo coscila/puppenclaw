@@ -72,6 +72,10 @@ export class AdvancedRuntime {
   private readonly requests = new Map<string, { participant: RuntimeParticipant; abort: AbortController; done: Promise<void> }>();
   private readonly barriers = new Map<string, Promise<void>>();
   private readonly pausedProviders = new Map<string, string>();
+  // Native Claude owns OAuth refresh and decides whether to retry its HTTP
+  // request. Keep only a process-local digest to admit one renewed credential
+  // after a 401; never replay a prompt or persist credentials in receipts.
+  private readonly nativeOAuthRecovery = new Map<string, { rejectedTokenSha256: string; retryClaimed: boolean }>();
   private readonly observedJobs = new Set<string>();
   private readonly policy = new EgressPolicy();
   private readonly socketRoot: string;
@@ -301,6 +305,7 @@ export class AdvancedRuntime {
     if (!["paused", "interrupted", "failed", "cancelled"].includes(old.state)) throw new Error("Only settled or paused jobs can resume.");
     const config = this.worker(p, old.config.id); if (hash(config) !== hash(old.config)) throw new Error("Worker configuration changed; submit an explicit new job.");
     this.pausedProviders.delete(providerPauseKey(p, config.modelProvider.id));
+    this.nativeOAuthRecovery.delete(providerPauseKey(p, config.modelProvider.id));
     const request = old.kind === "bulk" ? { ...old.request, items: (old.request as BulkSubmit).items.filter((item) => old.results.find((r) => r.id === item.id)?.state !== "completed") } : old.request;
     if (old.kind === "bulk" && !(request as BulkSubmit).items.length) return publicJob(old);
     return this.submit(p, old.kind, { ...request, idempotencyKey: `${hash(old.idempotencyKey).slice(0, 48)}-resume-${old.jobId}` }, old.jobId);
@@ -352,7 +357,25 @@ export class AdvancedRuntime {
     const model = String(parsed.model ?? p.provider.model);
     const allowedModels = [p.provider.model].map(normalizeModel);
     if (!allowedModels.includes(normalizeModel(model))) throw new PuppenclawError("MODEL_NOT_CONFIGURED", "The requested model is not configured for this attempt.");
-    const paused = this.pausedProviders.get(providerPauseKey(p, p.provider.id)); if (paused) throw new PuppenclawError("PROVIDER_PAUSED", paused);
+    const pauseKey = providerPauseKey(p, p.provider.id);
+    const nativeOAuthDigest = p.provider.kind === "claude-code" && itemId === undefined && /^Bearer \S+$/u.test(headers.authorization ?? "")
+      ? hash(headers.authorization!) : undefined;
+    const paused = this.pausedProviders.get(pauseKey);
+    let oauthRecovery: { rejectedTokenSha256: string; retryClaimed: boolean } | undefined;
+    if (paused) {
+      const candidate = this.nativeOAuthRecovery.get(pauseKey);
+      if (!candidate || candidate.retryClaimed || nativeOAuthDigest === undefined || nativeOAuthDigest === candidate.rejectedTokenSha256) {
+        throw new PuppenclawError("PROVIDER_PAUSED", paused);
+      }
+      candidate.retryClaimed = true;
+      oauthRecovery = candidate;
+    }
+    const completeOAuthRecovery = () => {
+      if (oauthRecovery && this.nativeOAuthRecovery.get(pauseKey) === oauthRecovery) {
+        this.pausedProviders.delete(pauseKey);
+        this.nativeOAuthRecovery.delete(pauseKey);
+      }
+    };
     const requestId = randomUUID(), abort = new AbortController(), anthropic = p.provider.kind === "claude-code";
     const receipt: UsageReceipt = { version: 1, requestId, parentSessionName: p.parentSessionName, sessionName: p.sessionName, attemptId: p.attemptId,
       ...(p.jobId ? { jobId: p.jobId } : {}), ...(p.ownerKey ? { ownerKey: p.ownerKey } : {}), ...(itemId ? { itemId } : {}), providerId: p.provider.id, model, role: p.jobId ? "subagent" : "main", promptSha256: hash(bytes.toString()), state: "running", authTransport: headers.authorization ? "authorization" : headers["x-api-key"] ? "api-key" : "missing", usage: noUsage(), createdAt: timestamp(), updatedAt: timestamp() };
@@ -392,12 +415,19 @@ export class AdvancedRuntime {
       parser.finish(success); receipt.usage = parser.usage; receipt.model = parser.model ?? receipt.model; receipt.state = success ? "completed" : "failed";
       if (response.ok && !success) receipt.errorCode = parser.protocolErrorCode ?? "provider_stream_incomplete";
       if (!response.ok) { const providerError = object(object(payload)?.error); receipt.errorCode = safeErrorCode(providerError?.code) ?? safeErrorCode(providerError?.type) ?? "provider_http_error"; }
-      if ([401, 403, 429, 503].includes(response.status)) this.pausedProviders.set(providerPauseKey(p, p.provider.id), `Provider ${p.provider.id} requires attention (HTTP ${response.status}); resume explicitly after access or quota recovers.`);
+      if ([401, 403, 429, 503].includes(response.status)) {
+        this.pausedProviders.set(pauseKey, `Provider ${p.provider.id} requires attention (HTTP ${response.status}); resume explicitly after access or quota recovers.`);
+        if (response.status === 401 && nativeOAuthDigest !== undefined) {
+          // A second rejection cannot reset this recovery allowance. Concurrent
+          // requests using the old credential cannot open another retry either.
+          if (!this.nativeOAuthRecovery.has(pauseKey)) this.nativeOAuthRecovery.set(pauseKey, { rejectedTokenSha256: nativeOAuthDigest, retryClaimed: false });
+        } else this.nativeOAuthRecovery.delete(pauseKey);
+      } else if (success) completeOAuthRecovery();
       if (!counting) this.publish(receipt); downstream?.end();
       if (!success) throw new Error(response.ok ? "Provider stream did not complete successfully." : `Provider request failed with HTTP ${response.status}.`);
       return { payload, receipt };
     } catch (error) {
-      if (receipt.state === "completed") { parser.finish(true); receipt.usage = parser.usage; if (!counting) this.publish(receipt); downstream?.end(); return { payload, receipt }; }
+      if (receipt.state === "completed") { completeOAuthRecovery(); parser.finish(true); receipt.usage = parser.usage; if (!counting) this.publish(receipt); downstream?.end(); return { payload, receipt }; }
       const failure = bulkRequest?.timeoutError ?? error;
       parser.finish(false); receipt.usage = parser.usage; receipt.state = parser.protocolErrorCode ? "failed" : abort.signal.aborted ? "cancelled" : "failed"; receipt.errorCode ??= parser.protocolErrorCode ?? (abort.signal.aborted ? "request_cancelled" : safeErrorCode(object(failure)?.code) ?? safeErrorCode(object(object(failure)?.cause)?.code) ?? "transport_error"); if (!counting) this.publish(receipt); throw failure;
     }

@@ -1,7 +1,7 @@
 import type { AgentKind } from "./types.js";
 
 export type ProviderFailure = {
-  code: "PROVIDER_AUTHENTICATION_REQUIRED" | "PROVIDER_CONNECTION_FAILED" | "PROVIDER_AUTHENTICATION_BUSY";
+  code: "PROVIDER_AUTHENTICATION_REQUIRED" | "PROVIDER_CONNECTION_FAILED" | "PROVIDER_AUTHENTICATION_BUSY" | "PROVIDER_PAUSED";
   message: string;
   retryable: boolean;
 };
@@ -12,6 +12,22 @@ const CLAUDE_CONNECTION_MESSAGE =
   "Claude is temporarily unreachable because of a network or provider outage. Please retry.";
 const CLAUDE_AUTH_BUSY_MESSAGE =
   "Claude credentials are temporarily locked while another process refreshes them. Please retry shortly.";
+const CLAUDE_PAUSED_MESSAGE =
+  "The Claude broker paused this turn after a provider error. This does not establish that your saved login has expired. Retry after the provider issue is resolved.";
+
+function isBrokerPause(code: string, message: string): boolean {
+  if (code === "PROVIDER_PAUSED") return true;
+  // ACP wraps the broker's typed response in its generic internal-error event.
+  // Read that exact envelope before interpreting an earlier HTTP status quoted
+  // inside it. Arbitrary prose mentioning PROVIDER_PAUSED is not a contract.
+  const match = /^(?:Internal error:\s*)?API Error:\s*409\s+(\{[\s\S]*\})$/u.exec(message);
+  if (!match) return false;
+  try {
+    const body: unknown = JSON.parse(match[1]!);
+    return body !== null && typeof body === "object" && !Array.isArray(body) &&
+      (body as Record<string, unknown>).code === "PROVIDER_PAUSED";
+  } catch { return false; }
+}
 
 export function classifyProviderFailure(params: {
   agent: AgentKind;
@@ -21,6 +37,13 @@ export function classifyProviderFailure(params: {
 }): ProviderFailure | null {
   const code = params.code?.trim().toUpperCase() ?? "";
   const message = params.message.trim();
+  if (isBrokerPause(code, message)) {
+    return {
+      code: "PROVIDER_PAUSED",
+      message: params.agent === "claude" ? CLAUDE_PAUSED_MESSAGE : "The model broker paused this turn after a provider error. Retry after the provider issue is resolved.",
+      retryable: true
+    };
+  }
   if (params.agent === "claude") {
     const structuredAuth =
       /^(?:PROVIDER_AUTHENTICATION_REQUIRED|INVALID_GRANT|401|403|AUTH(?:ENTICATION)?(?:_ERROR|_FAILED|_REQUIRED)?|OAUTH(?:_ERROR|_EXPIRED|_INVALID)?|UNAUTHENTICATED|UNAUTHORIZED|TOKEN_(?:EXPIRED|INVALID|REVOKED)|CREDENTIALS?_(?:EXPIRED|INVALID|REVOKED))$/u.test(

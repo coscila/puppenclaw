@@ -148,6 +148,13 @@ describe("DaemonSessionManager", () => {
       code: "PROVIDER_AUTHENTICATION_BUSY",
       retryable: true,
       message: "Claude credentials are temporarily locked while another process refreshes them. Please retry shortly."
+    },
+    {
+      label: "broker-paused",
+      task: "CLAUDE_BROKER_PAUSED",
+      code: "PROVIDER_PAUSED",
+      retryable: true,
+      message: "The Claude broker paused this turn after a provider error. This does not establish that your saved login has expired. Retry after the provider issue is resolved."
     }
   ])(
     "preserves Claude $label failure parity across keyed SSE and JSON replay",
@@ -303,8 +310,8 @@ describe("DaemonSessionManager", () => {
       });
       expect(payload.sessionModelProviderRefresh).toBe(true);
       expect(payload.providerFailureContracts).toEqual({
-        version: 2,
-        codes: ["PROVIDER_AUTHENTICATION_REQUIRED", "PROVIDER_CONNECTION_FAILED", "PROVIDER_AUTHENTICATION_BUSY"],
+        version: 3,
+        codes: ["PROVIDER_AUTHENTICATION_REQUIRED", "PROVIDER_CONNECTION_FAILED", "PROVIDER_AUTHENTICATION_BUSY", "PROVIDER_PAUSED"],
         retryability: true,
         durableReplay: true
       });

@@ -142,7 +142,8 @@ function normalizeProviderError(session: Pick<SessionInfo, "agent">, error: unkn
     error instanceof PuppenclawError &&
     (error.code === "PROVIDER_AUTHENTICATION_REQUIRED" ||
       error.code === "PROVIDER_CONNECTION_FAILED" ||
-      error.code === "PROVIDER_AUTHENTICATION_BUSY")
+      error.code === "PROVIDER_AUTHENTICATION_BUSY" ||
+      error.code === "PROVIDER_PAUSED")
   ) {
     return error;
   }

@@ -398,6 +398,65 @@ describe("scoped worker broker", () => {
     const { runtime, socket, params, session } = await setup(url); expect((await unix(socket, "/native/v1/responses", { model: "test-model" })).status).toBe(401); expect((await unix(socket, "/native/v1/responses", { model: "test-model" })).status).toBe(409); expect(calls).toBe(1);
     await runtime.closeTurn("main"); await runtime.begin(session, { ...params, statisticsContext: { version: 1, chatId: "chat", attemptId: "explicit-retry" } }, "approve-all"); expect((await unix(socket, "/native/v1/responses", { model: "test-model" })).status).toBe(200); expect(calls).toBe(2); expect(runtime.store.receipts("main", "explicit-retry")[0]!.state).toBe("completed");
   });
+  it("admits one native Claude request with renewed OAuth after a 401 without replaying requests", async () => {
+    const tokens: string[] = [];
+    const { url } = await upstream((req, res) => {
+      tokens.push(req.headers.authorization ?? ""); res.setHeader("content-type", "application/json");
+      if (req.headers.authorization === "Bearer expired-fixture") { res.statusCode = 401; res.end('{"error":{"type":"authentication_error"}}'); }
+      else res.end('{"model":"test-model","usage":{"input_tokens":10,"output_tokens":2}}');
+    });
+    const { runtime, socket, params, session } = await setup(url); await runtime.closeTurn("main");
+    const provider = { ...params.modelProvider!, kind: "claude-code" as const };
+    await runtime.begin({ ...session, modelProvider: provider }, { ...params, modelProvider: provider, statisticsContext: { version: 1, chatId: "chat", attemptId: "native-refresh" } }, "approve-all");
+    const send = (token: string) => unix(socket, "/native/v1/messages", { model: "test-model", messages: [] }, { authorization: `Bearer ${token}` });
+    expect((await send("expired-fixture")).status).toBe(401);
+    expect((await send("expired-fixture")).body.code).toBe("PROVIDER_PAUSED");
+    expect(tokens).toEqual(["Bearer expired-fixture"]);
+    expect((await send("renewed-fixture")).status).toBe(200);
+    expect((await send("renewed-fixture")).status).toBe(200);
+    expect(tokens).toEqual(["Bearer expired-fixture", "Bearer renewed-fixture", "Bearer renewed-fixture"]);
+    const receipts = runtime.store.receipts("main", "native-refresh");
+    expect(receipts.map((r) => r.httpStatus)).toEqual([401, 200, 200]);
+    expect(JSON.stringify(receipts)).not.toMatch(/expired-fixture|renewed-fixture|rejectedTokenSha256/);
+  });
+  it("does not allow repeated native Claude credential changes to bypass a rejected recovery", async () => {
+    let calls = 0; const { url } = await upstream((_req, res) => { calls++; res.statusCode = 401; res.setHeader("content-type", "application/json"); res.end('{"error":{"type":"authentication_error"}}'); });
+    const { runtime, socket, params, session } = await setup(url); await runtime.closeTurn("main");
+    const provider = { ...params.modelProvider!, kind: "claude-code" as const };
+    await runtime.begin({ ...session, modelProvider: provider }, { ...params, modelProvider: provider, statisticsContext: { version: 1, chatId: "chat", attemptId: "bounded-refresh" } }, "approve-all");
+    const send = (token: string) => unix(socket, "/native/v1/messages", { model: "test-model", messages: [] }, { authorization: `Bearer ${token}` });
+    expect((await send("expired-fixture")).status).toBe(401);
+    expect((await send("renewed-fixture")).status).toBe(401);
+    expect((await send("another-fixture")).status).toBe(409);
+    expect((await send("expired-fixture")).status).toBe(409);
+    expect(calls).toBe(2);
+  });
+  it.each([403, 429, 503])("keeps native Claude HTTP %s pauses closed despite a changed credential", async (status) => {
+    let calls = 0; const { url } = await upstream((_req, res) => { calls++; res.statusCode = status; res.setHeader("content-type", "application/json"); res.end('{"error":{"type":"provider_error"}}'); });
+    const { runtime, socket, params, session } = await setup(url); await runtime.closeTurn("main");
+    const provider = { ...params.modelProvider!, kind: "claude-code" as const };
+    await runtime.begin({ ...session, modelProvider: provider }, { ...params, modelProvider: provider, statisticsContext: { version: 1, chatId: "chat", attemptId: `native-${status}` } }, "approve-all");
+    const send = (token: string) => unix(socket, "/native/v1/messages", { model: "test-model", messages: [] }, { authorization: `Bearer ${token}` });
+    expect((await send("first-fixture")).status).toBe(status);
+    expect((await send("second-fixture")).status).toBe(409);
+    expect(calls).toBe(1);
+  });
+  it("claims native OAuth recovery once while a renewed request is still in flight", async () => {
+    let release!: () => void, entered!: () => void;
+    const hold = new Promise<void>((resolve) => { release = resolve; });
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    let calls = 0;
+    const { url } = await upstream((req, res) => { calls++; res.setHeader("content-type", "application/json"); if (req.headers.authorization === "Bearer expired-fixture") { res.statusCode = 401; res.end('{"error":{"type":"authentication_error"}}'); } else { entered(); void hold.then(() => res.end('{"model":"test-model","usage":{"input_tokens":10,"output_tokens":2}}')); } });
+    const { runtime, socket, params, session } = await setup(url); await runtime.closeTurn("main");
+    const provider = { ...params.modelProvider!, kind: "claude-code" as const };
+    await runtime.begin({ ...session, modelProvider: provider }, { ...params, modelProvider: provider, statisticsContext: { version: 1, chatId: "chat", attemptId: "concurrent-refresh" } }, "approve-all");
+    const send = (token: string) => unix(socket, "/native/v1/messages", { model: "test-model", messages: [] }, { authorization: `Bearer ${token}` });
+    expect((await send("expired-fixture")).status).toBe(401);
+    const recovery = send("renewed-fixture"); await started;
+    try { expect((await send("another-fixture")).status).toBe(409); expect(calls).toBe(2); }
+    finally { release(); }
+    expect((await recovery).status).toBe(200);
+  });
   it("pins native agent workers to parent planning permissions and records actual calls", async () => {
     const { url } = await upstream((_req, res) => { res.setHeader("content-type", "application/json"); res.end('{"model":"actual-test-model","output_text":"ok","usage":{"input_tokens":10,"output_tokens":2}}'); });
     const { runtime, socket, session } = await setup(url, "plan"); let captured: any; const quiesced: string[] = [];

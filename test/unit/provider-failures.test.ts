@@ -5,6 +5,23 @@ import { classifyProviderFailure } from "../../src/shared/provider-failures.js";
 const refreshBusyMessage = "Internal error: Failed to refresh OAuth token: Another Claude Code process is refreshing it or exited mid-refresh. This is usually transient; retry in a minute, and if it persists close other Claude Code processes or sign in again.";
 
 describe("provider failure classification", () => {
+  it.each([401, 403, 429, 503])("preserves a broker pause after HTTP %s without claiming expired credentials", (status) => {
+    const envelope = JSON.stringify({ error: `Provider claude requires attention (HTTP ${status}); resume explicitly after access or quota recovers.`, code: "PROVIDER_PAUSED" });
+    for (const message of [`API Error: 409 ${envelope}`, `Internal error: API Error: 409 ${envelope}`]) {
+      expect(classifyProviderFailure({ agent: "claude", message })).toMatchObject({ code: "PROVIDER_PAUSED", retryable: true });
+      expect(classifyProviderFailure({ agent: "claude", message })?.message).not.toContain(envelope);
+    }
+    expect(classifyProviderFailure({ agent: "claude", code: "PROVIDER_PAUSED", message: `Previous request returned HTTP ${status}` })).toMatchObject({ code: "PROVIDER_PAUSED", retryable: true });
+  });
+
+  it("does not infer a broker pause from quoted words or malformed envelopes", () => {
+    for (const message of [
+      'HTTP 401; user mentioned PROVIDER_PAUSED',
+      'Internal error: API Error: 409 {"error":"HTTP 401","code":"PROVIDER_PAUSED"',
+      'Internal error: API Error: 409 {"error":"HTTP 401","code":"AUTHENTICATION_REQUIRED"}',
+    ]) expect(classifyProviderFailure({ agent: "claude", message })).toMatchObject({ code: "PROVIDER_AUTHENTICATION_REQUIRED" });
+  });
+
   it.each([
     { message: refreshBusyMessage },
     { message: refreshBusyMessage.replace("Another", "[redacted]") },

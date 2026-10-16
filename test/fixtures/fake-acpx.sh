@@ -257,6 +257,9 @@ if [[ "${command[0]:-}" == "prompt" && "${command[1]:-}" == "--session" && -n "$
   elif [[ "$normalized_input" == *"CLAUDE_OAUTH_REFRESH_BUSY"* ]]; then
     emit_error "INTERNAL_ERROR" "Internal error: Failed to refresh OAuth token: Another Claude Code process is refreshing it or exited mid-refresh. This is usually transient; retry in a minute, and if it persists close other Claude Code processes or sign in again. token=must-not-survive"
     exit 0
+  elif [[ "$normalized_input" == *"CLAUDE_BROKER_PAUSED"* ]]; then
+    emit_error 'INTERNAL_ERROR' 'Internal error: API Error: 409 {"error":"Provider claude requires attention (HTTP 401); resume explicitly after access or quota recovers.","code":"PROVIDER_PAUSED"}'
+    exit 0
   elif [[ "$normalized_input" == *"PROVIDER_CONNECTION_FAILED"* ]]; then
     emit_error "CONNECTION_FAILED" "upstream connection reset"
     exit 0
