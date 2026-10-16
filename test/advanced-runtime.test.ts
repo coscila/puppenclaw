@@ -74,6 +74,62 @@ describe("advanced usage", () => {
 });
 
 describe("scoped worker broker", () => {
+  it.each(["claude-sonnet-5", "claude-sonnet-5[1m]"])("routes and records native safety review on %s without changing a denial", async (model) => {
+    const observed: { path?: string; model?: string; beta?: string } = {};
+    const denial = { id: "classifier-denial", type: "message", role: "assistant", model: "claude-sonnet-5", content: [{ type: "text", text: "<block>true</block>" }], stop_reason: "end_turn", usage: { input_tokens: 20, output_tokens: 5 } };
+    const { url } = await upstream(async (req, res) => {
+      let text = ""; for await (const chunk of req) text += chunk;
+      observed.path = req.url ?? ""; observed.model = JSON.parse(text).model; observed.beta = String(req.headers["anthropic-beta"]);
+      res.setHeader("content-type", "application/json"); res.end(JSON.stringify(denial));
+    });
+    const { runtime, socket, params, session } = await setup(url);
+    await runtime.closeTurn("main");
+    const provider = { ...params.modelProvider!, kind: "claude-code" as const, model: "claude-sonnet-5-5" };
+    await runtime.begin({ ...session, modelProvider: provider }, { ...params, modelProvider: provider }, "approve-all");
+    const result = await unix(socket, "/native/v1/messages?beta=true", { model, messages: [{ role: "user", content: "Review a synthetic action" }], max_tokens: 32 }, { authorization: "Bearer synthetic-native-token", "anthropic-beta": "oauth-2025-04-20, auto-mode-classifier-2026-07-16" });
+    expect(result).toEqual({ status: 200, body: denial });
+    expect(observed).toMatchObject({ path: "/v1/messages?beta=true", model, beta: "oauth-2025-04-20, auto-mode-classifier-2026-07-16" });
+    const receipts = runtime.store.receipts("main", "attempt");
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0]).toMatchObject({ model: "claude-sonnet-5", providerId: "local", state: "completed", httpStatus: 200, usage: { input: 20, output: 5 } });
+    expect(params.modelProvider?.model).toBe("test-model");
+    expect(provider.model).toBe("claude-sonnet-5-5");
+  });
+  it("keeps unmatched auxiliary models, headers, routes and non-native providers blocked", async () => {
+    let requests = 0;
+    const { url } = await upstream((_req, res) => { requests++; res.end("{}"); });
+    const { runtime, socket, params, session } = await setup(url);
+    const classifierHeaders = { authorization: "Bearer synthetic-native-token", "anthropic-beta": "auto-mode-classifier-2026-07-16" };
+    const classifierBody = { model: "claude-sonnet-5", messages: [], max_tokens: 32 };
+    expect((await unix(socket, "/native/v1/messages", classifierBody, classifierHeaders)).body.code).toBe("MODEL_NOT_CONFIGURED");
+    await runtime.closeTurn("main");
+    const provider = { ...params.modelProvider!, kind: "claude-code" as const, model: "claude-sonnet-5-5" };
+    await runtime.begin({ ...session, modelProvider: provider }, { ...params, modelProvider: provider }, "approve-all");
+    for (const beta of ["", "auto-mode-classifier-2026-07-16-other", "prefix-auto-mode-classifier-2026-07-16", "auto-mode-classifier-2026-07-17"]) {
+      expect((await unix(socket, "/native/v1/messages", classifierBody, { ...classifierHeaders, "anthropic-beta": beta })).body.code).toBe("MODEL_NOT_CONFIGURED");
+    }
+    for (const model of ["claude-opus-4-8", "claude-sonnet-5[2m]", "claude-sonnet-5-other", "claude-sonnet-5[1m][1m]"]) {
+      expect((await unix(socket, "/native/v1/messages", { ...classifierBody, model }, classifierHeaders)).body.code).toBe("MODEL_NOT_CONFIGURED");
+    }
+    for (const path of ["/native/v1/responses", "/native/v1/messages/count_tokens", "/native/v1/chat/completions"]) {
+      expect((await unix(socket, path, classifierBody, classifierHeaders)).body.code).toBe("MODEL_NOT_CONFIGURED");
+    }
+    expect((await unix(socket, "/native/v1/messages", classifierBody, { "anthropic-beta": classifierHeaders["anthropic-beta"] })).body.code).toBe("MODEL_NOT_CONFIGURED");
+    expect((await unix(socket, "/native/v1/messages", classifierBody, { ...classifierHeaders, "x-api-key": "synthetic-api-key" })).body.code).toBe("PROVIDER_AUTHENTICATION_REQUIRED");
+    expect(requests).toBe(0);
+    expect(runtime.store.receipts("main", "attempt")).toHaveLength(0);
+  });
+  it("preserves classifier transport failure without manufacturing an allow verdict", async () => {
+    const unavailable = { type: "error", error: { type: "overloaded_error", message: "Synthetic classifier unavailable" } };
+    const { url } = await upstream((_req, res) => { res.writeHead(503, { "content-type": "application/json" }); res.end(JSON.stringify(unavailable)); });
+    const { runtime, socket, params, session } = await setup(url);
+    await runtime.closeTurn("main");
+    const provider = { ...params.modelProvider!, kind: "claude-code" as const, model: "claude-sonnet-5-5" };
+    await runtime.begin({ ...session, modelProvider: provider }, { ...params, modelProvider: provider }, "approve-all");
+    const result = await unix(socket, "/native/v1/messages", { model: "claude-sonnet-5", messages: [], max_tokens: 32 }, { authorization: "Bearer synthetic-native-token", "anthropic-beta": "auto-mode-classifier-2026-07-16" });
+    expect(result).toEqual({ status: 503, body: unavailable });
+    expect(runtime.store.receipts("main", "attempt")[0]).toMatchObject({ model: "claude-sonnet-5", state: "failed", httpStatus: 503, errorCode: "overloaded_error" });
+  });
   it.each(["turn", "runtime"] as const)("cancels %s admission during first OAuth certificate issuance", async (scope) => {
     const { runtime, params, session } = await setup("http://127.0.0.1:9/v1");
     await runtime.closeTurn("main");

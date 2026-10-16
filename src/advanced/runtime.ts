@@ -29,6 +29,15 @@ const safeErrorCode = (value: unknown): string | undefined => typeof value === "
 const message = (error: unknown) => redactSensitiveText(error instanceof Error ? error.message : String(error));
 const terminal = (state: string) => ["completed", "failed", "cancelled", "interrupted"].includes(state);
 const normalizeModel = (value: string) => value.replace(/\[1m\]$/u, "");
+// Claude's native auto-permission reviewer uses a separate pinned model. Admit
+// that review through the recorded transport without changing its verdict,
+// replacing the controller model, or opening other auxiliary model routes.
+function nativeSafetyClassifier(p: RuntimeParticipant, path: string, model: string, headers: Record<string, string>, native: boolean): boolean {
+  return native && p.provider.kind === "claude-code" && path.split("?")[0] === "/v1/messages"
+    && normalizeModel(model) === "claude-sonnet-5"
+    && /^Bearer \S+$/u.test(headers.authorization ?? "")
+    && (headers["anthropic-beta"] ?? "").split(",").some((beta) => beta.trim() === "auto-mode-classifier-2026-07-16");
+}
 const providerPauseKey = (p: { parentSessionName: string; attemptId: string }, providerId: string) => JSON.stringify([p.parentSessionName, p.attemptId, providerId]);
 export function aggregateUsage(parts: UsageReceipt["usage"][]): UsageReceipt["usage"] {
   const result = noUsage(); for (const key of ["input", "output", "cacheRead", "cacheWrite", "reasoning", "total"] as const) { const values = parts.map((p) => p[key]); const total = values.reduce<number>((a,b) => a + (b ?? 0), 0); result[key] = values.some((v) => v === null) || !Number.isSafeInteger(total) ? null : total; }
@@ -379,7 +388,7 @@ export class AdvancedRuntime {
     const parsed = object(JSON.parse(bytes.toString())); if (!parsed) throw new Error("Model payload must be an object.");
     const model = String(parsed.model ?? p.provider.model);
     const allowedModels = [p.provider.model].map(normalizeModel);
-    if (!allowedModels.includes(normalizeModel(model))) throw new PuppenclawError("MODEL_NOT_CONFIGURED", "The requested model is not configured for this attempt.");
+    if (!allowedModels.includes(normalizeModel(model)) && !nativeSafetyClassifier(p, path, model, headers, downstream !== undefined && itemId === undefined)) throw new PuppenclawError("MODEL_NOT_CONFIGURED", "The requested model is not configured for this attempt.");
     const pauseKey = providerPauseKey(p, p.provider.id);
     const nativeOAuthDigest = p.provider.kind === "claude-code" && itemId === undefined && /^Bearer \S+$/u.test(headers.authorization ?? "")
       ? hash(headers.authorization!) : undefined;

@@ -263,7 +263,7 @@ export async function createDaemonServer(params: {
   app.get("/capabilities", async () => ({
     ok: true,
     version: 1,
-    advancedOrchestration: { version: 1, durableJobs: true, recordedTransport: true, namespaceRequired: true, workerJoinContinuation: true, incrementalResults: true, aggregateBulkConcurrency: true, nativeClaudeOAuthRefresh: 1 },
+    advancedOrchestration: { version: 1, durableJobs: true, recordedTransport: true, namespaceRequired: true, workerJoinContinuation: true, incrementalResults: true, aggregateBulkConcurrency: true, nativeClaudeOAuthRefresh: 1, nativeClaudeSafetyClassifier: 1 },
     sessionStart: true,
     sessionStartStream: true,
     sessionSend: true,

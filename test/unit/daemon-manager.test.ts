@@ -282,7 +282,7 @@ describe("DaemonSessionManager", () => {
         sessionTurnIdempotency?: unknown;
         sessionModelProviderRefresh?: boolean;
         providerFailureContracts?: unknown;
-        advancedOrchestration?: { nativeClaudeOAuthRefresh?: number };
+        advancedOrchestration?: { nativeClaudeOAuthRefresh?: number; nativeClaudeSafetyClassifier?: number };
         codexTurnPolicy?: unknown;
         codexLocalSubagents?: unknown;
         sessionOwnerCleanup?: unknown;
@@ -311,6 +311,7 @@ describe("DaemonSessionManager", () => {
       });
       expect(payload.sessionModelProviderRefresh).toBe(true);
       expect(payload.advancedOrchestration?.nativeClaudeOAuthRefresh).toBe(1);
+      expect(payload.advancedOrchestration?.nativeClaudeSafetyClassifier).toBe(1);
       expect(payload.providerFailureContracts).toEqual({
         version: 3,
         codes: ["PROVIDER_AUTHENTICATION_REQUIRED", "PROVIDER_CONNECTION_FAILED", "PROVIDER_AUTHENTICATION_BUSY", "PROVIDER_PAUSED"],
