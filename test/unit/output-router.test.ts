@@ -119,4 +119,34 @@ describe("OutputRouter", () => {
       }
     ]);
   });
+
+  it("delivers turn-scoped subscriptions only the events of their own keyed turn", async () => {
+    const router = new OutputRouter({ info() {}, warn() {}, error() {}, debug() {} });
+    let executing: string | null = null;
+    router.setTurnKeyResolver(() => executing);
+    const session: string[] = [];
+    const turnA: string[] = [];
+    const turnB: string[] = [];
+    router.attach("demo", (event) => {
+      if (event.kind === "final") session.push(event.text);
+    });
+    router.attach("demo", (event) => {
+      if (event.kind === "final") turnA.push(event.text);
+    }, { turnKey: "a" });
+    router.attach("demo", (event) => {
+      if (event.kind === "final") turnB.push(event.text);
+    }, { turnKey: "b" });
+
+    await router.onFinal("demo", "unkeyed turn");
+    executing = "a";
+    await router.onFinal("demo", "turn a");
+    executing = "b";
+    await router.onFinal("demo", "turn b");
+    executing = null;
+
+    expect(session).toEqual(["unkeyed turn", "turn a", "turn b"]);
+    expect(turnA).toEqual(["turn a"]);
+    expect(turnB).toEqual(["turn b"]);
+  });
 });
+

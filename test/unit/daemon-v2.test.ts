@@ -210,7 +210,7 @@ describe("pcp/2 health and identity", () => {
         ok: true,
         protocol: { major: 2, minor: 0 },
         pcp: { major: 2, minor: 0 },
-        features: { health: 1, opsIdle: 1, usageLedger: 1, compactStatus: 1 },
+        features: { health: 1, opsIdle: 1, usageLedger: 1, compactStatus: 1, keyedStreaming: 1 },
         limits: { turnKeyMax: 128, ledgerPageMax: 1_000, transcriptLimitMax: 1_000, transcriptPageMax: 500 },
         providers: {
           structuredOutput: [

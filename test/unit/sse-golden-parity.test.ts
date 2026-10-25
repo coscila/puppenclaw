@@ -1,3 +1,6 @@
+import { access } from "node:fs/promises";
+import { join } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import { createDaemonServer } from "../../src/daemon/server.js";
@@ -88,6 +91,13 @@ const SCENARIOS: Scenario[] = [
   }
 ];
 
+async function exists(path: string): Promise<boolean> {
+  return await access(path).then(
+    () => true,
+    () => false
+  );
+}
+
 async function daemon(runner: Scenario["runner"]) {
   const dataDir = await createTempDir("puppenclaw-sse-golden-");
   const workspace = await createTempDir("puppenclaw-sse-golden-ws-");
@@ -157,10 +167,8 @@ describe("golden SSE sequences", () => {
     }
   });
 
-  // Keyed streaming is not implemented yet: these parity cases are expected to fail
-  // until the keyedStreaming opt-in exists, and are flipped to plain tests with it.
   for (const scenario of SCENARIOS) {
-    it.fails(`keyed start with keyedStreaming matches the unkeyed golden: ${scenario.label}`, async () => {
+    it(`keyed start with keyedStreaming matches the unkeyed golden: ${scenario.label}`, async () => {
       const { app, workspace } = await daemon(scenario.runner);
       try {
         const response = await app.inject({
@@ -181,4 +189,99 @@ describe("golden SSE sequences", () => {
       }
     });
   }
+
+  it("keyed send with keyedStreaming matches the unkeyed golden", async () => {
+    const { app, workspace } = await daemon("bash");
+    try {
+      await app.inject({
+        method: "POST",
+        url: "/session/start",
+        payload: { agent: "claude", name: "golden-keyed-send", directory: workspace, task: "prime" }
+      });
+      const response = await app.inject({
+        method: "POST",
+        url: "/session/golden-keyed-send/send/stream",
+        payload: { message: "golden reply", turnKey: "golden:send:1", keyedStreaming: true }
+      });
+      expect(normalizeSse(response.body)).toEqual(SCENARIOS[0]!.golden);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("a keyed replay streams no live output, and never another turn's", async () => {
+    const { app, workspace } = await daemon("bash");
+    const request = {
+      agent: "claude",
+      name: "golden-isolation",
+      directory: workspace,
+      task: "golden reply",
+      turnKey: "golden:isolation:1",
+      keyedStreaming: true
+    };
+    try {
+      const accepted = await app.inject({ method: "POST", url: "/session/start/stream", payload: request });
+      expect(normalizeSse(accepted.body)).toEqual(SCENARIOS[0]!.golden);
+
+      const replay = await app.inject({ method: "POST", url: "/session/start/stream", payload: request });
+      expect(normalizeSse(replay.body)).toEqual(['chunk:""', 'result:"Handled: golden reply"', "done"]);
+
+      // While a newer unkeyed turn streams, a keyed replay still shows nothing of it.
+      const newer = app.inject({
+        method: "POST",
+        url: "/session/golden-isolation/send/stream",
+        payload: { message: "SLOW_TURN newer output" }
+      });
+      const marker = join(workspace, ".fake-acpx-state", "golden-isolation.slow");
+      for (let attempt = 0; attempt < 300 && !(await exists(marker)); attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const isolated = await app.inject({ method: "POST", url: "/session/start/stream", payload: request });
+      expect(normalizeSse(isolated.body)).toEqual(['chunk:""', 'result:"Handled: golden reply"', "done"]);
+      expect(isolated.body).not.toContain("newer output");
+      await app.inject({ method: "DELETE", url: "/session/golden-isolation" });
+      await newer;
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("re-attaches a repeated keyed request to the live output of the running turn", async () => {
+    const { app, workspace } = await daemon("stream");
+    const request = {
+      agent: "claude",
+      name: "golden-reattach",
+      directory: workspace,
+      task: "STREAM_CHUNKS=24 STREAM_INTERVAL_MS=40 STREAM_CHUNK_CHARS=40",
+      turnKey: "golden:reattach:1",
+      keyedStreaming: true
+    };
+    try {
+      const first = app.inject({ method: "POST", url: "/session/start/stream", payload: request });
+      // Join once the turn runs and has produced output.
+      for (let attempt = 0; attempt < 300; attempt += 1) {
+        const status = await app.inject({ method: "GET", url: "/session/golden-reattach?view=summary" });
+        const turn = status.statusCode === 200
+          ? (JSON.parse(status.body) as { details: { turn?: { outputChars?: number } } }).details.turn
+          : undefined;
+        if ((turn?.outputChars ?? 0) > 300) {
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const second = await app.inject({ method: "POST", url: "/session/start/stream", payload: request });
+      const firstEvents = normalizeSse((await first).body);
+      const secondEvents = normalizeSse(second.body);
+      const fullText = firstEvents.filter((event) => event.startsWith("chunk:")).map((event) => JSON.parse(event.slice(6)) as string).join("");
+      const joinedText = secondEvents.filter((event) => event.startsWith("chunk:")).map((event) => JSON.parse(event.slice(6)) as string).join("");
+      expect(firstEvents.at(-2)).toMatch(/^result:/u);
+      expect(secondEvents.slice(-2)).toEqual([firstEvents.at(-2), "done"]);
+      // The second stream saw a non-empty suffix of the live output, not all of it.
+      expect(joinedText.length).toBeGreaterThan(0);
+      expect(joinedText.length).toBeLessThan(fullText.length);
+      expect(fullText.endsWith(joinedText)).toBe(true);
+    } finally {
+      await app.close();
+    }
+  });
 });

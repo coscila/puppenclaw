@@ -1459,7 +1459,13 @@ export class AcpxSessionManager implements ISessionManager {
       advanced?: AdvancedRuntime;
       runners?: RunnerRegistry;
     }
-  ) {}
+  ) {
+    // Output events are attributed to the keyed turn executing at dispatch time,
+    // which lets a keyed request stream exactly its own turn (keyedStreaming).
+    deps.outputRouter.setTurnKeyResolver?.(
+      (sessionName) => this.keyedTurnExecutions.get(sessionName)?.turnKey ?? null
+    );
+  }
 
   /** Turns admitted in this process and not yet settled (counts only, for ops and health). */
   activeTurnCount(): number {

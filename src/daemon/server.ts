@@ -79,8 +79,24 @@ import {
  * keyed-turn fingerprint.
  */
 const responseOptInsZod = {
-  resultView: z.enum(["session", "turn"]).optional()
+  resultView: z.enum(["session", "turn"]).optional(),
+  /** Keyed turns stream their own live output (capability keyedStreaming). */
+  keyedStreaming: z.boolean().optional()
 };
+
+/**
+ * Which live output a stream request receives: an unkeyed turn gets the
+ * session's output (as always); a keyed turn gets none unless it opts in, and
+ * then only the output of its own turn key.
+ */
+function streamSubscription(turnKey: string | undefined, keyedStreaming: boolean | undefined): StreamSubscription {
+  if (turnKey == null) {
+    return { mode: "session" };
+  }
+  return keyedStreaming === true ? { mode: "turn", turnKey } : { mode: "none" };
+}
+
+type StreamSubscription = { mode: "session" } | { mode: "turn"; turnKey: string } | { mode: "none" };
 const daemonStartParamsZod = startParamsZod.extend(responseOptInsZod);
 const daemonSendParamsZod = sendParamsZod.extend(responseOptInsZod);
 
@@ -449,7 +465,7 @@ export async function createDaemonServer(params: {
     streamBacklog,
     // compactStatus: status view=summary and transcriptLimit, GET /session/:name/transcript,
     // and start/send resultView=turn; every one is opt-in per request.
-    features: () => ({ health: 1, opsIdle: 1, usageLedger: 1, compactStatus: 1 }),
+    features: () => ({ health: 1, opsIdle: 1, usageLedger: 1, compactStatus: 1, keyedStreaming: 1 }),
     limits: () => ({
       turnKeyMax: 128,
       ledgerPageMax: MAX_LEDGER_PAGE_ROWS,
@@ -800,7 +816,7 @@ export async function createDaemonServer(params: {
     resultView === "turn" ? withIdentity(turnScopedResult(result)) : ok(result);
 
   app.post("/session/start", async (request) => {
-    const { resultView, ...parsed } = daemonStartParamsZod.parse(request.body);
+    const { resultView, keyedStreaming: _keyedStreaming, ...parsed } = daemonStartParamsZod.parse(request.body);
     if (parsed.ownerKey != null) {
       assertOwnerCleanupAuthentication(authToken);
     }
@@ -808,7 +824,7 @@ export async function createDaemonServer(params: {
   });
 
   app.post("/session/start/stream", async (request, reply) => {
-    const { resultView, ...parsed } = daemonStartParamsZod.parse(request.body);
+    const { resultView, keyedStreaming, ...parsed } = daemonStartParamsZod.parse(request.body);
     if (parsed.ownerKey != null) {
       assertOwnerCleanupAuthentication(authToken);
     }
@@ -818,13 +834,13 @@ export async function createDaemonServer(params: {
       outputRouter,
       identity,
       openStreams,
-      subscribeToSessionOutput: parsed.turnKey == null,
+      subscription: streamSubscription(parsed.turnKey, keyedStreaming),
       run: async () => presentTurnResult(await manager.start(parsed), resultView)
     });
   });
 
   app.post("/session/:name/send", async (request) => {
-    const { resultView, ...parsed } = daemonSendParamsZod.parse({
+    const { resultView, keyedStreaming: _keyedStreaming, ...parsed } = daemonSendParamsZod.parse({
       ...(request.body as Record<string, unknown>),
       name: (request.params as { name: string }).name
     });
@@ -832,7 +848,7 @@ export async function createDaemonServer(params: {
   });
 
   app.post("/session/:name/send/stream", async (request, reply) => {
-    const { resultView, ...parsed } = daemonSendParamsZod.parse({
+    const { resultView, keyedStreaming, ...parsed } = daemonSendParamsZod.parse({
       ...(request.body as Record<string, unknown>),
       name: (request.params as { name: string }).name
     });
@@ -842,7 +858,7 @@ export async function createDaemonServer(params: {
       outputRouter,
       identity,
       openStreams,
-      subscribeToSessionOutput: parsed.turnKey == null,
+      subscription: streamSubscription(parsed.turnKey, keyedStreaming),
       run: async () => presentTurnResult(await manager.send(parsed), resultView)
     });
   });
@@ -1317,7 +1333,7 @@ async function streamToolResult(params: {
   outputRouter: OutputRouter;
   identity: DaemonIdentity;
   openStreams: Set<OpenStream>;
-  subscribeToSessionOutput?: boolean;
+  subscription: StreamSubscription;
   run: () => Promise<ToolResult>;
 }): Promise<FastifyReply> {
   let closed = false;
@@ -1355,14 +1371,18 @@ async function streamToolResult(params: {
   };
 
   const subscription =
-    params.subscribeToSessionOutput === false
+    params.subscription.mode === "none"
       ? null
-      : params.outputRouter.attach(params.sessionName, (event) => {
-          if (event.kind === "error" && isProviderFailureCode(event.code)) {
-            emittedProviderFailureCode = event.code;
-          }
-          write(event);
-        });
+      : params.outputRouter.attach(
+          params.sessionName,
+          (event) => {
+            if (event.kind === "error" && isProviderFailureCode(event.code)) {
+              emittedProviderFailureCode = event.code;
+            }
+            write(event);
+          },
+          params.subscription.mode === "turn" ? { turnKey: params.subscription.turnKey } : {}
+        );
 
   try {
     if (subscription != null) {
