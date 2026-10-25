@@ -65,11 +65,16 @@ describe("daemon SSE with a stalled consumer", () => {
           app.inject({ method: "GET", url: "/session/lab-stall?view=summary" }),
           app.inject({ method: "GET", url: "/v2/health" })
         ]);
-        const turn = status.statusCode === 200
-          ? (JSON.parse(status.body) as { details: { session: { activeTurn?: { state: string } } } }).details.session.activeTurn
+        const details = status.statusCode === 200
+          ? (JSON.parse(status.body) as {
+              details: { session: { activeTurn?: { state: string } }; turn?: { outputChars: number } };
+            }).details
           : undefined;
+        const turn = details?.session.activeTurn;
         completed = turn?.state === "completed";
-        if (turn?.state === "running") {
+        // While the runner is still producing, only live deltas are queued; the
+        // never-dropped final and result events follow once its output is complete.
+        if (turn?.state === "running" && (details?.turn?.outputChars ?? 0) < FLOOD) {
           runningBacklog.push((JSON.parse(health.body) as { backlog: { streamBytes: number } }).backlog.streamBytes);
         }
         if (!completed) {
