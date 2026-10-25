@@ -486,10 +486,13 @@ export async function createDaemonServer(params: {
   // Deploy idle check (plan H2): counts only, no names or identifiers. The ops
   // CLI decides what blocks a deploy; the daemon only reports. Every count is
   // measured now: restart survivors (fenced sessions, leftover runner groups)
-  // count only while their processes may still be alive.
+  // count only while their processes may still be alive. Fences that record
+  // no process are reported apart: nothing to wait for, but their sessions
+  // refuse new turns until they are stopped.
   app.get("/ops/idle", async () => {
     const jobs = advanced.store.countJobsByState();
     const runnerCounts = runners.counts();
+    const fences = await manager.countRecoveryFences();
     return {
       ok: true,
       ...identityEnvelope(identity),
@@ -498,7 +501,8 @@ export async function createDaemonServer(params: {
         turnProcesses: manager.activeTurnProcessCount(),
         runnerProcesses: runnerCounts.total,
         runningTurnKeys: store.listRunningTurnRequests().length,
-        recoveryFencedSessions: await manager.countUnresolvedRecoveryFences(),
+        recoveryFencedSessions: fences.withProcess,
+        recoveryFencesWithoutProcess: fences.withoutProcess,
         brokerJobsActive: jobs.queued + jobs.running,
         brokerJobsPaused: jobs.paused,
         computeJobsActive: computeRuntime.listActiveJobs().length,

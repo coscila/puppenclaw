@@ -130,6 +130,7 @@ describe("GET /ops/idle", () => {
         runnerProcesses: 0,
         runningTurnKeys: 0,
         recoveryFencedSessions: 0,
+        recoveryFencesWithoutProcess: 0,
         brokerJobsActive: 0,
         brokerJobsPaused: 0,
         computeJobsActive: 0,
@@ -253,4 +254,37 @@ describe("GET /ops/idle", () => {
     },
     20_000
   );
+
+  it("reports a fence that records no process apart, so it holds no deploy, while its session still refuses turns", async () => {
+    const dataDir = await createTempDir("puppenclaw-ops-idle-no-process-");
+    const workspace = await createTempDir("puppenclaw-ops-idle-no-process-ws-");
+    // A session left running without turn metadata (a crash window, or a
+    // record from before turn metadata): startup fences it without a process.
+    await writeSeedState(dataDir, [seedSession("lab-no-turn", workspace, { state: "running" })]);
+    const { app } = await createDaemonServer({
+      config: makeConfig({ acpxCommand: await resolveFakeAcpxCommand(), daemonAuthToken: TOKEN }),
+      dataDir,
+      logger: { info() {}, warn() {}, error() {}, debug() {} }
+    });
+    try {
+      for (let check = 0; check < 2; check += 1) {
+        const response = await app.inject({ method: "GET", url: "/ops/idle", headers: auth });
+        expect(response.statusCode).toBe(200);
+        expect((JSON.parse(response.body) as { counts: Record<string, number> }).counts).toMatchObject({
+          recoveryFencedSessions: 0,
+          recoveryFencesWithoutProcess: 1
+        });
+      }
+      const refused = await app.inject({
+        method: "POST",
+        url: "/session/lab-no-turn/send",
+        headers: auth,
+        payload: { message: "next turn" }
+      });
+      expect(refused.statusCode).toBeGreaterThanOrEqual(400);
+      expect(refused.body).toContain("RECOVERY_FENCE_ACTIVE");
+    } finally {
+      await app.close();
+    }
+  }, 20_000);
 });

@@ -430,8 +430,11 @@ set; none of them is added to the open `/health` and `/capabilities`.
   turn and runner processes, running turn keys, active and paused broker jobs,
   active compute jobs, open streams). Restart survivors count only while their
   processes may still be alive: `recoveryFencedSessions` (sessions fenced after a
-  restart whose recorded process is not proven gone) and `leftoverRunnerGroups`
-  (runner groups of earlier boots still running).
+  restart whose recorded process is not proven gone; the next dispatch clears
+  the fence once it is) and `leftoverRunnerGroups` (runner groups of earlier
+  boots still running). `recoveryFencesWithoutProcess` counts fences that record
+  no process (missing turn metadata or pid): there is nothing to wait for, but
+  such a session refuses new turns (`RECOVERY_FENCE_ACTIVE`) until it is stopped.
 - `GET /session/:name?view=summary` and `GET /sessions?view=summary`: the
   session without its transcript (plus `transcriptSummary`) and without the
   `acpx status` probe. `transcriptLimit=N` (0–1000) keeps the newest N entries

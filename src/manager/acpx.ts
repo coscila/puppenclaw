@@ -1478,22 +1478,29 @@ export class AcpxSessionManager implements ISessionManager {
   }
 
   /**
-   * Sessions fenced after a restart whose recorded process is not proven gone
-   * (GET /ops/idle). A fence stays persisted until the next dispatch or stop
-   * clears it, so one whose process has exited is no longer activity; a fence
-   * without a recorded process cannot be proven gone and keeps counting.
+   * Sessions fenced after a restart (GET /ops/idle), by what the daemon can
+   * watch. `withProcess`: the fence records a process that is not proven gone,
+   * which is activity a deploy waits for; once that process exits it no
+   * longer counts, and the next dispatch clears the fence. `withoutProcess`:
+   * the fence records no process (missing turn metadata or pid), so there is
+   * nothing to wait for, but the fence keeps refusing the session's next turn
+   * (RECOVERY_FENCE_ACTIVE) until an explicit stop resolves it.
    */
-  async countUnresolvedRecoveryFences(): Promise<number> {
-    let unresolved = 0;
+  async countRecoveryFences(): Promise<{ withProcess: number; withoutProcess: number }> {
+    let withProcess = 0;
+    let withoutProcess = 0;
     for (const session of this.deps.store.listSessions()) {
-      if (
-        session.recoveryFence != null &&
-        !(await this.isRecoveredProcessDefinitelyGone(session.recoveryFence))
-      ) {
-        unresolved += 1;
+      const fence = session.recoveryFence;
+      if (fence == null) {
+        continue;
+      }
+      if (fence.pid == null) {
+        withoutProcess += 1;
+      } else if (!(await this.isRecoveredProcessDefinitelyGone(fence))) {
+        withProcess += 1;
       }
     }
-    return unresolved;
+    return { withProcess, withoutProcess };
   }
 
   private recordTurnUsage(session: SessionInfo, turn: TurnResult): void {
