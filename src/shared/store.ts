@@ -39,6 +39,20 @@ import {
 
 const OWNER_LEASE_VERSION = 1 as const;
 const OWNER_LEASE_FILE = ".state-owner.json";
+/**
+ * Identity of the persisted in-flight state ("spool"). It changes whenever the
+ * state is replaced instead of continued: a fresh data directory, a recovery
+ * reset, or state that could not be loaded. Consumers treat a new spoolId as
+ * the loss of every turn the previous spool held.
+ */
+const SPOOL_FILE = "spool.json";
+const spoolRecordZod = z
+  .object({
+    version: z.literal(1),
+    spoolId: z.string().uuid(),
+    createdAt: z.string().min(1)
+  })
+  .strict();
 /** Full terminal outcomes retained per logical session. Older identities become tombstones. */
 export const MAX_TURN_REQUEST_OUTCOMES_PER_SESSION = 64;
 export const MAX_TURN_REQUEST_IDENTITIES_PER_SESSION = 4_096;
@@ -709,12 +723,14 @@ function freshState(): StoredState {
 export class SessionStore {
   private mutationTail: Promise<void> = Promise.resolve();
   private closed = false;
+  private pendingMutations = 0;
 
   private constructor(
     readonly rootDir: string,
     private state: StoredState,
     private recovery: StateRecoveryStatus,
-    private readonly ownerLease: OwnerLease
+    private readonly ownerLease: OwnerLease,
+    private spool: { id: string; persisted: boolean }
   ) {}
 
   static async open(rootDir: string): Promise<SessionStore> {
@@ -728,11 +744,32 @@ export class SessionStore {
           }
         });
       }
-      return new SessionStore(rootDir, loaded.state, loaded.recovery, ownerLease);
+      // Continued state keeps its spool identity. A fresh or unreadable state
+      // starts a new spool; it is written with the first state write (fresh) or
+      // the operator reset (recovery), so opening alone never adds files.
+      let spool: { id: string; persisted: boolean } = { id: randomUUID(), persisted: false };
+      if (loaded.origin === "loaded") {
+        const existing = await readSpoolId(join(rootDir, SPOOL_FILE));
+        spool =
+          existing != null
+            ? { id: existing, persisted: true }
+            : { id: await writeSpoolRecord(join(rootDir, SPOOL_FILE), spool.id), persisted: true };
+      }
+      return new SessionStore(rootDir, loaded.state, loaded.recovery, ownerLease, spool);
     } catch (error) {
       await releaseOwnerLease(rootDir, ownerLease);
       throw error;
     }
+  }
+
+  /** Identity of the persisted in-flight state; see SPOOL_FILE. */
+  get spoolId(): string {
+    return this.spool.id;
+  }
+
+  /** Mutations accepted but not yet durably written (a backlog signal for health). */
+  get pendingMutationCount(): number {
+    return this.pendingMutations;
   }
 
   get statePath(): string {
@@ -753,7 +790,9 @@ export class SessionStore {
     }
     await this.enqueueMutation(async () => {
       const nextState = freshState();
+      const spoolId = await writeSpoolRecord(join(this.rootDir, SPOOL_FILE), randomUUID());
       await writeJsonFileAtomic(this.statePath, nextState, { mode: 0o600 });
+      this.spool = { id: spoolId, persisted: true };
       this.state = nextState;
       this.recovery = { required: false };
     });
@@ -1351,20 +1390,35 @@ export class SessionStore {
 
   private async mutate<T>(mutator: (state: StoredState) => T): Promise<T> {
     this.assertWritable();
-    return await this.enqueueMutation(async () => {
-      const nextState = structuredClone(this.state);
-      const result = mutator(nextState);
-      const validated = storedStateZod.safeParse(nextState);
-      if (!validated.success) {
-        throw new PuppenclawError(
-          "INVALID_STATE_MUTATION",
-          `Refusing to persist invalid session state: ${z.prettifyError(validated.error)}`
-        );
-      }
-      await writeJsonFileAtomic(this.statePath, nextState, { mode: 0o600 });
-      this.state = nextState;
-      return result;
-    });
+    this.pendingMutations += 1;
+    try {
+      return await this.enqueueMutation(async () => {
+        const nextState = structuredClone(this.state);
+        const result = mutator(nextState);
+        const validated = storedStateZod.safeParse(nextState);
+        if (!validated.success) {
+          throw new PuppenclawError(
+            "INVALID_STATE_MUTATION",
+            `Refusing to persist invalid session state: ${z.prettifyError(validated.error)}`
+          );
+        }
+        await this.persistSpoolIdentity();
+        await writeJsonFileAtomic(this.statePath, nextState, { mode: 0o600 });
+        this.state = nextState;
+        return result;
+      });
+    } finally {
+      this.pendingMutations -= 1;
+    }
+  }
+
+  /** A fresh spool is written just before its first state write. */
+  private async persistSpoolIdentity(): Promise<void> {
+    if (this.spool.persisted) {
+      return;
+    }
+    await writeSpoolRecord(join(this.rootDir, SPOOL_FILE), this.spool.id);
+    this.spool = { id: this.spool.id, persisted: true };
   }
 
   private async enqueueMutation<T>(run: () => Promise<T>): Promise<T> {
@@ -1394,16 +1448,31 @@ export class SessionStore {
   }
 }
 
+async function readSpoolId(path: string): Promise<string | null> {
+  try {
+    const parsed = spoolRecordZod.safeParse(JSON.parse(await readFile(path, "utf8")) as unknown);
+    return parsed.success ? parsed.data.spoolId : null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeSpoolRecord(path: string, spoolId: string): Promise<string> {
+  await writeJsonFileAtomic(path, { version: 1, spoolId, createdAt: nowIso() }, { mode: 0o600 });
+  return spoolId;
+}
+
 async function loadStoredState(statePath: string): Promise<{
   state: StoredState;
   recovery: StateRecoveryStatus;
+  origin: "fresh" | "loaded" | "recovery";
 }> {
   let raw: string;
   try {
     raw = await readFile(statePath, "utf8");
   } catch (error) {
     if (isNodeError(error, "ENOENT")) {
-      return { state: freshState(), recovery: { required: false } };
+      return { state: freshState(), recovery: { required: false }, origin: "fresh" };
     }
     return await recoveryState({
       statePath,
@@ -1438,7 +1507,8 @@ async function loadStoredState(statePath: string): Promise<{
         sessionOwners: validated.data.sessionOwners,
         ownerCleanup: validated.data.ownerCleanup
       },
-      recovery: { required: false }
+      recovery: { required: false },
+      origin: "loaded"
     };
   }
   const version =
@@ -1509,7 +1579,7 @@ async function recoveryState(params: {
   reason: Extract<StateRecoveryStatus, { required: true }>['reason'];
   message: string;
   quarantine: boolean;
-}): Promise<{ state: StoredState; recovery: StateRecoveryStatus }> {
+}): Promise<{ state: StoredState; recovery: StateRecoveryStatus; origin: "recovery" }> {
   const quarantinePath = params.quarantine ? await quarantineFile(params.statePath) : null;
   const detectedAt = nowIso();
   const recovery: StateRecoveryStatus = {
@@ -1524,7 +1594,7 @@ async function recoveryState(params: {
       quarantinePath != null ? `; previous state was preserved at ${quarantinePath}` : ""
     }.`
   );
-  return { state: freshState(), recovery };
+  return { state: freshState(), recovery, origin: "recovery" };
 }
 
 async function acquireOwnerLease(rootDir: string): Promise<OwnerLease> {

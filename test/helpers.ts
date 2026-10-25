@@ -90,3 +90,54 @@ export function nodeStdinToNullAndPrintCommand(text: string): string {
 function base64(value: string): string {
   return Buffer.from(value, "utf8").toString("base64");
 }
+
+/** A minimal persisted session as SessionStore validates it. */
+export function seedSession(
+  name: string,
+  directory: string,
+  overrides: Record<string, unknown> = {}
+): Record<string, unknown> {
+  const at = "2026-10-25T10:00:00.000Z";
+  return {
+    name,
+    agent: "claude",
+    directory,
+    state: "idle",
+    createdAt: at,
+    lastActivity: at,
+    permissionMode: "approve-reads",
+    warnings: [],
+    transcript: [],
+    ...overrides
+  };
+}
+
+/** Seeds `<dataDir>/state.json` with the given sessions (keyed by name). */
+export async function writeSeedState(
+  dataDir: string,
+  sessions: Array<Record<string, unknown>>
+): Promise<void> {
+  const { writeFile } = await import("node:fs/promises");
+  await writeFile(
+    join(dataDir, "state.json"),
+    JSON.stringify({
+      version: 1,
+      sessions: Object.fromEntries(sessions.map((session) => [session.name as string, session])),
+      turnRequests: {},
+      turnGenerations: {},
+      exposures: {},
+      quiescence: { lastEpoch: 0, active: {}, latestByName: {} }
+    }),
+    "utf8"
+  );
+}
+
+/** `count` transcript entries of `chars` characters each, alternating user and assistant. */
+export function seedTranscript(count: number, chars: number, turnId?: string): Array<Record<string, unknown>> {
+  return Array.from({ length: count }, (_, index) => ({
+    role: index % 2 === 0 ? "user" : "assistant",
+    text: `${index}:`.padEnd(chars, "x"),
+    createdAt: new Date(Date.parse("2026-10-25T10:00:00.000Z") + index * 1_000).toISOString(),
+    ...(turnId != null ? { turnId } : {})
+  }));
+}

@@ -60,6 +60,12 @@ import {
 } from "../shared/schema.js";
 import type { ParsedPluginConfig, StateRecoveryStatus, ToolResult } from "../shared/types.js";
 import { ensureDir, redactSensitiveText } from "../shared/utils.js";
+import { EventLoopMonitor } from "./event-loop.js";
+import { identityHeaders, resolveBuildId, type DaemonIdentity } from "./identity.js";
+import { registerV2Routes, type StreamBacklog } from "./v2.js";
+
+/** Live SSE responses; their queued backlog is reported by /v2/health and /ops/idle. */
+type OpenStream = { pendingEvents: number; pendingBytes: number };
 
 export async function createDaemonServer(params: {
   config: ParsedPluginConfig;
@@ -134,6 +140,34 @@ export async function createDaemonServer(params: {
   const store = await SessionStore.open(params.dataDir);
   const bootId = randomUUID();
   const reaperMode = bootReaperModeFromEnv();
+  const startedAtMs = Date.now();
+  const identity: DaemonIdentity = {
+    bootId,
+    build: await resolveBuildId(),
+    startedAt: new Date(startedAtMs).toISOString(),
+    startedAtMs,
+    spoolId: () => store.spoolId
+  };
+  // Identity headers on every response, v1 included: headers cannot break a
+  // JSON consumer, so old labs are unaffected.
+  app.addHook("onSend", async (_request, reply, payload) => {
+    for (const [name, value] of Object.entries(identityHeaders(identity))) {
+      reply.header(name, value);
+    }
+    return payload;
+  });
+  const eventLoop = new EventLoopMonitor();
+  eventLoop.start();
+  const openStreams = new Set<OpenStream>();
+  const streamBacklog = (): StreamBacklog => {
+    let events = 0;
+    let bytes = 0;
+    for (const stream of openStreams) {
+      events += stream.pendingEvents;
+      bytes += stream.pendingBytes;
+    }
+    return { streams: openStreams.size, events, bytes };
+  };
   app.addHook("onRequest", async (request) => {
     if (
       request.method === "GET" ||
@@ -258,6 +292,7 @@ export async function createDaemonServer(params: {
         bootReap
       };
     } catch (error) {
+      eventLoop.stop();
       resourceMonitor?.close();
       await advanced?.close();
       await statistics?.close();
@@ -380,6 +415,17 @@ export async function createDaemonServer(params: {
     defaultAgent: params.config.defaultAgent
   }));
 
+  registerV2Routes(app, {
+    identity,
+    eventLoop,
+    recoveryRequired: () => store.getRecoveryStatus().required,
+    activeTurns: () => manager.activeTurnCount(),
+    pendingStateWrites: () => store.pendingMutationCount,
+    streamBacklog,
+    features: () => ({ health: 1 }),
+    limits: () => ({ turnKeyMax: 128 })
+  });
+
   app.get("/compute/capacity", async () => computeRuntime.capacity());
 
   app.post("/compute/jobs", async (request, reply) => {
@@ -411,6 +457,7 @@ export async function createDaemonServer(params: {
   });
 
   app.addHook("onClose", async () => {
+    eventLoop.stop();
     resourceMonitor.close();
     await advanced.close();
     await statistics.close();
@@ -650,6 +697,8 @@ export async function createDaemonServer(params: {
       reply,
       sessionName: parsed.name,
       outputRouter,
+      identity,
+      openStreams,
       subscribeToSessionOutput: parsed.turnKey == null,
       run: async () => ok(await manager.start(parsed))
     });
@@ -675,6 +724,8 @@ export async function createDaemonServer(params: {
       reply,
       sessionName: parsed.name,
       outputRouter,
+      identity,
+      openStreams,
       subscribeToSessionOutput: parsed.turnKey == null,
       run: async () => ok(await manager.send(parsed))
     });
@@ -1148,19 +1199,25 @@ async function streamToolResult(params: {
   reply: FastifyReply;
   sessionName: string;
   outputRouter: OutputRouter;
+  identity: DaemonIdentity;
+  openStreams: Set<OpenStream>;
   subscribeToSessionOutput?: boolean;
   run: () => Promise<ToolResult>;
 }): Promise<FastifyReply> {
   let closed = false;
   let emittedProviderFailureCode: string | null = null;
+  const openStream: OpenStream = { pendingEvents: 0, pendingBytes: 0 };
+  params.openStreams.add(openStream);
   params.reply.raw.on("close", () => {
     closed = true;
+    params.openStreams.delete(openStream);
   });
   params.reply.raw.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",
     "cache-control": "no-cache, no-transform",
     connection: "keep-alive",
-    "x-accel-buffering": "no"
+    "x-accel-buffering": "no",
+    ...identityHeaders(params.identity)
   });
 
   const heartbeat = setInterval(() => {
@@ -1225,6 +1282,7 @@ async function streamToolResult(params: {
     });
     write({ kind: "done" });
   } finally {
+    params.openStreams.delete(openStream);
     clearInterval(heartbeat);
     // Identity-guarded: only removes this stream's own subscription, so a
     // racing second stream (e.g. rejected with TURN_ALREADY_RUNNING) can
