@@ -25,7 +25,7 @@ export function readProviderUsage(raw: unknown, previous: StatisticsTokens, anth
   return result;
 }
 export class UsageParser {
-  usage = noUsage(); model: string | null = null; private tail = ""; private streaming = false; private complete = false; private failure: string | null = null;
+  usage = noUsage(); model: string | null = null; systemFingerprint: string | null = null; private tail = ""; private streaming = false; private complete = false; private failure: string | null = null;
   constructor(private readonly anthropic: boolean) {}
   get protocolComplete(): boolean { return this.complete && this.failure === null; }
   get protocolErrorCode(): string | null { return this.failure; }
@@ -39,6 +39,8 @@ export class UsageParser {
     }
     const source = response ?? message ?? o;
     if (typeof source.model === "string") this.model = source.model;
+    const fingerprint = source.system_fingerprint ?? o.system_fingerprint;
+    if (typeof fingerprint === "string" && /^[\x21-\x7e]{1,200}$/u.test(fingerprint)) this.systemFingerprint = fingerprint;
     this.usage = readProviderUsage(source.usage, this.usage, this.anthropic);
     if (source !== o) this.usage = readProviderUsage(o.usage, this.usage, this.anthropic);
   }

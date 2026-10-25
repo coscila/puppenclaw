@@ -182,11 +182,14 @@ describe("scoped worker broker", () => {
     });
     const previous = process.env.PUPPENCLAW_BULK_RESPONSE_TIMEOUT_MS;
     process.env.PUPPENCLAW_BULK_RESPONSE_TIMEOUT_MS = "60";
+    // One attempt: a timeout is retryable, and broker retries are covered by their own tests.
+    process.env.PUPPENCLAW_BULK_RETRY_ATTEMPTS = "1";
     let configured: Awaited<ReturnType<typeof setup>>;
     try { configured = await setup(url); }
     finally {
       if (previous === undefined) delete process.env.PUPPENCLAW_BULK_RESPONSE_TIMEOUT_MS;
       else process.env.PUPPENCLAW_BULK_RESPONSE_TIMEOUT_MS = previous;
+      delete process.env.PUPPENCLAW_BULK_RETRY_ATTEMPTS;
     }
     const { runtime, socket } = configured;
     const submitted = (await unix(socket, "/bulk/submit", { configId: "refs", idempotencyKey: "bounded-response", items: [{ id: "one", input: "Review" }] })).body;
@@ -207,11 +210,13 @@ describe("scoped worker broker", () => {
     });
     const previous = process.env.PUPPENCLAW_BULK_RESPONSE_TIMEOUT_MS;
     process.env.PUPPENCLAW_BULK_RESPONSE_TIMEOUT_MS = "100";
+    process.env.PUPPENCLAW_BULK_RETRY_ATTEMPTS = "1";
     let configured: Awaited<ReturnType<typeof setup>>;
     try { configured = await setup(url, "execute", { defaultLimit: 1 }); }
     finally {
       if (previous === undefined) delete process.env.PUPPENCLAW_BULK_RESPONSE_TIMEOUT_MS;
       else process.env.PUPPENCLAW_BULK_RESPONSE_TIMEOUT_MS = previous;
+      delete process.env.PUPPENCLAW_BULK_RETRY_ATTEMPTS;
     }
     const submitted = (await unix(configured.socket, "/bulk/submit", {
       configId: "refs", idempotencyKey: "queue-time-excluded", concurrency: 2,
@@ -571,7 +576,11 @@ describe("scoped worker broker", () => {
     const started = new Promise<void>((done) => { entered = done; }); const held = new Promise<void>((done) => { finish = done; }); const quiesced: string[] = [];
     runtime.attach({ start: async () => { entered(); await held; return { content: [{ type: "text", text: "secret" }], details: {} }; }, quiesce: async (name) => { quiesced.push(name); finish(); }, getSession: () => session, contribution: () => {} });
     const agent = (await unix(socket, "/agent/submit", { configId: "refs", idempotencyKey: "held", task: "secret-task" })).body; await started; await runtime.closeTurn("main"); expect(runtime.store.job(agent.jobId)!.state).toBe("cancelled"); expect(quiesced).toHaveLength(1);
-    await runtime.purge("main"); expect(runtime.jobs("main")).toEqual([]); expect(runtime.store.receipts("main")).toEqual([]); expect(runtime.socket("main")).toBeUndefined();
+    await runtime.purge("main"); expect(runtime.socket("main")).toBeUndefined();
+    // Its outbox rows are not acknowledged yet, so the job waits for the feed before it is erased.
+    expect(runtime.store.deferredPurges()).toEqual([agent.jobId]);
+    runtime.store.ack(runtime.store.feedId, runtime.store.head());
+    expect(runtime.jobs("main")).toEqual([]); expect(runtime.store.receipts("main")).toEqual([]); expect(runtime.store.deferredPurges()).toEqual([]);
   });
   it("rejects old child sockets after a new parent attempt starts", async () => {
     const { url } = await upstream((_req, res) => res.end('{}')); const { runtime, socket, params, session } = await setup(url); let child!: string;
@@ -580,7 +589,14 @@ describe("scoped worker broker", () => {
   });
   it("recovers ambiguous jobs without automatic redispatch and keeps completed item results", async () => {
     const dir = await root(); let store = await AdvancedStore.open(dir); const now = new Date().toISOString(); const job: WorkerJob = { jobId: "job", kind: "bulk", state: "running", parentSessionName: "main", attemptId: "attempt", configRevision: 1, config: { id: "refs", assignment: "sources", agent: "codex", modelProvider: { id: "local", model: "test", kind: "codex-openai-compatible" } }, idempotencyKey: "key", fingerprint: "fingerprint", createdAt: now, updatedAt: now, request: { configId: "refs", idempotencyKey: "key", items: [{ id: "one", input: "x" }, { id: "two", input: "y" }], concurrency: 1 }, results: ["completed", "running"].map((state, i) => ({ id: ["one", "two"][i]!, state: state as "completed" | "running", providerId: "local", model: "test", promptSha256: "hash", usage: null })) };
-    store.putJob(job); store.close(); store = await AdvancedStore.open(dir); expect(store.recover()).toEqual([]); expect(store.job("job")!.state).toBe("interrupted"); expect(store.job("job")!.results.map((r) => r.state)).toEqual(["completed", "interrupted"]); expect(store.duplicate("main", "attempt", "key")!.jobId).toBe("job"); store.close();
+    // A job written by P1: its unsettled bulk item is requeued (inference is side-effect free) and
+    // the chat-attempt job waits for an explicit resume, since its parent turn ended with the restart.
+    store.putJob(job); store.close(); store = await AdvancedStore.open(dir); expect(store.recover()).toEqual([]); expect(store.job("job")!.state).toBe("interrupted"); expect(store.job("job")!.results.map((r) => r.state)).toEqual(["completed", "queued"]); expect(store.lastRecovery).toEqual({ requeued: ["job"], relaunch: [] }); expect(store.duplicate("main", "attempt", "key")!.jobId).toBe("job"); store.close();
+    // The same job as written before P1 keeps the old behaviour: ambiguous work is never replayed.
+    const legacy = { ...job, jobId: "legacy", idempotencyKey: "legacy-key" };
+    store = await AdvancedStore.open(dir); store.putJob(legacy); store.flush(); store.close();
+    const { DatabaseSync } = await import(`node${":sqlite"}`); const raw = new DatabaseSync(join(dir, "advanced.sqlite")); raw.prepare("UPDATE jobs SET storage_version=1 WHERE id='legacy'").run(); raw.close();
+    store = await AdvancedStore.open(dir); store.recover(); expect(store.job("legacy")!.results.map((r) => r.state)).toEqual(["completed", "interrupted"]); expect(store.lastRecovery.requeued).toEqual([]); store.close();
   });
   it("rejects private, numeric transition and multicast egress addresses", () => { for (const address of ["127.0.0.1", "10.2.3.4", "169.254.169.254", "::1", "::ffff:c0a8:1", "2002:c0a8:0101::", "fc00::1", "ff02::1"]) expect(publicAddress(address)).toBe(false); expect(publicAddress("8.8.8.8")).toBe(true); expect(publicAddress("2606:4700::1111")).toBe(true); });
 });

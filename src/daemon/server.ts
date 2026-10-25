@@ -1,4 +1,6 @@
 import { AdvancedRuntime } from "../advanced/runtime.js";
+import { AdvancedMaintenance, maintenanceFromEnvironment } from "../advanced/maintenance.js";
+import type { UsageReceipt } from "../advanced/types.js";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { join } from "node:path";
 
@@ -63,6 +65,8 @@ import { ensureDir, redactSensitiveText } from "../shared/utils.js";
 import { EventLoopMonitor } from "./event-loop.js";
 import { identityEnvelope, identityHeaders, resolveBuildId, type DaemonIdentity } from "./identity.js";
 import { registerV2Routes, type StreamBacklog } from "./v2.js";
+import { registerV2BrokerRoutes } from "./v2-broker.js";
+import { EVENT_PAGE_MAX, EVENT_WAIT_MAX_MS, INLINE_OUTPUT_MAX_BYTES } from "../advanced/outbox.js";
 import { SseEventStream, sseMaxPendingBytesFromEnv, type SseEvent } from "./sse.js";
 import {
   compactOutputView,
@@ -236,6 +240,7 @@ export async function createDaemonServer(params: {
     let resourceMonitor: ResourceMonitor | undefined;
     let statistics: TurnStatisticsRecorder | undefined;
     let advanced: AdvancedRuntime | undefined;
+    let maintenance: AdvancedMaintenance | undefined;
     try {
       // The owner lease is held, so every leftover record belongs to a dead
       // daemon. Reap before reconciliation so killed runners read as orphaned.
@@ -274,7 +279,16 @@ export async function createDaemonServer(params: {
       });
       resourceMonitor.start();
       const outputRouter = new OutputRouter(logger);
-      advanced = await AdvancedRuntime.open(join(params.dataDir, "advanced"));
+      advanced = await AdvancedRuntime.open(join(params.dataDir, "advanced"), undefined, { store: { warn: (code) => logger.warn(code) } });
+      /** The usage-ledger row of a settled broker call with measured usage (ids keep it unique). */
+      const brokerLedgerEntry = (receipt: UsageReceipt) => {
+        if (receipt.state === "running" || receipt.usage.input === null || receipt.usage.output === null) return null;
+        const session = store.getSession(receipt.sessionName) ?? store.getSession(receipt.parentSessionName);
+        if (!session) return null;
+        return { id: `advanced-${receipt.requestId}`, sessionName: receipt.parentSessionName, agent: session.agent, provider: receipt.providerId, model: receipt.model,
+          usage: { input: Math.max(0, receipt.usage.input - (receipt.usage.cacheRead ?? 0) - (receipt.usage.cacheWrite ?? 0)), output: receipt.usage.output, cacheRead: receipt.usage.cacheRead ?? 0, cacheWrite: receipt.usage.cacheWrite ?? 0, total: receipt.usage.total ?? receipt.usage.input + receipt.usage.output },
+          durationMs: Date.parse(receipt.updatedAt) - Date.parse(receipt.createdAt), timestamp: receipt.updatedAt, turnId: receipt.attemptId, role: receipt.role, threads: 1 };
+      };
       const manager = new AcpxSessionManager({
         config: {
           ...params.config,
@@ -294,12 +308,15 @@ export async function createDaemonServer(params: {
         getSession: (name) => store.getSession(name), getOwner: (name) => store.getSessionOwner(name) ?? undefined,
         contribution: (receipt) => {
           statistics!.observeBrokerReceipt(receipt.parentSessionName, receipt);
-          if (receipt.state === "running" || receipt.usage.input === null || receipt.usage.output === null) return;
-          const session = store.getSession(receipt.sessionName) ?? store.getSession(receipt.parentSessionName);
-          if (!session) return;
-          usageLedger!.append({ id: `advanced-${receipt.requestId}`, sessionName: receipt.parentSessionName, agent: session.agent, provider: receipt.providerId, model: receipt.model,
-            usage: { input: Math.max(0, receipt.usage.input - (receipt.usage.cacheRead ?? 0) - (receipt.usage.cacheWrite ?? 0)), output: receipt.usage.output, cacheRead: receipt.usage.cacheRead ?? 0, cacheWrite: receipt.usage.cacheWrite ?? 0, total: receipt.usage.total ?? receipt.usage.input + receipt.usage.output },
-            durationMs: Date.parse(receipt.updatedAt) - Date.parse(receipt.createdAt), timestamp: receipt.updatedAt, turnId: receipt.attemptId, role: receipt.role, threads: 1 });
+          const entry = brokerLedgerEntry(receipt);
+          if (entry) usageLedger!.append(entry);
+        },
+        // Bulk batches: one statistics checkpoint per session and one ledger transaction per batch.
+        contributions: (receipts) => {
+          const bySession = new Map<string, typeof receipts>();
+          for (const receipt of receipts) bySession.set(receipt.parentSessionName, [...bySession.get(receipt.parentSessionName) ?? [], receipt]);
+          for (const [name, list] of bySession) statistics!.observeBrokerReceipts(name, list);
+          usageLedger!.appendMany(receipts.flatMap((receipt) => brokerLedgerEntry(receipt) ?? []));
         },
       });
       const runningAtBoot = store
@@ -311,6 +328,9 @@ export async function createDaemonServer(params: {
         await manager.cancelInterruptedRuntimeTurns(runningAtBoot);
       }
       await advanced.recover();
+      // Opt-in only: archive and event retention stay off unless their env settings are present.
+      maintenance = new AdvancedMaintenance(advanced.store, maintenanceFromEnvironment(), (line) => logger.info(line));
+      maintenance.start();
       const orchestrator = new OrchestratorRuntime({
         config: {
           ...params.config,
@@ -329,6 +349,7 @@ export async function createDaemonServer(params: {
         resourceMonitor,
         statistics,
         advanced,
+        maintenance,
         outputRouter,
         manager,
         orchestrator,
@@ -337,6 +358,7 @@ export async function createDaemonServer(params: {
     } catch (error) {
       eventLoop.stop();
       resourceMonitor?.close();
+      await maintenance?.stop();
       await advanced?.close();
       await statistics?.close();
       computeRuntime?.close();
@@ -353,6 +375,7 @@ export async function createDaemonServer(params: {
     resourceMonitor,
     statistics,
     advanced,
+    maintenance,
     outputRouter,
     manager,
     orchestrator,
@@ -466,22 +489,31 @@ export async function createDaemonServer(params: {
     streamBacklog,
     // compactStatus: status view=summary and transcriptLimit, GET /session/:name/transcript,
     // and start/send resultView=turn; every one is opt-in per request.
+    // eventFeed/brokerOutbox: GET /v2/events and POST /v2/events/ack over the broker
+    // outbox; instrumentMode: PUT|GET /v2/instruments and bulk jobs naming a digest.
     features: () => ({
       health: 1,
       opsIdle: 1,
       usageLedger: 1,
       compactStatus: 1,
       keyedStreaming: 1,
-      sseGap: 1
+      sseGap: 1,
+      eventFeed: 1,
+      brokerOutbox: 1,
+      instrumentMode: 1
     }),
     limits: () => ({
       turnKeyMax: 128,
       ledgerPageMax: MAX_LEDGER_PAGE_ROWS,
       transcriptLimitMax: MAX_TRANSCRIPT_LIMIT,
       transcriptPageMax: MAX_TRANSCRIPT_PAGE_ENTRIES,
-      sseMaxPendingBytes
+      sseMaxPendingBytes,
+      eventPageMax: EVENT_PAGE_MAX,
+      eventWaitMsMax: EVENT_WAIT_MAX_MS,
+      eventInlineOutputMax: INLINE_OUTPUT_MAX_BYTES
     })
   });
+  registerV2BrokerRoutes(app, { identity, advanced });
 
   // Deploy idle check (plan H2): counts only, no names or identifiers. The ops
   // CLI decides what blocks a deploy; the daemon only reports. Every count is
@@ -549,6 +581,7 @@ export async function createDaemonServer(params: {
   app.addHook("onClose", async () => {
     eventLoop.stop();
     resourceMonitor.close();
+    await maintenance.stop();
     await advanced.close();
     await statistics.close();
     computeRuntime.close();
