@@ -1,4 +1,6 @@
 import { AdvancedRuntime } from "../advanced/runtime.js";
+import { PrincipalRegistry } from "../advanced/principals.js";
+import { legacyAttemptAuthorityFromEnvironment, modelProvidersFromEnvironment } from "../advanced/principals-schema.js";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { join } from "node:path";
 
@@ -63,6 +65,7 @@ import { ensureDir, redactSensitiveText } from "../shared/utils.js";
 import { EventLoopMonitor } from "./event-loop.js";
 import { identityEnvelope, identityHeaders, resolveBuildId, type DaemonIdentity } from "./identity.js";
 import { registerV2Routes, type StreamBacklog } from "./v2.js";
+import { registerV2PrincipalRoutes } from "./v2-principals.js";
 import { SseEventStream, sseMaxPendingBytesFromEnv, type SseEvent } from "./sse.js";
 import {
   compactOutputView,
@@ -236,6 +239,7 @@ export async function createDaemonServer(params: {
     let resourceMonitor: ResourceMonitor | undefined;
     let statistics: TurnStatisticsRecorder | undefined;
     let advanced: AdvancedRuntime | undefined;
+    let principals: PrincipalRegistry | undefined;
     try {
       // The owner lease is held, so every leftover record belongs to a dead
       // daemon. Reap before reconciliation so killed runners read as orphaned.
@@ -293,6 +297,7 @@ export async function createDaemonServer(params: {
         purge: async (name) => { await manager.purge({ name }); },
         getSession: (name) => store.getSession(name), getOwner: (name) => store.getSessionOwner(name) ?? undefined,
         contribution: (receipt) => {
+          principals?.observeReceipt(receipt);
           statistics!.observeBrokerReceipt(receipt.parentSessionName, receipt);
           if (receipt.state === "running" || receipt.usage.input === null || receipt.usage.output === null) return;
           const session = store.getSession(receipt.sessionName) ?? store.getSession(receipt.parentSessionName);
@@ -301,6 +306,15 @@ export async function createDaemonServer(params: {
             usage: { input: Math.max(0, receipt.usage.input - (receipt.usage.cacheRead ?? 0) - (receipt.usage.cacheWrite ?? 0)), output: receipt.usage.output, cacheRead: receipt.usage.cacheRead ?? 0, cacheWrite: receipt.usage.cacheWrite ?? 0, total: receipt.usage.total ?? receipt.usage.input + receipt.usage.output },
             durationMs: Date.parse(receipt.updatedAt) - Date.parse(receipt.createdAt), timestamp: receipt.updatedAt, turnId: receipt.attemptId, role: receipt.role, threads: 1 });
         },
+      });
+      // Run principals (P3) reattach before broker recovery, so recovered principal
+      // work finds its participant; their sockets reopen at the same paths.
+      principals = await PrincipalRegistry.open({
+        dataDir: params.dataDir,
+        runtime: advanced,
+        providers: modelProvidersFromEnvironment(),
+        legacyAttemptAuthority: legacyAttemptAuthorityFromEnvironment(),
+        warn: (message) => logger.warn(message)
       });
       const runningAtBoot = store
         .listSessions()
@@ -329,6 +343,7 @@ export async function createDaemonServer(params: {
         resourceMonitor,
         statistics,
         advanced,
+        principals,
         outputRouter,
         manager,
         orchestrator,
@@ -337,7 +352,9 @@ export async function createDaemonServer(params: {
     } catch (error) {
       eventLoop.stop();
       resourceMonitor?.close();
+      await principals?.shutdown();
       await advanced?.close();
+      await principals?.close();
       await statistics?.close();
       computeRuntime?.close();
       usageLedger?.close();
@@ -353,6 +370,7 @@ export async function createDaemonServer(params: {
     resourceMonitor,
     statistics,
     advanced,
+    principals,
     outputRouter,
     manager,
     orchestrator,
@@ -472,7 +490,10 @@ export async function createDaemonServer(params: {
       usageLedger: 1,
       compactStatus: 1,
       keyedStreaming: 1,
-      sseGap: 1
+      sseGap: 1,
+      // Run principals need the bearer token; legacyAttemptAuthority says chat turns still carry bulk authority.
+      ...(authToken.length > 0 ? { principals: 1 } : {}),
+      ...(principals.legacyAttemptAuthority ? { legacyAttemptAuthority: 1 } : {})
     }),
     limits: () => ({
       turnKeyMax: 128,
@@ -482,6 +503,7 @@ export async function createDaemonServer(params: {
       sseMaxPendingBytes
     })
   });
+  registerV2PrincipalRoutes(app, { identity, principals, authenticated: authToken.length > 0 });
 
   // Deploy idle check (plan H2): counts only, no names or identifiers. The ops
   // CLI decides what blocks a deploy; the daemon only reports. Every count is
@@ -520,7 +542,10 @@ export async function createDaemonServer(params: {
 
   app.post("/compute/jobs", async (request, reply) => {
     try {
-      return await computeRuntime.submit(computeJobSpecZod.parse(request.body));
+      const spec = computeJobSpecZod.parse(request.body);
+      // A compute job may run as a principal: its launcher binds that principal's socket directory.
+      const principal = spec.principalId === undefined ? null : principals.socketBinding(spec.principalId);
+      return await computeRuntime.submit(spec, principal ? { principal } : {});
     } catch (error) {
       return reply.code(400).send({
         error: error instanceof Error ? error.message : String(error)
@@ -549,7 +574,11 @@ export async function createDaemonServer(params: {
   app.addHook("onClose", async () => {
     eventLoop.stop();
     resourceMonitor.close();
+    // Principal jobs pause (resumable) rather than end: the registry refuses new
+    // items before the runtime aborts their calls; its store closes last.
+    await principals.shutdown();
     await advanced.close();
+    await principals.close();
     await statistics.close();
     computeRuntime.close();
     orchestratorStore.close();
@@ -649,6 +678,8 @@ export async function createDaemonServer(params: {
       } catch (error) {
         throw ownerCleanupIncomplete("purge", sessions.length, error);
       }
+      // The owner's run principals stop first, so none admits work into a purged account.
+      await principals.revokeOwner(parsed.ownerKey);
       await advanced.purgeOwner(parsed.ownerKey);
       const remaining = store.listSessionsByOwner(parsed.ownerKey);
       if (remaining.length > 0) {
