@@ -295,7 +295,10 @@ export class AdvancedStore {
         if (nowMs - (this.headerTouches.get(jobId) ?? 0) < HEADER_TOUCH_INTERVAL_MS) continue;
         const row = this.stmt("SELECT payload FROM jobs WHERE id=?").get(jobId) as { payload: string } | undefined;
         if (!row) continue;
-        const job = JSON.parse(row.payload) as WorkerJobHeader; job.updatedAt = new Date(nowMs).toISOString();
+        const job = JSON.parse(row.payload) as WorkerJobHeader;
+        // updatedAt is a liveness signal of active jobs; a finished job keeps the time it finished.
+        if (TERMINAL_JOB_STATES.includes(job.state)) continue;
+        job.updatedAt = new Date(nowMs).toISOString();
         this.stmt("UPDATE jobs SET payload=? WHERE id=?").run(JSON.stringify(job), jobId);
         this.headerTouches.set(jobId, nowMs);
       }
@@ -310,7 +313,8 @@ export class AdvancedStore {
   private saveHeader(job: WorkerJobHeader, revision: number): void {
     this.stmt("INSERT INTO jobs (id,parent,attempt,request_key,fingerprint,payload,revision,storage_version) VALUES (?,?,?,?,?,?,?,2) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,revision=excluded.revision,storage_version=CASE jobs.storage_version WHEN 0 THEN 1 ELSE jobs.storage_version END")
       .run(job.jobId, job.parentSessionName, job.attemptId, job.idempotencyKey, job.fingerprint, JSON.stringify(job), revision);
-    this.headerTouches.set(job.jobId, this.now().getTime());
+    if (TERMINAL_JOB_STATES.includes(job.state)) this.headerTouches.delete(job.jobId);
+    else this.headerTouches.set(job.jobId, this.now().getTime());
   }
 
   private saveInput(jobId: string, itemId: string, input: unknown): void {
