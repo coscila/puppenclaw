@@ -1,5 +1,6 @@
 import { AdvancedRuntime } from "../advanced/runtime.js";
 import { AdvancedMaintenance, maintenanceFromEnvironment } from "../advanced/maintenance.js";
+import type { UsageReceipt } from "../advanced/types.js";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { join } from "node:path";
 
@@ -279,6 +280,15 @@ export async function createDaemonServer(params: {
       resourceMonitor.start();
       const outputRouter = new OutputRouter(logger);
       advanced = await AdvancedRuntime.open(join(params.dataDir, "advanced"), undefined, { store: { warn: (code) => logger.warn(code) } });
+      /** The usage-ledger row of a settled broker call with measured usage (ids keep it unique). */
+      const brokerLedgerEntry = (receipt: UsageReceipt) => {
+        if (receipt.state === "running" || receipt.usage.input === null || receipt.usage.output === null) return null;
+        const session = store.getSession(receipt.sessionName) ?? store.getSession(receipt.parentSessionName);
+        if (!session) return null;
+        return { id: `advanced-${receipt.requestId}`, sessionName: receipt.parentSessionName, agent: session.agent, provider: receipt.providerId, model: receipt.model,
+          usage: { input: Math.max(0, receipt.usage.input - (receipt.usage.cacheRead ?? 0) - (receipt.usage.cacheWrite ?? 0)), output: receipt.usage.output, cacheRead: receipt.usage.cacheRead ?? 0, cacheWrite: receipt.usage.cacheWrite ?? 0, total: receipt.usage.total ?? receipt.usage.input + receipt.usage.output },
+          durationMs: Date.parse(receipt.updatedAt) - Date.parse(receipt.createdAt), timestamp: receipt.updatedAt, turnId: receipt.attemptId, role: receipt.role, threads: 1 };
+      };
       const manager = new AcpxSessionManager({
         config: {
           ...params.config,
@@ -298,12 +308,15 @@ export async function createDaemonServer(params: {
         getSession: (name) => store.getSession(name), getOwner: (name) => store.getSessionOwner(name) ?? undefined,
         contribution: (receipt) => {
           statistics!.observeBrokerReceipt(receipt.parentSessionName, receipt);
-          if (receipt.state === "running" || receipt.usage.input === null || receipt.usage.output === null) return;
-          const session = store.getSession(receipt.sessionName) ?? store.getSession(receipt.parentSessionName);
-          if (!session) return;
-          usageLedger!.append({ id: `advanced-${receipt.requestId}`, sessionName: receipt.parentSessionName, agent: session.agent, provider: receipt.providerId, model: receipt.model,
-            usage: { input: Math.max(0, receipt.usage.input - (receipt.usage.cacheRead ?? 0) - (receipt.usage.cacheWrite ?? 0)), output: receipt.usage.output, cacheRead: receipt.usage.cacheRead ?? 0, cacheWrite: receipt.usage.cacheWrite ?? 0, total: receipt.usage.total ?? receipt.usage.input + receipt.usage.output },
-            durationMs: Date.parse(receipt.updatedAt) - Date.parse(receipt.createdAt), timestamp: receipt.updatedAt, turnId: receipt.attemptId, role: receipt.role, threads: 1 });
+          const entry = brokerLedgerEntry(receipt);
+          if (entry) usageLedger!.append(entry);
+        },
+        // Bulk batches: one statistics checkpoint per session and one ledger transaction per batch.
+        contributions: (receipts) => {
+          const bySession = new Map<string, typeof receipts>();
+          for (const receipt of receipts) bySession.set(receipt.parentSessionName, [...bySession.get(receipt.parentSessionName) ?? [], receipt]);
+          for (const [name, list] of bySession) statistics!.observeBrokerReceipts(name, list);
+          usageLedger!.appendMany(receipts.flatMap((receipt) => brokerLedgerEntry(receipt) ?? []));
         },
       });
       const runningAtBoot = store

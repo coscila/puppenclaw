@@ -117,6 +117,8 @@ export class AdvancedRuntime {
   private readonly retry: BulkRetryOptions;
   private readonly activeJobs = new Map<string, ActiveJob>();
   private readonly pauseResumeAfter = new Map<string, string>();
+  private readonly pendingContributions = new Map<string, UsageReceipt>();
+  private contributionTimer: ReturnType<typeof setTimeout> | undefined;
   private constructor(readonly store: AdvancedStore, root: string, concurrency?: BulkConcurrencyOptions, options: AdvancedRuntimeOptions = {}) {
     this.bulkConcurrency = new BulkConcurrencyLimiter(concurrency);
     this.socketRoot = join("/tmp", `ocsl-model-broker-${process.getuid?.() ?? "user"}-${hash(root).slice(0, 12)}`);
@@ -394,6 +396,7 @@ export class AdvancedRuntime {
       finally { if (!settled) this.store.clearRunning(job.jobId, item.id); }
     } };
     await Promise.allSettled(Array.from({ length: Math.min(request.concurrency, this.bulkConcurrency.limit(job.config.modelProvider.id), pending.length) }, run));
+    this.flushContributions();
     const current = this.store.jobHeader(job.jobId)!;
     if (!["cancelled", "paused"].includes(current.state)) { const counts = this.store.progress(job.jobId); this.store.updateHeader(job.jobId, { state: counts.completed === counts.total ? "completed" : "failed", updatedAt: timestamp() }); }
   }
@@ -573,6 +576,11 @@ export class AdvancedRuntime {
     if (job.kind === "agent") { const settled = this.store.job(id); if (settled) { this.recordAgentReceipts(settled); void this.store.putJob(settled, { receipts: [this.agentSettlement(settled)] }); } }
   }
   async closeTurn(name: string): Promise<void> {
+    try { await this.closeTurnNow(name); }
+    // The caller settles the turn's statistics next: every bulk receipt must be in by then.
+    finally { this.flushContributions(); }
+  }
+  private async closeTurnNow(name: string): Promise<void> {
     this.admissionEpochs.set(name, (this.admissionEpochs.get(name) ?? 0) + 1);
     const p = this.participants.get(name); if (!p || p.jobId) return;
     const existing = this.barriers.get(name); if (existing) return existing;
@@ -592,8 +600,25 @@ export class AdvancedRuntime {
     this.barriers.set(name, operation);
     try { await operation; } finally { if (this.barriers.get(name) === operation) this.barriers.delete(name); for (const job of this.store.jobHeaders(name)) if (job.attemptId === p.attemptId) this.observedJobs.delete(job.jobId); }
   }
-  /** Receipt updates reach statistics and the usage ledger at once; bulk receipts are stored with their item settlement instead. */
-  private publish(receipt: UsageReceipt, persist = true): void { receipt.updatedAt = timestamp(); if (persist) this.store.putReceipt(receipt); this.runtimeDriver().contribution(receipt); }
+  /**
+   * Native receipt updates reach statistics and the usage ledger at once. Bulk receipts are
+   * stored with their item settlement instead, and their updates are batched (newest state
+   * per request) so the receipt hooks commit once per batch rather than once per call.
+   */
+  private publish(receipt: UsageReceipt, persist = true): void {
+    receipt.updatedAt = timestamp();
+    if (persist) { this.store.putReceipt(receipt); this.runtimeDriver().contribution(receipt); return; }
+    this.pendingContributions.set(receipt.requestId, structuredClone(receipt));
+    this.contributionTimer ??= setTimeout(() => this.flushContributions(), 1000);
+    this.contributionTimer.unref?.();
+  }
+  /** Delivers batched bulk receipt updates now (before a turn's statistics settle, and at close). */
+  private flushContributions(): void {
+    if (this.contributionTimer) { clearTimeout(this.contributionTimer); this.contributionTimer = undefined; }
+    if (this.pendingContributions.size === 0 || !this.driver) return;
+    const receipts = [...this.pendingContributions.values()]; this.pendingContributions.clear();
+    if (this.driver.contributions) this.driver.contributions(receipts); else for (const receipt of receipts) this.driver.contribution(receipt);
+  }
   private async native(p: RuntimeParticipant, req: IncomingMessage, res: ServerResponse): Promise<void> {
     const path = req.url!.slice("/native".length);
     if (p.provider.kind === "claude-code" && req.headers["x-api-key"] !== undefined) throw new PuppenclawError("PROVIDER_AUTHENTICATION_REQUIRED", "Native Claude calls require subscription OAuth; API-key authentication is disabled.");
@@ -692,6 +717,7 @@ export class AdvancedRuntime {
     this.closed = true;
     await Promise.all([...this.participants.values()].filter((p) => !p.jobId).map((p) => this.closeTurn(p.sessionName)));
     await Promise.all([...this.servers.values()].map(async ({ server, path, sockets }) => { for (const socket of sockets) socket.destroy(); server.closeAllConnections(); await new Promise<void>((resolve) => server.close(() => resolve())); await unlink(path).catch(() => {}); }));
+    this.flushContributions();
     await this.bulkTransport.close();
     await this.oauthRelayOpening?.catch(() => undefined);
     await this.oauthRelay?.close();

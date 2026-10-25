@@ -13,6 +13,9 @@ import { instrumentSystemPrompt, type InstrumentBundle } from "../src/advanced/i
 import type { BrokerJobPayload, BrokerReceiptPayload } from "../src/advanced/outbox.js";
 import { startParamsZod } from "../src/shared/schema.js";
 import type { SessionInfo } from "../src/shared/types.js";
+import type { UsageReceipt } from "../src/advanced/types.js";
+import { TurnStatisticsRecorder } from "../src/statistics/recorder.js";
+import { TurnStatisticsStore } from "../src/statistics/store.js";
 
 const cleanups: (() => Promise<void> | void)[] = [];
 afterEach(async () => { while (cleanups.length) await cleanups.pop()!(); delete process.env.TEST_MODEL_KEY; });
@@ -210,5 +213,39 @@ describe("P2 receipts, retries and the pooled upstream", () => {
     expect((await unix(socket, "/native/v1/responses", { model: "test-model", input: "native" })).body.output_text).toBe("proxy");
     expect(proxy.requests).toHaveLength(1);
     expect(runtime.store.jobReceipts(job.jobId).every((row) => row.state === "completed")).toBe(true);
+  });
+});
+
+describe("P2 receipt hooks", () => {
+  it("delivers bulk receipt updates in batches, newest state per call, and flushes them before the parent turn closes", async () => {
+    const up = await upstream((_body, res) => reply(res, answer("ok")));
+    const { runtime, socket } = await setup(up.url);
+    const batches: UsageReceipt[][] = [], single: UsageReceipt[] = [];
+    const session = { name: "main" } as SessionInfo;
+    runtime.attach({ start: async () => ({ content: [], details: {} }), quiesce: async () => {}, getSession: () => session, contribution: (receipt) => single.push(receipt), contributions: (receipts) => batches.push(receipts) });
+    const job = (await unix(socket, "/bulk/submit", { configId: "refs", idempotencyKey: "batched", concurrency: 4, items: Array.from({ length: 20 }, (_, index) => ({ id: `i${index}`, input: `x${index}` })) })).body;
+    await settled(socket, job.jobId);
+    expect((await unix(socket, "/native/v1/responses", { model: "test-model", input: "native" })).status).toBe(200);
+    await runtime.closeTurn("main");
+    const delivered = batches.flat();
+    // Every bulk call arrives once in its final state; the native call keeps the per-receipt path.
+    expect(new Set(delivered.map((receipt) => receipt.requestId)).size).toBe(20);
+    expect(delivered.filter((receipt) => receipt.state === "completed")).toHaveLength(20);
+    expect(batches.length).toBeLessThan(20);
+    expect(single.every((receipt) => receipt.itemId === undefined)).toBe(true);
+    expect(single.length).toBeGreaterThan(0);
+  });
+
+  it("checkpoints statistics once per receipt batch", async () => {
+    const store = await TurnStatisticsStore.open(await mkdtemp(join(tmpdir(), "advanced-p2-stats-")));
+    const recorder = new TurnStatisticsRecorder(store, { listComputeJobs: () => [] }); cleanups.push(() => recorder.close());
+    recorder.admit({ version: 1, chatId: "chat", attemptId: "attempt" }, { name: "main", agent: "codex" }, "turn");
+    const receipt = (id: string): UsageReceipt => ({ version: 1, requestId: id, parentSessionName: "main", sessionName: "main", attemptId: "attempt", jobId: "job", itemId: id, providerId: "local", model: "m", role: "subagent", promptSha256: "p", state: "completed", createdAt: "now", updatedAt: "now", usage: { input: 10, output: 2, cacheRead: 0, cacheWrite: 0, reasoning: 0, total: 12, quality: "measured" } });
+    const before = Number(store.page().turns[0]!.revision);
+    recorder.observeBrokerReceipts("main", Array.from({ length: 50 }, (_, index) => receipt(`r${index}`)));
+    recorder.observeBrokerReceipts("main", [{ ...receipt("other-attempt"), attemptId: "another" }]);
+    const row = store.page().turns[0]!;
+    expect(Number(row.revision) - before).toBe(1);
+    expect(row.tokens).toMatchObject({ input: 500, output: 100, total: 600 });
   });
 });

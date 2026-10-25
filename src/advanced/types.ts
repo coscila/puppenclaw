@@ -65,5 +65,11 @@ export type RuntimeDriver = {
   getSession: (name: string) => SessionInfo | null;
   getOwner?: (name: string) => string | undefined;
   contribution: (receipt: UsageReceipt) => void;
+  /**
+   * Bulk receipt updates in batches (the newest state per request, at most every
+   * 50 ms), so statistics and the usage ledger commit once per batch instead of
+   * once per call. Without it each receipt goes to contribution().
+   */
+  contributions?: (receipts: UsageReceipt[]) => void;
   registerChild?: (parent: string, child: string) => void;
 };

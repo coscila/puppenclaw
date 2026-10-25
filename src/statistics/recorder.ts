@@ -343,6 +343,15 @@ export class TurnStatisticsRecorder {
     meter.brokerUsage ??= new BrokerUsageAccumulator(); meter.brokerUsage.update(receipt);
     this.publishBrokerUsage(meter);
   }
+  /** Several receipt updates of one session with a single checkpoint (bulk batches). */
+  observeBrokerReceipts(name: string, receipts: readonly UsageReceipt[]): void {
+    const meter = this.active.get(name); if (!meter || meter.ended) return;
+    const own = receipts.filter((receipt) => receipt.attemptId === meter.row.attemptId);
+    if (own.length === 0) return;
+    meter.brokerUsage ??= new BrokerUsageAccumulator();
+    for (const receipt of own) meter.brokerUsage.update(receipt);
+    this.publishBrokerUsage(meter);
+  }
   private publishBrokerUsage(meter: Meter): void {
     meter.brokerUsageOwned = true;
     const snapshot = meter.brokerUsage!.snapshot();
