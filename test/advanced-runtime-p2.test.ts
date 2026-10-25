@@ -40,9 +40,9 @@ const reply = (res: Parameters<RequestListener>[1], payload: unknown, status = 2
 };
 const answer = (text: string, extra: Record<string, unknown> = {}) => ({ model: "served-model", status: "completed", output_text: text, usage: { input_tokens: 12, output_tokens: 3 }, ...extra });
 
-async function setup(baseUrl: string, options: { concurrency?: BulkConcurrencyOptions; direct?: Map<string, string>; attempts?: number; timeoutMs?: number } = {}) {
+async function setup(baseUrl: string, options: { concurrency?: BulkConcurrencyOptions; direct?: Map<string, string>; attempts?: number; timeoutMs?: number; backoffMs?: number } = {}) {
   const transport = new BulkResponseTransport(options.timeoutMs ?? 60_000, options.direct ?? new Map());
-  const runtime = await AdvancedRuntime.open(await mkdtemp(join(tmpdir(), "advanced-p2-")), options.concurrency, { transport, retry: { attempts: options.attempts ?? 3, baseDelayMs: 1, maxDelayMs: 5 } });
+  const runtime = await AdvancedRuntime.open(await mkdtemp(join(tmpdir(), "advanced-p2-")), options.concurrency, { transport, retry: { attempts: options.attempts ?? 3, baseDelayMs: options.backoffMs ?? 1, maxDelayMs: Math.max(5, options.backoffMs ?? 1) } });
   cleanups.push(() => runtime.close()); process.env.TEST_MODEL_KEY = "test-secret";
   const provider = { id: "local", model: "test-model", kind: "codex-openai-compatible" as const, baseUrl, authTokenEnv: "TEST_MODEL_KEY" };
   const params = startParamsZod.parse({ name: "main", agent: "codex", directory: "/tmp", task: "review", interactionMode: "execute", permissionMode: "approve-all", statisticsContext: { version: 1, chatId: "chat", attemptId: "attempt" }, modelProvider: provider, orchestration: { version: 1, revision: 1, workers: [{ id: "refs", assignment: "Check sources", agent: "codex", modelProvider: provider }] } });
@@ -177,6 +177,23 @@ describe("P2 receipts, retries and the pooled upstream", () => {
     expect(runtime.store.jobReceipts(second.jobId).map((row) => row.errorCode ?? "ok")).toEqual(["BULK_RESPONSE_TIMEOUT", "ok"]);
     const events = runtime.store.events(0, 100).events.filter((event) => event.type === "broker.receipt").map((event) => event.payload as BrokerReceiptPayload);
     expect(events.map((payload) => [payload.itemId, payload.attempt, payload.status])).toEqual([["a", 4, "succeeded"], ["b", 2, "succeeded"]]);
+  });
+
+  it("settles an item cancelled during its retry backoff as cancelled, with the receipt of its last attempt", async () => {
+    let calls = 0;
+    const up = await upstream((_body, res) => { calls += 1; reply(res, { error: { type: "bad_gateway" } }, 502); });
+    const { runtime, socket } = await setup(up.url, { attempts: 3, backoffMs: 10_000 });
+    const job = (await unix(socket, "/bulk/submit", { configId: "refs", idempotencyKey: "backoff", concurrency: 1, items: [{ id: "a", input: "x" }, { id: "b", input: "y" }] })).body;
+    for (let i = 0; i < 200 && calls === 0; i++) await new Promise((done) => setTimeout(done, 5));
+    await new Promise((done) => setTimeout(done, 20));
+    const started = Date.now();
+    const cancelled = (await unix(socket, `/jobs/${job.jobId}/cancel`, {})).body;
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(cancelled.state).toBe("cancelled");
+    expect(cancelled.results.map((result: { state: string; errorCode: string; attempts?: number }) => [result.state, result.errorCode, result.attempts ?? null])).toEqual([["cancelled", "CANCELLED", 1], ["cancelled", "CANCELLED", null]]);
+    expect(calls).toBe(1);
+    const events = runtime.store.events(0, 100).events.filter((event) => event.type === "broker.receipt").map((event) => event.payload as BrokerReceiptPayload);
+    expect(events.map((payload) => [payload.itemId, payload.status, payload.attempt])).toEqual([["a", "cancelled", 1]]);
   });
 
   it("never retries a rate limit: the provider pauses at once with resumeAfter, and a lasting 503 pauses after the last attempt", async () => {

@@ -130,7 +130,9 @@ export class AdvancedStore {
     this.indexes = indexes;
     const meta = db.prepare("SELECT feed_id, acked FROM outbox_meta WHERE id=1").get() as { feed_id: string; acked: number };
     this.feed = meta.feed_id; this.ackedSeq = Number(meta.acked);
-    this.headSeq = this.readHead(); this.durableSeq = this.headSeq;
+    // Events committed by an earlier process may still sit unsynced in the page cache:
+    // the first page served by this process fsyncs them (syncDurable).
+    this.headSeq = this.readHead(); this.durableSeq = 0;
   }
 
   static async open(root: string, options: AdvancedStoreOptions = {}): Promise<AdvancedStore> {

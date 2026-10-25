@@ -451,7 +451,8 @@ export class AdvancedRuntime {
     const receipt = outcome.receipt;
     const measured: Partial<ItemResult> = { usage: receipt.usage, model: receipt.model, promptSha256: receipt.promptSha256, attempts: attempt, finishReason: outcome.finishReason, ...(receipt.serverFingerprint ? { serverFingerprint: receipt.serverFingerprint } : {}), ...(receipt.settingsSha256 ? { settingsSha256: receipt.settingsSha256 } : {}) };
     if (!outcome.ok) {
-      if (outcome.cancelled) { this.settleBulkItem(job, base, { ...measured, state: "cancelled", error: "Worker cancelled by its controller or parent turn closure.", errorCode: "CANCELLED" }, receipt, instrumentDigest); return true; }
+      // Cancelled in flight, or during the backoff before another attempt: the job's cancellation wins.
+      if (outcome.cancelled || active.cancelled) { this.settleBulkItem(job, base, { ...measured, state: "cancelled", error: "Worker cancelled by its controller or parent turn closure.", errorCode: "CANCELLED" }, receipt, instrumentDigest); return true; }
       if (outcome.httpStatus !== undefined && PAUSE_HTTP_STATUS.has(outcome.httpStatus)) {
         this.pausedProviders.set(pauseKey, `Provider ${provider.id} requires attention (HTTP ${outcome.httpStatus}); resume explicitly after access or quota recovers.`);
         if (outcome.resumeAfter && [429, 503].includes(outcome.httpStatus)) this.pauseResumeAfter.set(pauseKey, outcome.resumeAfter);
