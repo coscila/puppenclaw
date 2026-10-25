@@ -159,6 +159,8 @@ export class AdvancedStore {
       if (!columns("receipts").includes("job_id")) db.exec("ALTER TABLE receipts ADD COLUMN job_id TEXT; ALTER TABLE receipts ADD COLUMN item_id TEXT; UPDATE receipts SET job_id=json_extract(payload,'$.jobId'), item_id=json_extract(payload,'$.itemId')");
       // P1 (additive only: older daemons name their columns on insert, and job_items keeps its seven columns).
       if (!columns("jobs").includes("study_ref")) db.exec("ALTER TABLE jobs ADD COLUMN study_ref TEXT");
+      // The outbox columns are the pcp/2 contract names (jobId, itemId, createdAt); a pre-release store named them in snake case.
+      if (columns("outbox").includes("job_id")) db.exec("ALTER TABLE outbox RENAME COLUMN job_id TO jobId; ALTER TABLE outbox RENAME COLUMN item_id TO itemId; ALTER TABLE outbox RENAME COLUMN created_at TO createdAt; ALTER TABLE outbox RENAME COLUMN receipt_id TO receiptId");
       db.exec("COMMIT");
     } catch (error) { db.exec("ROLLBACK"); db.close(); throw error; }
     db.exec(`CREATE TABLE IF NOT EXISTS job_items (job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE, item_id TEXT NOT NULL, ordinal INTEGER NOT NULL, input TEXT, result TEXT NOT NULL, state TEXT NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY(job_id,item_id));
@@ -170,9 +172,9 @@ export class AdvancedStore {
       CREATE TABLE IF NOT EXISTS blobs (digest TEXT PRIMARY KEY, data TEXT NOT NULL, bytes INTEGER NOT NULL) WITHOUT ROWID;
       CREATE TABLE IF NOT EXISTS item_inputs (job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE, item_id TEXT NOT NULL, digest TEXT NOT NULL, PRIMARY KEY(job_id,item_id)) WITHOUT ROWID;
       CREATE INDEX IF NOT EXISTS item_inputs_digest ON item_inputs(digest);
-      CREATE TABLE IF NOT EXISTS outbox (seq INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL, job_id TEXT NOT NULL, item_id TEXT, payload TEXT NOT NULL, created_at TEXT NOT NULL, receipt_id TEXT);
-      CREATE INDEX IF NOT EXISTS outbox_job ON outbox(job_id,seq);
-      CREATE UNIQUE INDEX IF NOT EXISTS outbox_receipt_item ON outbox(job_id,item_id) WHERE type='broker.receipt';
+      CREATE TABLE IF NOT EXISTS outbox (seq INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL, jobId TEXT NOT NULL, itemId TEXT, payload TEXT NOT NULL, createdAt TEXT NOT NULL, receiptId TEXT);
+      CREATE INDEX IF NOT EXISTS outbox_job ON outbox(jobId,seq);
+      CREATE UNIQUE INDEX IF NOT EXISTS outbox_receipt_item ON outbox(jobId,itemId) WHERE type='broker.receipt';
       CREATE TABLE IF NOT EXISTS outbox_meta (id INTEGER PRIMARY KEY CHECK(id=1), feed_id TEXT NOT NULL, acked INTEGER NOT NULL DEFAULT 0, acked_at TEXT, synced_revision INTEGER NOT NULL DEFAULT 0, durable_seq INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS purge_deferred (job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE, requested_at TEXT NOT NULL) WITHOUT ROWID;
       CREATE TABLE IF NOT EXISTS instruments (digest TEXT PRIMARY KEY, bundle TEXT NOT NULL, settings_sha256 TEXT NOT NULL, installed_at TEXT NOT NULL) WITHOUT ROWID;`);
@@ -366,7 +368,7 @@ export class AdvancedStore {
 
   private insertJobEvent(job: WorkerJobHeader, batch: BatchContext): void {
     const payload = brokerJobPayload(job, this.counts(job.jobId));
-    this.stmt("INSERT INTO outbox (type,job_id,item_id,payload,created_at,receipt_id) VALUES (?,?,NULL,?,?,NULL)").run(BROKER_JOB_EVENT, job.jobId, JSON.stringify(payload), this.timestamp());
+    this.stmt("INSERT INTO outbox (type,jobId,itemId,payload,createdAt,receiptId) VALUES (?,?,NULL,?,?,NULL)").run(BROKER_JOB_EVENT, job.jobId, JSON.stringify(payload), this.timestamp());
     batch.events += 1;
   }
 
@@ -375,9 +377,9 @@ export class AdvancedStore {
    * The check comes first because even an ignored insert would consume a seq.
    */
   private insertReceiptEvent(jobId: string, instrumentDigest: string | null, item: ItemResult, settlement: ReceiptSettlement, batch: BatchContext): boolean {
-    if (this.stmt("SELECT 1 FROM outbox WHERE job_id=? AND item_id=? AND type='broker.receipt'").get(jobId, item.id) !== undefined) { this.stats.duplicateSettlements += 1; return false; }
+    if (this.stmt("SELECT 1 FROM outbox WHERE jobId=? AND itemId=? AND type='broker.receipt'").get(jobId, item.id) !== undefined) { this.stats.duplicateSettlements += 1; return false; }
     const payload = brokerReceiptPayload({ jobId, instrumentDigest, item, receipt: settlement.receipt, fallbackFingerprint: settlement.fallbackFingerprint, fallbackSettingsSha256: settlement.fallbackSettingsSha256 });
-    this.stmt("INSERT INTO outbox (type,job_id,item_id,payload,created_at,receipt_id) VALUES (?,?,?,?,?,?)")
+    this.stmt("INSERT INTO outbox (type,jobId,itemId,payload,createdAt,receiptId) VALUES (?,?,?,?,?,?)")
       .run(BROKER_RECEIPT_EVENT, jobId, item.id, JSON.stringify(payload), this.timestamp(), settlement.receipt.requestId);
     batch.events += 1;
     return true;
@@ -423,7 +425,7 @@ export class AdvancedStore {
       if (!row) return;
       const job = JSON.parse(row.payload) as WorkerJobHeader;
       if (job.state === "queued" || job.state === "running") return;
-      const last = this.stmt("SELECT payload FROM outbox WHERE job_id=? AND type=? ORDER BY seq DESC LIMIT 1").get(jobId, BROKER_JOB_EVENT) as { payload: string } | undefined;
+      const last = this.stmt("SELECT payload FROM outbox WHERE jobId=? AND type=? ORDER BY seq DESC LIMIT 1").get(jobId, BROKER_JOB_EVENT) as { payload: string } | undefined;
       if (last) {
         const previous = JSON.parse(last.payload) as BrokerJobPayload;
         if (previous.state === job.state && canonicalJson(previous.counts) === canonicalJson(this.counts(jobId))) return;
@@ -680,7 +682,7 @@ export class AdvancedStore {
     return (rows as { id: string }[]).map((row) => row.id);
   }
   private hasUnacknowledgedEvents(jobId: string): boolean {
-    return this.stmt("SELECT 1 FROM outbox WHERE job_id=? AND seq>? LIMIT 1").get(jobId, this.ackedSeq) !== undefined;
+    return this.stmt("SELECT 1 FROM outbox WHERE jobId=? AND seq>? LIMIT 1").get(jobId, this.ackedSeq) !== undefined;
   }
 
   /**
@@ -707,7 +709,7 @@ export class AdvancedStore {
   private eraseJob(id: string): void {
     const digests = (this.stmt("SELECT DISTINCT digest FROM item_inputs WHERE job_id=?").all(id) as { digest: string }[]).map((row) => row.digest);
     this.stmt("DELETE FROM receipts WHERE job_id=?").run(id);
-    this.stmt("DELETE FROM outbox WHERE job_id=? AND seq<=?").run(id, this.ackedSeq);
+    this.stmt("DELETE FROM outbox WHERE jobId=? AND seq<=?").run(id, this.ackedSeq);
     this.stmt("DELETE FROM jobs WHERE id=?").run(id);
     for (const digest of digests) this.stmt("DELETE FROM blobs WHERE digest=? AND NOT EXISTS (SELECT 1 FROM item_inputs WHERE digest=?)").run(digest, digest);
     this.running.delete(id); this.headerTouches.delete(id);
@@ -758,7 +760,7 @@ export class AdvancedStore {
     this.flushPending();
     if (after > this.headSeq) throw new FeedCursorError("INVALID_EVENT_CURSOR", "after is beyond the newest event; restart from 0.");
     this.syncDurable();
-    const rows = this.stmt("SELECT seq, type, job_id, item_id, payload, created_at FROM outbox WHERE seq>? ORDER BY seq LIMIT ?").all(after, limit + 1) as { seq: number; type: BrokerEventType; job_id: string; item_id: string | null; payload: string; created_at: string }[];
+    const rows = this.stmt("SELECT seq, type, jobId AS job_id, itemId AS item_id, payload, createdAt AS created_at FROM outbox WHERE seq>? ORDER BY seq LIMIT ?").all(after, limit + 1) as { seq: number; type: BrokerEventType; job_id: string; item_id: string | null; payload: string; created_at: string }[];
     const page = rows.slice(0, limit).map((row) => ({
       seq: Number(row.seq), type: row.type, at: row.created_at, jobId: row.job_id,
       ...(row.item_id != null ? { itemId: row.item_id } : {}), payload: JSON.parse(row.payload) as BrokerEvent["payload"]
@@ -808,7 +810,7 @@ export class AdvancedStore {
   /** Retention (opt-in): deletes acknowledged events older than the cutoff; unacknowledged ones are never pruned. */
   pruneAcknowledged(olderThan: Date): number {
     let removed = 0;
-    this.applyNow(() => { removed = Number(this.stmt("DELETE FROM outbox WHERE seq<=? AND created_at<?").run(this.ackedSeq, olderThan.toISOString()).changes); });
+    this.applyNow(() => { removed = Number(this.stmt("DELETE FROM outbox WHERE seq<=? AND createdAt<?").run(this.ackedSeq, olderThan.toISOString()).changes); });
     return removed;
   }
 

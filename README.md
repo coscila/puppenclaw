@@ -497,13 +497,16 @@ and every body carries `protocol`, `bootId` and `spoolId`; errors add `code`,
 `retryable` and `error`.
 
 **Outbox.** `advanced.sqlite` holds an outbox table (`seq INTEGER PRIMARY KEY
-AUTOINCREMENT, type, job_id, item_id, payload, created_at`). Every job creation
-and job state change writes a `broker.job` row, and every item that settles
-after a provider call writes one `broker.receipt` row, in the same transaction
-as the change itself: a crash keeps the change and its row together or loses
-both. An item gets at most one receipt row per job; a duplicate completion is
-refused. Seqs only grow and are never reused, also after pruning; gaps can only
-appear at or below the acknowledged cursor (retention, erasure).
+AUTOINCREMENT, type, jobId, itemId, payload, createdAt`, plus `receiptId`).
+Every job creation and job state change writes a `broker.job` row, and every
+item that settles after a provider call writes one `broker.receipt` row, in the
+same transaction as the change itself: a crash keeps the change and its row
+together or loses both. An item gets at most one receipt row per job; a
+duplicate completion is refused. Seqs only grow and are never reused, also
+after pruning; gaps can only appear at or below the acknowledged cursor
+(retention, erasure). A store written by a pre-release build of this version
+named the columns `job_id`, `item_id`, `created_at` and `receipt_id`; opening it
+renames them.
 
 - `GET /v2/events?after=SEQ&limit=N&waitMs=MS` (`after` default 0, `limit`
   1-1000, default 500, `waitMs` 0-25000): `{ok, feedId, events: [{seq, type,

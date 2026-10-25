@@ -172,6 +172,24 @@ describe("P1 broker outbox and feed", () => {
     expect((page.events[3]!.payload as BrokerReceiptPayload)).toMatchObject({ status: "failed", error: { code: "PROVIDER_UNREACHABLE", retryable: true } });
   });
 
+  it("names the outbox columns as the pcp/2 contract does and renames those of a pre-release store", async () => {
+    const contract = ["seq", "type", "jobId", "itemId", "payload", "createdAt"];
+    const fresh = await open();
+    const names = (db: DatabaseSync) => (db.prepare("PRAGMA table_info(outbox)").all() as { name: string }[]).map((column) => column.name);
+    expect(names(fresh.db())).toEqual(expect.arrayContaining(contract));
+    // A store written by a pre-release build of P1 named them job_id, item_id and created_at.
+    const dir = await createTempDir("advanced-p1-outbox-");
+    const { DatabaseSync } = await import(`node${":sqlite"}`);
+    const legacy = new DatabaseSync(join(dir, "advanced.sqlite"));
+    legacy.exec("CREATE TABLE outbox (seq INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL, job_id TEXT NOT NULL, item_id TEXT, payload TEXT NOT NULL, created_at TEXT NOT NULL, receipt_id TEXT); CREATE INDEX outbox_job ON outbox(job_id,seq)");
+    legacy.prepare("INSERT INTO outbox (type, job_id, item_id, payload, created_at) VALUES (?,?,?,?,?)").run(BROKER_JOB_EVENT, "old", null, JSON.stringify({ jobId: "old", state: "queued" }), "2026-10-25T00:00:00.000Z");
+    legacy.close();
+    const reopened = await open(dir);
+    expect(names(reopened.db())).toEqual(expect.arrayContaining([...contract, "receiptId"]));
+    expect(names(reopened.db())).not.toContain("job_id");
+    expect(reopened.store.events(0, 10).events).toEqual([expect.objectContaining({ seq: 1, type: BROKER_JOB_EVENT, jobId: "old", at: "2026-10-25T00:00:00.000Z" })]);
+  });
+
   it("carries outputs up to 16 KiB inline and only their digest above", async () => {
     const { store } = await open();
     store.createJob(job("j", ["small", "large"]));

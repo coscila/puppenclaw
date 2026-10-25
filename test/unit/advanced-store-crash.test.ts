@@ -51,7 +51,7 @@ async function snapshot(dir: string, jobId: string): Promise<Snapshot> {
     const settled = new Set((db.prepare("SELECT item_id FROM job_items WHERE job_id=? AND state='completed'").all(jobId) as { item_id: string }[]).map((row) => row.item_id));
     const receipts = new Set((db.prepare("SELECT item_id FROM receipts WHERE job_id=?").all(jobId) as { item_id: string }[]).map((row) => row.item_id));
     const events = new Map<string, number>();
-    for (const row of db.prepare("SELECT item_id FROM outbox WHERE job_id=? AND type='broker.receipt'").all(jobId) as { item_id: string }[]) events.set(row.item_id, (events.get(row.item_id) ?? 0) + 1);
+    for (const row of db.prepare("SELECT itemId FROM outbox WHERE jobId=? AND type='broker.receipt'").all(jobId) as { itemId: string }[]) events.set(row.itemId, (events.get(row.itemId) ?? 0) + 1);
     const seqs = (db.prepare("SELECT seq FROM outbox ORDER BY seq").all() as { seq: number }[]).map((row) => Number(row.seq));
     return { settled, receipts, events, seqs };
   } finally { db.close(); }
