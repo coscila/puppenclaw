@@ -9,6 +9,7 @@
 //   STREAM_ACTIVITY_EVERY=<k>  a tool_call activity event after every k chunks
 //   FLOOD_BYTES=<n>            chunk text to emit as fast as stdout accepts it
 //   FLOOD_CHUNK_CHARS=<n>      characters per flood chunk (default 16384)
+//   FLOOD_LINE_CHARS=<n>       end a line every n flood characters (default: no newlines)
 //   FINAL_NEWLINE              end the reply with a newline
 // Note: no `import process from "node:process"`. Importing that module
 // initialises process.stdin/stdout, which sets O_NONBLOCK on the inherited
@@ -78,10 +79,14 @@ const floodBytes = directive("FLOOD_BYTES", 0);
 const chunks = directive("STREAM_CHUNKS", 0);
 if (floodBytes > 0) {
   const size = directive("FLOOD_CHUNK_CHARS", 16_384);
+  const line = directive("FLOOD_LINE_CHARS", 0);
   let sent = 0;
   let index = 0;
   while (sent < floodBytes) {
-    const text = `[${index}]`.padEnd(Math.min(size, floodBytes - sent), "f");
+    let text = `[${index}]`.padEnd(Math.min(size, floodBytes - sent), "f");
+    if (line > 0) {
+      text = text.replace(new RegExp(`(.{${line - 1}}).`, "gsu"), "$1\n");
+    }
     await emit({ type: "agent_message_chunk", content: { type: "text", text } });
     sent += text.length;
     index += 1;

@@ -63,6 +63,7 @@ import { ensureDir, redactSensitiveText } from "../shared/utils.js";
 import { EventLoopMonitor } from "./event-loop.js";
 import { identityEnvelope, identityHeaders, resolveBuildId, type DaemonIdentity } from "./identity.js";
 import { registerV2Routes, type StreamBacklog } from "./v2.js";
+import { SseEventStream, sseMaxPendingBytesFromEnv, type SseEvent } from "./sse.js";
 import {
   limitStatusTranscripts,
   MAX_TRANSCRIPT_LIMIT,
@@ -106,7 +107,7 @@ const usageLedgerQueryZod = z.object({
 });
 
 /** Live SSE responses; their queued backlog is reported by /v2/health and /ops/idle. */
-type OpenStream = { pendingEvents: number; pendingBytes: number };
+type OpenStream = { readonly pendingEvents: number; readonly pendingBytes: number };
 
 export async function createDaemonServer(params: {
   config: ParsedPluginConfig;
@@ -200,6 +201,7 @@ export async function createDaemonServer(params: {
   const eventLoop = new EventLoopMonitor();
   eventLoop.start();
   const openStreams = new Set<OpenStream>();
+  const sseMaxPendingBytes = sseMaxPendingBytesFromEnv();
   const streamBacklog = (): StreamBacklog => {
     let events = 0;
     let bytes = 0;
@@ -465,12 +467,20 @@ export async function createDaemonServer(params: {
     streamBacklog,
     // compactStatus: status view=summary and transcriptLimit, GET /session/:name/transcript,
     // and start/send resultView=turn; every one is opt-in per request.
-    features: () => ({ health: 1, opsIdle: 1, usageLedger: 1, compactStatus: 1, keyedStreaming: 1 }),
+    features: () => ({
+      health: 1,
+      opsIdle: 1,
+      usageLedger: 1,
+      compactStatus: 1,
+      keyedStreaming: 1,
+      sseGap: 1
+    }),
     limits: () => ({
       turnKeyMax: 128,
       ledgerPageMax: MAX_LEDGER_PAGE_ROWS,
       transcriptLimitMax: MAX_TRANSCRIPT_LIMIT,
-      transcriptPageMax: MAX_TRANSCRIPT_PAGE_ENTRIES
+      transcriptPageMax: MAX_TRANSCRIPT_PAGE_ENTRIES,
+      sseMaxPendingBytes
     })
   });
 
@@ -835,6 +845,7 @@ export async function createDaemonServer(params: {
       identity,
       openStreams,
       subscription: streamSubscription(parsed.turnKey, keyedStreaming),
+      maxPendingBytes: sseMaxPendingBytes,
       run: async () => presentTurnResult(await manager.start(parsed), resultView)
     });
   });
@@ -859,6 +870,7 @@ export async function createDaemonServer(params: {
       identity,
       openStreams,
       subscription: streamSubscription(parsed.turnKey, keyedStreaming),
+      maxPendingBytes: sseMaxPendingBytes,
       run: async () => presentTurnResult(await manager.send(parsed), resultView)
     });
   });
@@ -1334,16 +1346,10 @@ async function streamToolResult(params: {
   identity: DaemonIdentity;
   openStreams: Set<OpenStream>;
   subscription: StreamSubscription;
+  maxPendingBytes: number;
   run: () => Promise<ToolResult>;
 }): Promise<FastifyReply> {
-  let closed = false;
   let emittedProviderFailureCode: string | null = null;
-  const openStream: OpenStream = { pendingEvents: 0, pendingBytes: 0 };
-  params.openStreams.add(openStream);
-  params.reply.raw.on("close", () => {
-    closed = true;
-    params.openStreams.delete(openStream);
-  });
   params.reply.raw.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",
     "cache-control": "no-cache, no-transform",
@@ -1351,23 +1357,23 @@ async function streamToolResult(params: {
     "x-accel-buffering": "no",
     ...identityHeaders(params.identity)
   });
+  // One queue per stream with drain, coalescing and the gap policy (see sse.ts).
+  const stream = new SseEventStream(params.reply.raw, {
+    sessionName: params.sessionName,
+    maxPendingBytes: params.maxPendingBytes
+  });
+  params.openStreams.add(stream);
+  params.reply.raw.on("close", () => {
+    params.openStreams.delete(stream);
+  });
 
-  const heartbeat = setInterval(() => {
-    if (closed || params.reply.raw.writableEnded) {
-      return;
-    }
-    params.reply.raw.write(`: heartbeat ${Date.now()}\n\n`);
-  }, 15_000);
+  const heartbeat = setInterval(() => stream.heartbeat(), 15_000);
   heartbeat.unref?.();
 
   const write = (
     event: OutputRouteEvent | { kind: "result"; result: ToolResult } | { kind: "done" }
   ): void => {
-    if (closed || params.reply.raw.writableEnded) {
-      return;
-    }
-    params.reply.raw.write(`event: ${event.kind}\n`);
-    params.reply.raw.write(`data: ${JSON.stringify(event)}\n\n`);
+    stream.send(event as SseEvent);
   };
 
   const subscription =
@@ -1418,7 +1424,7 @@ async function streamToolResult(params: {
     });
     write({ kind: "done" });
   } finally {
-    params.openStreams.delete(openStream);
+    params.openStreams.delete(stream);
     clearInterval(heartbeat);
     // Identity-guarded: only removes this stream's own subscription, so a
     // racing second stream (e.g. rejected with TURN_ALREADY_RUNNING) can
@@ -1426,9 +1432,7 @@ async function streamToolResult(params: {
     if (subscription != null) {
       params.outputRouter.detach(subscription);
     }
-    if (!params.reply.raw.writableEnded) {
-      params.reply.raw.end();
-    }
+    stream.end();
   }
 
   return params.reply;
