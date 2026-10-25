@@ -7,6 +7,7 @@
 //   STREAM_INTERVAL_MS=<ms>    delay between chunks (default 20)
 //   STREAM_CHUNK_CHARS=<n>     characters per chunk (default 40)
 //   STREAM_ACTIVITY_EVERY=<k>  a tool_call activity event after every k chunks
+//   STREAM_NEWLINES            end every streamed chunk with a newline
 //   FLOOD_BYTES=<n>            chunk text to emit as fast as stdout accepts it
 //   FLOOD_CHUNK_CHARS=<n>      characters per flood chunk (default 16384)
 //   FLOOD_LINE_CHARS=<n>       end a line every n flood characters (default: no newlines)
@@ -96,7 +97,11 @@ if (floodBytes > 0) {
   const size = directive("STREAM_CHUNK_CHARS", 40);
   const activityEvery = directive("STREAM_ACTIVITY_EVERY", 0);
   for (let index = 0; index < chunks; index += 1) {
-    await emit({ type: "agent_message_chunk", content: { type: "text", text: `<${index}>`.padEnd(size, ".") } });
+    const body = `<${index}>`.padEnd(size, ".");
+    await emit({
+      type: "agent_message_chunk",
+      content: { type: "text", text: prompt.includes("STREAM_NEWLINES") ? `${body.slice(0, -1)}\n` : body }
+    });
     if (activityEvery > 0 && (index + 1) % activityEvery === 0) {
       await emit({ sessionUpdate: "tool_call", toolCallId: `tool-${index}`, title: `step ${index}`, status: "completed" });
     }
