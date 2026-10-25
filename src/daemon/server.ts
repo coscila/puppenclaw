@@ -8,9 +8,9 @@ import { z, ZodError } from "zod";
 import { AcpxSessionManager } from "../manager/acpx.js";
 import {
   bootReaperModeFromEnv,
+  countLiveLeftoverRunnerGroups,
   reapRunnerGroups,
-  RunnerRegistry,
-  type BootReapReport
+  RunnerRegistry
 } from "../manager/runner-registry.js";
 import { OrchestratorRuntime } from "../orchestrator/runtime.js";
 import { OrchestratorStore } from "../orchestrator/store.js";
@@ -238,7 +238,7 @@ export async function createDaemonServer(params: {
     try {
       // The owner lease is held, so every leftover record belongs to a dead
       // daemon. Reap before reconciliation so killed runners read as orphaned.
-      const bootReap: BootReapReport = await reapRunnerGroups({
+      await reapRunnerGroups({
         dataDir: params.dataDir,
         bootId,
         mode: reaperMode,
@@ -331,8 +331,7 @@ export async function createDaemonServer(params: {
         outputRouter,
         manager,
         orchestrator,
-        runners,
-        bootReap
+        runners
       };
     } catch (error) {
       eventLoop.stop();
@@ -356,8 +355,7 @@ export async function createDaemonServer(params: {
     outputRouter,
     manager,
     orchestrator,
-    runners,
-    bootReap
+    runners
   } = initialized;
 
   const ok = (result: ToolResult) => result;
@@ -485,7 +483,9 @@ export async function createDaemonServer(params: {
   });
 
   // Deploy idle check (plan H2): counts only, no names or identifiers. The ops
-  // CLI decides what blocks a deploy; the daemon only reports.
+  // CLI decides what blocks a deploy; the daemon only reports. Every count is
+  // measured now: restart survivors (fenced sessions, leftover runner groups)
+  // count only while their processes may still be alive.
   app.get("/ops/idle", async () => {
     const jobs = advanced.store.countJobsByState();
     const runnerCounts = runners.counts();
@@ -497,13 +497,16 @@ export async function createDaemonServer(params: {
         turnProcesses: manager.activeTurnProcessCount(),
         runnerProcesses: runnerCounts.total,
         runningTurnKeys: store.listRunningTurnRequests().length,
-        recoveryFencedSessions: store.listSessions().filter((session) => session.recoveryFence != null)
-          .length,
+        recoveryFencedSessions: await manager.countUnresolvedRecoveryFences(),
         brokerJobsActive: jobs.queued + jobs.running,
         brokerJobsPaused: jobs.paused,
         computeJobsActive: computeRuntime.listActiveJobs().length,
         streams: openStreams.size,
-        leftoverRunnerGroups: bootReap.survivors + bootReap.unverified
+        leftoverRunnerGroups: await countLiveLeftoverRunnerGroups({
+          dataDir: params.dataDir,
+          bootId,
+          mode: reaperMode
+        })
       }
     };
   });

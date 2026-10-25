@@ -426,9 +426,12 @@ set; none of them is added to the open `/health` and `/capabilities`.
 - `GET /v2/capabilities`: `features` (`health`, `opsIdle`, `usageLedger`,
   `compactStatus`, `keyedStreaming`, `sseGap`), `limits`, and provider dialect
   limits, e.g. the structured-output keywords removed for `qwen-3.8`.
-- `GET /ops/idle`: counts only (active turns, turn and runner processes, running
-  turn keys, fenced sessions, active and paused broker jobs, active compute
-  jobs, open streams, leftover runner groups from the previous boot).
+- `GET /ops/idle`: counts only, each measured at request time (active turns,
+  turn and runner processes, running turn keys, active and paused broker jobs,
+  active compute jobs, open streams). Restart survivors count only while their
+  processes may still be alive: `recoveryFencedSessions` (sessions fenced after a
+  restart whose recorded process is not proven gone) and `leftoverRunnerGroups`
+  (runner groups of earlier boots still running).
 - `GET /session/:name?view=summary` and `GET /sessions?view=summary`: the
   session without its transcript (plus `transcriptSummary`) and without the
   `acpx status` probe. `transcriptLimit=N` (0–1000) keeps the newest N entries

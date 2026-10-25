@@ -1,12 +1,21 @@
-import { readFile } from "node:fs/promises";
+import { spawn, type ChildProcess } from "node:child_process";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import { AdvancedStore } from "../../src/advanced/store.js";
 import type { WorkerJob } from "../../src/advanced/types.js";
 import { createDaemonServer } from "../../src/daemon/server.js";
-import { createTempDir, makeConfig, resolveFakeAcpxCommand } from "../helpers.js";
+import { runnerRegistryDir, type RunnerRecord } from "../../src/manager/runner-registry.js";
+import { readLinuxProcessStat } from "../../src/shared/process-identity.js";
+import {
+  createTempDir,
+  makeConfig,
+  resolveFakeAcpxCommand,
+  seedSession,
+  writeSeedState
+} from "../helpers.js";
 
 const TOKEN = "ops-idle-token";
 const auth = { authorization: `Bearer ${TOKEN}` };
@@ -32,6 +41,32 @@ function job(id: string, state: WorkerJob["state"]): WorkerJob {
     request: { configId: "refs", idempotencyKey: id, task: "Review" } as WorkerJob["request"],
     results: []
   };
+}
+
+const spawned: ChildProcess[] = [];
+
+afterEach(() => {
+  for (const child of spawned.splice(0)) {
+    if (child.pid != null) {
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch {
+        // gone
+      }
+    }
+  }
+});
+
+function spawnGroup(command: string, args: string[]): ChildProcess {
+  const child = spawn(command, args, { detached: true, stdio: "ignore" });
+  spawned.push(child);
+  return child;
+}
+
+async function killGroup(child: ChildProcess): Promise<void> {
+  const exited = new Promise((resolve) => child.once("exit", resolve));
+  process.kill(-child.pid!, "SIGKILL");
+  await exited;
 }
 
 async function waitForFile(path: string): Promise<boolean> {
@@ -136,4 +171,86 @@ describe("GET /ops/idle", () => {
       await app.close();
     }
   }, 30_000);
+
+  it.runIf(process.platform === "linux")(
+    "counts restart survivors only while their processes live",
+    async () => {
+      const dataDir = await createTempDir("puppenclaw-ops-idle-survivors-");
+      const workspace = await createTempDir("puppenclaw-ops-idle-survivors-ws-");
+      // A runner group a crashed daemon left behind; observe mode keeps it running.
+      const leftover = spawnGroup("sh", ["-c", "sleep 30 & wait"]);
+      const leftoverStat = await readLinuxProcessStat(leftover.pid!);
+      const record: RunnerRecord = {
+        version: 1,
+        pid: leftover.pid!,
+        processGroupId: leftoverStat!.processGroupId,
+        processStartIdentity: leftoverStat!.processStartIdentity,
+        kind: "turn",
+        sessionName: "lab-leftover",
+        bootId: "previous-boot",
+        ownerPid: 999_999_999,
+        spawnedAt: new Date().toISOString()
+      };
+      await mkdir(runnerRegistryDir(dataDir), { recursive: true });
+      await writeFile(join(runnerRegistryDir(dataDir), `${leftover.pid}.1.json`), JSON.stringify(record), "utf8");
+      // A turn process that survived the restart; startup reconciliation fences its session.
+      const survivor = spawnGroup("sleep", ["30"]);
+      const survivorStat = await readLinuxProcessStat(survivor.pid!);
+      const now = new Date().toISOString();
+      await writeSeedState(dataDir, [
+        seedSession("lab-survivor", workspace, {
+          state: "running",
+          activeTurn: {
+            id: "turn-survivor",
+            state: "running",
+            startedAt: now,
+            updatedAt: now,
+            outputChars: 0,
+            pid: survivor.pid,
+            processGroupId: survivorStat!.processGroupId,
+            processStartIdentity: survivorStat!.processStartIdentity
+          }
+        })
+      ]);
+
+      const { app } = await createDaemonServer({
+        config: makeConfig({ acpxCommand: await resolveFakeAcpxCommand(), daemonAuthToken: TOKEN }),
+        dataDir,
+        logger: { info() {}, warn() {}, error() {}, debug() {} }
+      });
+      const counts = async () => {
+        const response = await app.inject({ method: "GET", url: "/ops/idle", headers: auth });
+        expect(response.statusCode).toBe(200);
+        return (JSON.parse(response.body) as { counts: Record<string, number> }).counts;
+      };
+      const settle = async (expected: Record<string, number>) => {
+        for (let attempt = 0; attempt < 250; attempt += 1) {
+          const current = await counts();
+          if (Object.entries(expected).every(([key, value]) => current[key] === value)) {
+            return current;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        return await counts();
+      };
+      try {
+        expect(await counts()).toMatchObject({ leftoverRunnerGroups: 1, recoveryFencedSessions: 1 });
+
+        await killGroup(leftover);
+        expect(await settle({ leftoverRunnerGroups: 0 })).toMatchObject({
+          leftoverRunnerGroups: 0,
+          recoveryFencedSessions: 1
+        });
+
+        await killGroup(survivor);
+        expect(await settle({ recoveryFencedSessions: 0 })).toMatchObject({
+          leftoverRunnerGroups: 0,
+          recoveryFencedSessions: 0
+        });
+      } finally {
+        await app.close();
+      }
+    },
+    20_000
+  );
 });

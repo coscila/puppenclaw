@@ -1477,6 +1477,25 @@ export class AcpxSessionManager implements ISessionManager {
     return this.activeTurnProcesses.size;
   }
 
+  /**
+   * Sessions fenced after a restart whose recorded process is not proven gone
+   * (GET /ops/idle). A fence stays persisted until the next dispatch or stop
+   * clears it, so one whose process has exited is no longer activity; a fence
+   * without a recorded process cannot be proven gone and keeps counting.
+   */
+  async countUnresolvedRecoveryFences(): Promise<number> {
+    let unresolved = 0;
+    for (const session of this.deps.store.listSessions()) {
+      if (
+        session.recoveryFence != null &&
+        !(await this.isRecoveredProcessDefinitelyGone(session.recoveryFence))
+      ) {
+        unresolved += 1;
+      }
+    }
+    return unresolved;
+  }
+
   private recordTurnUsage(session: SessionInfo, turn: TurnResult): void {
     if (this.deps.advanced?.metered(session.name)) return;
     if (this.deps.ledger == null || turn.state === "failed") {

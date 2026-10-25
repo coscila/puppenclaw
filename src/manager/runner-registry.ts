@@ -302,3 +302,37 @@ export async function reapRunnerGroups(params: {
   }
   return report;
 }
+
+/**
+ * Runner groups of earlier boots that are still alive now (GET /ops/idle).
+ * The boot scan keeps the records of groups it left running (observe mode,
+ * termination not proven, or a populated group without its leader); this
+ * re-checks them on every call with the same rule, so a group that exits after
+ * the boot stops counting at once. Records of exited groups stay on disk until
+ * the next boot removes them. Reads only; never signals.
+ */
+export async function countLiveLeftoverRunnerGroups(params: {
+  dataDir: string;
+  bootId: string;
+  mode: BootReaperMode;
+}): Promise<number> {
+  if (params.mode === "off" || process.platform !== "linux") {
+    return 0;
+  }
+  const rootDir = runnerRegistryDir(params.dataDir);
+  const entries = await readdir(rootDir).catch(() => [] as string[]);
+  let live = 0;
+  for (const entry of entries) {
+    if (!entry.endsWith(".json")) {
+      continue;
+    }
+    const record = parseRecord(await readFile(join(rootDir, entry), "utf8").catch(() => ""));
+    if (record == null || record.bootId === params.bootId) {
+      continue;
+    }
+    if ((await leaderMatches(record)) || processGroupMayExist(record.processGroupId)) {
+      live += 1;
+    }
+  }
+  return live;
+}
