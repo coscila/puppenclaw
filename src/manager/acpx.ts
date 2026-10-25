@@ -77,6 +77,7 @@ import {
   redactSensitiveText
 } from "../shared/utils.js";
 import type { ISessionManager } from "./interface.js";
+import type { RunnerRegistry } from "./runner-registry.js";
 import { CodexEventAdapter, isWrapperMetadataType } from "./codex-events.js";
 import { AcpPlanPermissionTracker } from "./acp-plan-permissions.js";
 import { TurnDiagnosticsRecorder, purgeSessionDiagnostics, readCodexFinalMessageFile, unlinkCodexFinalMessageFile } from "./turn-diagnostics.js";
@@ -1441,8 +1442,19 @@ export class AcpxSessionManager implements ISessionManager {
       ledger?: UsageLedgerStore;
       statistics?: TurnStatisticsRecorder;
       advanced?: AdvancedRuntime;
+      runners?: RunnerRegistry;
     }
   ) {}
+
+  /** Turns admitted in this process and not yet settled (counts only, for ops and health). */
+  activeTurnCount(): number {
+    return this.activeTurns.size;
+  }
+
+  /** Turn processes this process spawned that have not closed yet. */
+  activeTurnProcessCount(): number {
+    return this.activeTurnProcesses.size;
+  }
 
   private recordTurnUsage(session: SessionInfo, turn: TurnResult): void {
     if (this.deps.advanced?.metered(session.name)) return;
@@ -2044,6 +2056,46 @@ export class AcpxSessionManager implements ISessionManager {
       });
       })
     );
+  }
+
+  /**
+   * Boot reaper (`PUPPENCLAW_BOOT_REAPER=on`): once a restart has settled a turn
+   * as interrupted, its persistent acpx runtime must not keep executing it.
+   * Asks each named runtime to cancel its in-flight prompt. Best effort, bounded
+   * per command; direct one-shot runtimes have no separate runtime to cancel.
+   */
+  async cancelInterruptedRuntimeTurns(names: readonly string[]): Promise<number> {
+    const targets = names
+      .map((name) => this.deps.store.getSession(name))
+      .filter(
+        (session): session is SessionInfo =>
+          session != null && !this.usesOneShotRuntime(session) && !this.activeTurns.has(session.name)
+      );
+    let cancelled = 0;
+    for (let index = 0; index < targets.length; index += 4) {
+      const settled = await Promise.allSettled(
+        targets.slice(index, index + 4).map(async (session) => {
+          const runtimeEnv = this.modelProviderRuntimeEnv(session.modelProvider, session.name);
+          await this.runControlCommand({
+            args: this.buildVerbArgs(session.agent, session.directory, ["cancel", "--session", session.name]),
+            cwd: session.directory,
+            allowNoSession: true,
+            timeoutMs: QUIESCENCE_RUNTIME_COMMAND_TIMEOUT_MS,
+            ...(runtimeEnv != null ? { env: runtimeEnv } : {})
+          });
+        })
+      );
+      for (const [offset, result] of settled.entries()) {
+        if (result.status === "fulfilled") {
+          cancelled += 1;
+        } else {
+          this.deps.logger.warn(
+            `Boot reaper could not cancel the runtime turn of ${targets[index + offset]?.name}: ${redactSensitiveText(ensureError(result.reason).message)}`
+          );
+        }
+      }
+    }
+    return cancelled;
   }
 
   async stop(params: StopParams): Promise<ToolResult> {
@@ -4795,6 +4847,7 @@ export class AcpxSessionManager implements ISessionManager {
           detached: process.platform !== "win32",
           env
         });
+    this.deps.runners?.track(child, { kind: "turn", sessionName: params.session.name });
     const exit = childExit(child);
     void exit.catch(() => undefined);
     await this.registerActiveTurnProcess(params.session.name, child);
@@ -5293,6 +5346,7 @@ export class AcpxSessionManager implements ISessionManager {
           detached: process.platform !== "win32",
           env
         });
+    this.deps.runners?.track(child, { kind: "turn", sessionName: params.session.name });
     const exit = childExit(child);
     void exit.catch(() => undefined);
     await this.registerActiveTurnProcess(params.session.name, child);
@@ -5969,6 +6023,13 @@ export class AcpxSessionManager implements ISessionManager {
             detached: process.platform !== "win32",
             env: params.env != null ? { ...process.env, ...params.env } : process.env
           });
+      const sessionIndex = params.args.indexOf("--session");
+      this.deps.runners?.track(child, {
+        kind: "control",
+        ...(sessionIndex >= 0 && params.args[sessionIndex + 1] != null
+          ? { sessionName: params.args[sessionIndex + 1] }
+          : {})
+      });
       let settled = false;
       const timeout =
         params.timeoutMs == null

@@ -1,11 +1,17 @@
 import { AdvancedRuntime } from "../advanced/runtime.js";
-import { timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { join } from "node:path";
 
 import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
 import { ZodError } from "zod";
 
 import { AcpxSessionManager } from "../manager/acpx.js";
+import {
+  bootReaperModeFromEnv,
+  reapRunnerGroups,
+  RunnerRegistry,
+  type BootReapReport
+} from "../manager/runner-registry.js";
 import { OrchestratorRuntime } from "../orchestrator/runtime.js";
 import { OrchestratorStore } from "../orchestrator/store.js";
 import type { PluginLogger } from "../shared/logger.js";
@@ -126,6 +132,8 @@ export async function createDaemonServer(params: {
   }
 
   const store = await SessionStore.open(params.dataDir);
+  const bootId = randomUUID();
+  const reaperMode = bootReaperModeFromEnv();
   app.addHook("onRequest", async (request) => {
     if (
       request.method === "GET" ||
@@ -151,6 +159,20 @@ export async function createDaemonServer(params: {
     let statistics: TurnStatisticsRecorder | undefined;
     let advanced: AdvancedRuntime | undefined;
     try {
+      // The owner lease is held, so every leftover record belongs to a dead
+      // daemon. Reap before reconciliation so killed runners read as orphaned.
+      const bootReap: BootReapReport = await reapRunnerGroups({
+        dataDir: params.dataDir,
+        bootId,
+        mode: reaperMode,
+        log: (message) => logger.warn(message)
+      });
+      const runners = await RunnerRegistry.open({
+        dataDir: params.dataDir,
+        bootId,
+        mode: reaperMode,
+        warn: (message) => logger.warn(message)
+      });
       orchestratorStore = await OrchestratorStore.open(join(params.dataDir, "orchestrator"));
       usageLedger = await UsageLedgerStore.open(join(params.dataDir, "usage"));
       computeRuntime = await ComputeRuntime.open({
@@ -185,7 +207,8 @@ export async function createDaemonServer(params: {
         outputRouter,
         ledger: usageLedger,
         statistics,
-        advanced
+        advanced,
+        runners
       });
       advanced.attach({
         start: (request) => manager.start(request), quiesce: async (name) => { await manager.quiesce({ name }); },
@@ -201,7 +224,14 @@ export async function createDaemonServer(params: {
             durationMs: Date.parse(receipt.updatedAt) - Date.parse(receipt.createdAt), timestamp: receipt.updatedAt, turnId: receipt.attemptId, role: receipt.role, threads: 1 });
         },
       });
+      const runningAtBoot = store
+        .listSessions()
+        .filter((session) => session.activeTurn?.state === "running")
+        .map((session) => session.name);
       await manager.reconcilePersistedSessions();
+      if (reaperMode === "on" && runningAtBoot.length > 0) {
+        await manager.cancelInterruptedRuntimeTurns(runningAtBoot);
+      }
       await advanced.recover();
       const orchestrator = new OrchestratorRuntime({
         config: {
@@ -223,7 +253,9 @@ export async function createDaemonServer(params: {
         advanced,
         outputRouter,
         manager,
-        orchestrator
+        orchestrator,
+        runners,
+        bootReap
       };
     } catch (error) {
       resourceMonitor?.close();
@@ -245,7 +277,9 @@ export async function createDaemonServer(params: {
     advanced,
     outputRouter,
     manager,
-    orchestrator
+    orchestrator,
+    runners,
+    bootReap
   } = initialized;
 
   const ok = (result: ToolResult) => result;
