@@ -78,6 +78,7 @@ import {
 } from "../shared/utils.js";
 import type { ISessionManager } from "./interface.js";
 import type { RunnerRegistry } from "./runner-registry.js";
+import { compactSessionView } from "../shared/session-views.js";
 import { CodexEventAdapter, isWrapperMetadataType } from "./codex-events.js";
 import { AcpPlanPermissionTracker } from "./acp-plan-permissions.js";
 import { TurnDiagnosticsRecorder, purgeSessionDiagnostics, readCodexFinalMessageFile, unlinkCodexFinalMessageFile } from "./turn-diagnostics.js";
@@ -2534,6 +2535,37 @@ export class AcpxSessionManager implements ISessionManager {
         : {})
     };
     return jsonToolResult(details, `Status for ${params.name}`);
+  }
+
+  /**
+   * Compact status (`view=summary`): the reconciled session and turn exactly as
+   * status() reports them, minus the transcript (or only its newest entries)
+   * and minus the runtime probe, so no `acpx status` process is spawned.
+   */
+  async statusSummary(params: { name?: string; transcriptLimit?: number } = {}): Promise<ToolResult> {
+    if (params.name == null) {
+      const sessions = await Promise.all(
+        this.deps.store.listSessions().map(async (session) => {
+          const reconciled = await this.reconcileVisibleSession(session);
+          return { ...compactSessionView(reconciled.session, params.transcriptLimit), turn: reconciled.turn };
+        })
+      );
+      return textToolResult("Tracked Orchestrator sessions (summary)", { view: "summary", sessions });
+    }
+    const stored = this.requireSession(params.name);
+    const activeQuiescence = this.deps.store.getQuiescence(stored.name);
+    const reconciled =
+      activeQuiescence != null
+        ? { session: this.decorateVisibleSession(stored), turn: null }
+        : await this.reconcileVisibleSession(stored);
+    return textToolResult(`Status summary for ${params.name}`, {
+      view: "summary",
+      session: compactSessionView(reconciled.session, params.transcriptLimit),
+      ...(reconciled.turn != null ? { turn: reconciled.turn } : {}),
+      ...(activeQuiescence != null
+        ? { lifecycle: { quiesced: true, epoch: activeQuiescence.epoch } }
+        : {})
+    });
   }
 
   async output(params: StatusParams): Promise<ToolResult> {

@@ -63,6 +63,7 @@ import { ensureDir, redactSensitiveText } from "../shared/utils.js";
 import { EventLoopMonitor } from "./event-loop.js";
 import { identityEnvelope, identityHeaders, resolveBuildId, type DaemonIdentity } from "./identity.js";
 import { registerV2Routes, type StreamBacklog } from "./v2.js";
+import { limitStatusTranscripts, statusViewQueryZod } from "../shared/session-views.js";
 
 /** Live SSE responses; their queued backlog is reported by /v2/health and /ops/idle. */
 type OpenStream = { pendingEvents: number; pendingBytes: number };
@@ -506,7 +507,27 @@ export async function createDaemonServer(params: {
     };
   });
 
-  app.get("/sessions", async () => ok(await manager.status(statusParamsZod.parse({}))));
+  // Opt-in identity for new response shapes: v1 bodies only gain it when the
+  // request asked for a compact view, so existing parsers see no change.
+  const withIdentity = (result: ToolResult): ToolResult & ReturnType<typeof identityEnvelope> => ({
+    ...result,
+    ...identityEnvelope(identity)
+  });
+
+  app.get("/sessions", async (request) => {
+    const query = statusViewQueryZod.parse(request.query ?? {});
+    if (query.view === "summary") {
+      return withIdentity(
+        await manager.statusSummary(
+          query.transcriptLimit != null ? { transcriptLimit: query.transcriptLimit } : {}
+        )
+      );
+    }
+    const result = await manager.status(statusParamsZod.parse({}));
+    return query.transcriptLimit != null
+      ? withIdentity(limitStatusTranscripts(result, query.transcriptLimit))
+      : ok(result);
+  });
 
   app.post("/sessions/owner/list", async (request) => {
     assertOwnerCleanupAuthentication(authToken);
@@ -585,15 +606,22 @@ export async function createDaemonServer(params: {
 
   app.get("/skills", async () => ok(await manager.listSkills()));
 
-  app.get("/session/:name", async (request) =>
-    ok(
-      await manager.status(
-        statusParamsZod.parse({
-          name: (request.params as { name: string }).name
+  app.get("/session/:name", async (request) => {
+    const name = (request.params as { name: string }).name;
+    const query = statusViewQueryZod.parse(request.query ?? {});
+    if (query.view === "summary") {
+      return withIdentity(
+        await manager.statusSummary({
+          name: statusParamsZod.parse({ name }).name!,
+          ...(query.transcriptLimit != null ? { transcriptLimit: query.transcriptLimit } : {})
         })
-      )
-    )
-  );
+      );
+    }
+    const result = await manager.status(statusParamsZod.parse({ name }));
+    return query.transcriptLimit != null
+      ? withIdentity(limitStatusTranscripts(result, query.transcriptLimit))
+      : ok(result);
+  });
 
   app.get("/session/:name/output", async (request) =>
     ok(
