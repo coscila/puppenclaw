@@ -437,7 +437,11 @@ set; none of them is added to the open `/health` and `/capabilities`.
   such a session refuses new turns (`RECOVERY_FENCE_ACTIVE`) until it is stopped.
 - `GET /session/:name?view=summary` and `GET /sessions?view=summary`: the
   session without its transcript (plus `transcriptSummary`) and without the
-  `acpx status` probe. `transcriptLimit=N` (0–1000) keeps the newest N entries
+  `acpx status` probe. Where a reader needs the runtime to classify one session,
+  its summary carries it like the full view: `runtime.status: quiesced` for a
+  quiesced session (no probe), and the probe's result for a session stored as
+  `running` without an active turn (a stale record that only the runtime can
+  show is over). `transcriptLimit=N` (0–1000) keeps the newest N entries
   in either view. `GET /session/:name/output` takes the same two options: its
   latest output stays, its session snapshot is compacted the same way.
 - `GET /session/:name/transcript?after=SEQ&limit=N` (1–500, about 1 MB per page):

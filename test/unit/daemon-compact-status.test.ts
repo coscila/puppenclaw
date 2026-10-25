@@ -90,6 +90,43 @@ describe("compact status views", () => {
     }
   });
 
+  it("probes the runtime in the summary only for a session stored as active without an active turn", async () => {
+    const dataDir = await createTempDir("puppenclaw-summary-stale-");
+    const workspace = await createTempDir("puppenclaw-summary-stale-ws-");
+    const acpx = await loggingAcpx(workspace);
+    // A session record still "running" after a restart, with no live turn; its
+    // transcript ended with the assistant's reply.
+    await writeSeedState(dataDir, [
+      seedSession("lab-stale", workspace, { state: "running", transcript: seedTranscript(4, 20, "turn-1") }),
+      seedSession("lab-resting", workspace, { state: "idle", transcript: seedTranscript(4, 20, "turn-1") })
+    ]);
+    const { app } = await createDaemonServer({ config: makeConfig({ acpxCommand: acpx.command }), dataDir, logger: quiet });
+    try {
+      await writeFile(acpx.log, "", "utf8");
+      const stale = JSON.parse((await app.inject({ method: "GET", url: "/session/lab-stale?view=summary" })).body) as {
+        details: { session: Record<string, unknown>; runtime?: Record<string, unknown>; turn?: Record<string, unknown> };
+      };
+      expect(stale.details.session).toMatchObject({ state: "running", transcriptSummary: { lastRole: "assistant" } });
+      expect(stale.details.session).not.toHaveProperty("transcript");
+      expect(stale.details.turn).toMatchObject({ classification: "inactive" });
+      // The same probe the full view runs, for this one session.
+      expect(stale.details.runtime).toEqual(
+        (JSON.parse((await app.inject({ method: "GET", url: "/session/lab-stale" })).body) as { details: { runtime: unknown } })
+          .details.runtime
+      );
+      expect(await readFile(acpx.log, "utf8")).toMatch(/status --session lab-stale/u);
+
+      await writeFile(acpx.log, "", "utf8");
+      const resting = JSON.parse((await app.inject({ method: "GET", url: "/session/lab-resting?view=summary" })).body) as {
+        details: Record<string, unknown>;
+      };
+      expect(resting.details).not.toHaveProperty("runtime");
+      expect(await readFile(acpx.log, "utf8")).toBe("");
+    } finally {
+      await app.close();
+    }
+  });
+
   it("limits the transcript to its newest entries in either view and counts all of them", async () => {
     const dataDir = await createTempDir("puppenclaw-transcript-limit-");
     const workspace = await createTempDir("puppenclaw-transcript-limit-ws-");

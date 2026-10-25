@@ -50,6 +50,10 @@
         "lastTurnId": "turn-quiesced-1"
       }
     },
+    "runtime": {
+      "exists": false,
+      "status": "quiesced"
+    },
     "lifecycle": {
       "quiesced": true,
       "epoch": 1

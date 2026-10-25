@@ -2571,8 +2571,13 @@ export class AcpxSessionManager implements ISessionManager {
 
   /**
    * Compact status (`view=summary`): the reconciled session and turn exactly as
-   * status() reports them, minus the transcript (or only its newest entries)
-   * and minus the runtime probe, so no `acpx status` process is spawned.
+   * status() reports them, minus the transcript (or only its newest entries).
+   * The runtime probe is left out, so no `acpx status` process is spawned,
+   * except where a status reader needs it to classify the session: a quiesced
+   * session reports the same `runtime: {status: "quiesced"}` as status()
+   * (no probe), and a session stored as active without an active turn (a stale
+   * record after a restart) gets the probe for that one session, because only
+   * the runtime can show its turn is over.
    */
   async statusSummary(params: { name?: string; transcriptLimit?: number } = {}): Promise<ToolResult> {
     if (params.name == null) {
@@ -2590,9 +2595,26 @@ export class AcpxSessionManager implements ISessionManager {
       activeQuiescence != null
         ? { session: this.decorateVisibleSession(stored), turn: null }
         : await this.reconcileVisibleSession(stored);
+    const session = reconciled.session;
+    const staleActive =
+      activeQuiescence == null &&
+      session.state === "running" &&
+      (reconciled.turn == null || reconciled.turn.classification === "inactive");
+    const runtime =
+      activeQuiescence != null
+        ? { exists: false, status: "quiesced" }
+        : staleActive
+          ? await this.getRuntimeStatus({
+              name: session.name,
+              agent: session.agent,
+              directory: session.directory,
+              ...(session.modelProvider != null ? { modelProvider: session.modelProvider } : {})
+            })
+          : undefined;
     return textToolResult(`Status summary for ${params.name}`, {
       view: "summary",
-      session: compactSessionView(reconciled.session, params.transcriptLimit),
+      session: compactSessionView(session, params.transcriptLimit),
+      ...(runtime != null ? { runtime } : {}),
       ...(reconciled.turn != null ? { turn: reconciled.turn } : {}),
       ...(activeQuiescence != null
         ? { lifecycle: { quiesced: true, epoch: activeQuiescence.epoch } }

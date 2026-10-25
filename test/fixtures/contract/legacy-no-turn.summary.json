@@ -27,6 +27,9 @@
         "lastTurnId": null
       }
     },
+    "runtime": {
+      "exists": false
+    },
     "turn": {
       "classification": "inactive",
       "lockHeld": false,
