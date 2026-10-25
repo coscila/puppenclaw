@@ -522,20 +522,21 @@ export class AdvancedRuntime {
       if (paused) this.pauseJob(job.jobId, paused, pauseKey, active);
       return true;
     }
-    const truncated = outcome.finishReason === "length";
-    let output: unknown = responseOutputText(outcome.payload), failure: { error: string; errorCode: string } | undefined;
-    if (validate) {
-      try { output = JSON.parse(String(output)); } catch { failure = { error: truncated ? "Provider output was cut at the output-token limit and is not valid structured JSON." : "Provider returned malformed structured JSON.", errorCode: "STRUCTURED_OUTPUT_INVALID" }; }
-      if (!failure && !validate(output)) failure = { error: `Provider output failed schema validation: ${ajv.errorsText(validate.errors)}`, errorCode: "STRUCTURED_OUTPUT_INVALID" };
-    }
+    // Who answered decides before what the answer says: a different model pauses the provider whether its
+    // output parses, validates or was cut at the token limit. The receipt stays; the output is dropped.
     const required = instrument?.requiredModelFingerprint;
-    if (!failure && required && required !== receipt.serverFingerprint && required !== receipt.model) {
-      // A different model answered: keep the receipt, drop the output, and stop the job for a decision.
+    if (required && required !== receipt.serverFingerprint && required !== receipt.model) {
       const drift = `Model drift: the instrument requires ${required}; the provider served ${receipt.model} (${receipt.serverFingerprint ?? "no fingerprint"}).`;
       this.pausedProviders.set(pauseKey, drift);
       this.settleBulkItem(job, base, { ...measured, state: "paused", error: drift, errorCode: "MODEL_DRIFT" }, receipt, instrumentDigest);
       this.pauseJob(job.jobId, drift, pauseKey, active);
       return true;
+    }
+    const truncated = outcome.finishReason === "length";
+    let output: unknown = responseOutputText(outcome.payload), failure: { error: string; errorCode: string } | undefined;
+    if (validate) {
+      try { output = JSON.parse(String(output)); } catch { failure = { error: truncated ? "Provider output was cut at the output-token limit and is not valid structured JSON." : "Provider returned malformed structured JSON.", errorCode: "STRUCTURED_OUTPUT_INVALID" }; }
+      if (!failure && !validate(output)) failure = { error: `Provider output failed schema validation: ${ajv.errorsText(validate.errors)}`, errorCode: "STRUCTURED_OUTPUT_INVALID" };
     }
     this.settleBulkItem(job, base, failure ? { ...measured, state: "failed", ...failure, ...(truncated ? { truncated: true } : {}) } : { ...measured, state: "completed", output, ...(truncated ? { truncated: true } : {}) }, receipt, instrumentDigest);
     return true;

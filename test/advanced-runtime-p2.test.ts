@@ -136,6 +136,28 @@ describe("P2 instrument mode", () => {
     expect(done.results[0]).toMatchObject({ state: "paused", errorCode: "MODEL_DRIFT" }); expect(done.results[0]).not.toHaveProperty("output");
     expect(up.requests).toHaveLength(1);
   });
+
+  it("pauses on model drift before parsing, so a drifted answer that is not JSON, fails the schema or was cut still stops the job", async () => {
+    const incomplete = { status: "incomplete", incomplete_details: { reason: "max_output_tokens" } };
+    const schema = { type: "object", properties: { labels: { type: "array" } }, required: ["labels"], additionalProperties: false };
+    for (const drifted of [answer("not json at all", { model: "other-model" }), answer('{"unexpected":true}', { model: "other-model" }), answer('{"labels":["T"', { model: "other-model", ...incomplete })]) {
+      const up = await upstream((_body, res) => reply(res, drifted));
+      const { runtime, socket } = await setup(up.url);
+      runtime.installInstrument(DIGEST, bundle({ responseSchema: schema, requiredModelFingerprint: "nvidia/Qwen3.8-Flash-Next-NVFP4" }));
+      const job = (await unix(socket, "/bulk/submit", { configId: "refs", idempotencyKey: "drift", instrumentDigest: DIGEST, concurrency: 1, items: [{ id: "a", input: "x" }, { id: "b", input: "y" }] })).body;
+      const done = await settled(socket, job.jobId);
+      expect(done.state).toBe("paused");
+      expect(done.results[0]).toMatchObject({ state: "paused", errorCode: "MODEL_DRIFT", model: "other-model" });
+      expect(done.results[0]).not.toHaveProperty("output");
+      expect(done.results[1].state).toBe("queued");
+      // One call: the drift paused the provider before the second item.
+      expect(up.requests).toHaveLength(1);
+      const receipts = runtime.store.events(0, 100).events.filter((event) => event.type === "broker.receipt").map((event) => event.payload as BrokerReceiptPayload);
+      expect(receipts).toHaveLength(1);
+      expect(receipts[0]).toMatchObject({ itemId: "a", status: "failed", error: { code: "MODEL_DRIFT" }, model: "other-model" });
+      expect(receipts[0]).not.toHaveProperty("output");
+    }
+  });
 });
 
 describe("P2 receipts, retries and the pooled upstream", () => {

@@ -586,7 +586,9 @@ bundle; an item that tries to set any of them fails with `INVALID_REQUEST`.
 cut structured output fails `STRUCTURED_OUTPUT_INVALID`, and the receipt's
 status is `truncated` either way. With `requiredModelFingerprint`, an answer
 whose fingerprint and served model both differ pauses the job (`MODEL_DRIFT`)
-and keeps no output. The socket's `GET /configs` lists installed instruments.
+and keeps no output; this check comes before parsing and validation, so it also
+catches a drifted answer that is malformed, fails the schema or was cut. The
+socket's `GET /configs` lists installed instruments.
 
 **Provider pauses and retries.** HTTP 429 and authentication failures (401,
 403) pause the provider for the attempt at once; a 503 does so only after the
