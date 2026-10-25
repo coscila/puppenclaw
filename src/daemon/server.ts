@@ -1,4 +1,5 @@
 import { AdvancedRuntime } from "../advanced/runtime.js";
+import { AdvancedMaintenance, maintenanceFromEnvironment } from "../advanced/maintenance.js";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { join } from "node:path";
 
@@ -238,6 +239,7 @@ export async function createDaemonServer(params: {
     let resourceMonitor: ResourceMonitor | undefined;
     let statistics: TurnStatisticsRecorder | undefined;
     let advanced: AdvancedRuntime | undefined;
+    let maintenance: AdvancedMaintenance | undefined;
     try {
       // The owner lease is held, so every leftover record belongs to a dead
       // daemon. Reap before reconciliation so killed runners read as orphaned.
@@ -313,6 +315,9 @@ export async function createDaemonServer(params: {
         await manager.cancelInterruptedRuntimeTurns(runningAtBoot);
       }
       await advanced.recover();
+      // Opt-in only: archive and event retention stay off unless their env settings are present.
+      maintenance = new AdvancedMaintenance(advanced.store, maintenanceFromEnvironment(), (line) => logger.info(line));
+      maintenance.start();
       const orchestrator = new OrchestratorRuntime({
         config: {
           ...params.config,
@@ -331,6 +336,7 @@ export async function createDaemonServer(params: {
         resourceMonitor,
         statistics,
         advanced,
+        maintenance,
         outputRouter,
         manager,
         orchestrator,
@@ -339,6 +345,7 @@ export async function createDaemonServer(params: {
     } catch (error) {
       eventLoop.stop();
       resourceMonitor?.close();
+      await maintenance?.stop();
       await advanced?.close();
       await statistics?.close();
       computeRuntime?.close();
@@ -355,6 +362,7 @@ export async function createDaemonServer(params: {
     resourceMonitor,
     statistics,
     advanced,
+    maintenance,
     outputRouter,
     manager,
     orchestrator,
@@ -560,6 +568,7 @@ export async function createDaemonServer(params: {
   app.addHook("onClose", async () => {
     eventLoop.stop();
     resourceMonitor.close();
+    await maintenance.stop();
     await advanced.close();
     await statistics.close();
     computeRuntime.close();
