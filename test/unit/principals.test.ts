@@ -82,7 +82,8 @@ async function harness(options: { dataDir?: string; providers?: ModelProviderCon
     start: async () => ({ content: [{ type: "text", text: "done" }], details: { output: "done", session: { state: "completed" } } }),
     quiesce: async () => {},
     getSession: () => null,
-    contribution: (receipt) => registry?.observeReceipt(receipt)
+    // Budgets are charged by the runtime itself as calls settle (the daemon's hooks are batched).
+    contribution: () => {}
   });
   registry = await PrincipalRegistry.open({
     dataDir, runtime, providers: new Map((options.providers ?? []).map((p) => [p.id, p])),
