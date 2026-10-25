@@ -111,7 +111,10 @@ export class SseEventStream {
     if (this.ended || this.isClosed || this.waitingForDrain || this.queue.length > 0) {
       return;
     }
-    this.raw.write(`: heartbeat ${Date.now()}\n\n`);
+    if (!this.raw.write(`: heartbeat ${Date.now()}\n\n`)) {
+      this.waitingForDrain = true;
+      this.raw.once("drain", this.onDrain);
+    }
   }
 
   /**
