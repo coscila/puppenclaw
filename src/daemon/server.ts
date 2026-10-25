@@ -65,10 +65,24 @@ import { identityEnvelope, identityHeaders, resolveBuildId, type DaemonIdentity 
 import { registerV2Routes, type StreamBacklog } from "./v2.js";
 import {
   limitStatusTranscripts,
+  MAX_TRANSCRIPT_LIMIT,
+  MAX_TRANSCRIPT_PAGE_ENTRIES,
   statusViewQueryZod,
   transcriptPage,
-  transcriptPageQueryZod
+  transcriptPageQueryZod,
+  turnScopedResult
 } from "../shared/session-views.js";
+
+/**
+ * Per-request opt-ins of the pcp/2 step-1 shapes (capability `compactStatus`).
+ * They change only the response, never the turn, so they are not part of the
+ * keyed-turn fingerprint.
+ */
+const responseOptInsZod = {
+  resultView: z.enum(["session", "turn"]).optional()
+};
+const daemonStartParamsZod = startParamsZod.extend(responseOptInsZod);
+const daemonSendParamsZod = sendParamsZod.extend(responseOptInsZod);
 
 const usageLedgerQueryZod = z.object({
   afterId: z.string().trim().min(1).max(256).optional(),
@@ -433,8 +447,15 @@ export async function createDaemonServer(params: {
     activeTurns: () => manager.activeTurnCount(),
     pendingStateWrites: () => store.pendingMutationCount,
     streamBacklog,
-    features: () => ({ health: 1, opsIdle: 1, usageLedger: 1 }),
-    limits: () => ({ turnKeyMax: 128, ledgerPageMax: MAX_LEDGER_PAGE_ROWS })
+    // compactStatus: status view=summary and transcriptLimit, GET /session/:name/transcript,
+    // and start/send resultView=turn; every one is opt-in per request.
+    features: () => ({ health: 1, opsIdle: 1, usageLedger: 1, compactStatus: 1 }),
+    limits: () => ({
+      turnKeyMax: 128,
+      ledgerPageMax: MAX_LEDGER_PAGE_ROWS,
+      transcriptLimitMax: MAX_TRANSCRIPT_LIMIT,
+      transcriptPageMax: MAX_TRANSCRIPT_PAGE_ENTRIES
+    })
   });
 
   // Deploy idle check (plan H2): counts only, no names or identifiers. The ops
@@ -775,16 +796,19 @@ export async function createDaemonServer(params: {
     )
   );
 
+  const presentTurnResult = (result: ToolResult, resultView: "session" | "turn" | undefined): ToolResult =>
+    resultView === "turn" ? withIdentity(turnScopedResult(result)) : ok(result);
+
   app.post("/session/start", async (request) => {
-    const parsed = startParamsZod.parse(request.body);
+    const { resultView, ...parsed } = daemonStartParamsZod.parse(request.body);
     if (parsed.ownerKey != null) {
       assertOwnerCleanupAuthentication(authToken);
     }
-    return ok(await manager.start(parsed));
+    return presentTurnResult(await manager.start(parsed), resultView);
   });
 
   app.post("/session/start/stream", async (request, reply) => {
-    const parsed = startParamsZod.parse(request.body);
+    const { resultView, ...parsed } = daemonStartParamsZod.parse(request.body);
     if (parsed.ownerKey != null) {
       assertOwnerCleanupAuthentication(authToken);
     }
@@ -795,23 +819,20 @@ export async function createDaemonServer(params: {
       identity,
       openStreams,
       subscribeToSessionOutput: parsed.turnKey == null,
-      run: async () => ok(await manager.start(parsed))
+      run: async () => presentTurnResult(await manager.start(parsed), resultView)
     });
   });
 
-  app.post("/session/:name/send", async (request) =>
-    ok(
-      await manager.send(
-        sendParamsZod.parse({
-          ...(request.body as Record<string, unknown>),
-          name: (request.params as { name: string }).name
-        })
-      )
-    )
-  );
+  app.post("/session/:name/send", async (request) => {
+    const { resultView, ...parsed } = daemonSendParamsZod.parse({
+      ...(request.body as Record<string, unknown>),
+      name: (request.params as { name: string }).name
+    });
+    return presentTurnResult(await manager.send(parsed), resultView);
+  });
 
   app.post("/session/:name/send/stream", async (request, reply) => {
-    const parsed = sendParamsZod.parse({
+    const { resultView, ...parsed } = daemonSendParamsZod.parse({
       ...(request.body as Record<string, unknown>),
       name: (request.params as { name: string }).name
     });
@@ -822,7 +843,7 @@ export async function createDaemonServer(params: {
       identity,
       openStreams,
       subscribeToSessionOutput: parsed.turnKey == null,
-      run: async () => ok(await manager.send(parsed))
+      run: async () => presentTurnResult(await manager.send(parsed), resultView)
     });
   });
 

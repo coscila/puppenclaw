@@ -2,6 +2,7 @@ import { z } from "zod";
 
 import { jsonToolResult } from "./tool-results.js";
 import type { SessionInfo, SessionTranscriptEntry, ToolResult } from "./types.js";
+import { redactSensitiveText } from "./utils.js";
 
 /**
  * Compact response shapes (plan H4, capability `compactStatus`). Every shape
@@ -133,5 +134,68 @@ function limitTranscript<T extends SessionInfo>(session: T, limit: number): T & 
     ...session,
     transcript: tail(session.transcript, limit),
     transcriptSummary: summarizeTranscript(session.transcript)
+  };
+}
+
+/**
+ * Session snapshot for turn-scoped start/send results. It has exactly the
+ * fields of the snapshot a keyed turn replays (state of the session and of its
+ * latest turn, redacted), so keyed and unkeyed results share one shape; the
+ * conversation transcript is never part of it.
+ */
+export function turnSessionSnapshot(session: Record<string, unknown>): Record<string, unknown> {
+  const text = (value: unknown): string | undefined =>
+    typeof value === "string" ? redactSensitiveText(value) : undefined;
+  const activeTurn = session.activeTurn as Record<string, unknown> | undefined;
+  return {
+    name: session.name,
+    state: session.state,
+    lastActivity: session.lastActivity,
+    ...(session.pendingQuestion != null ? { pendingQuestion: text(session.pendingQuestion) } : {}),
+    ...(session.lastError != null ? { lastError: text(session.lastError) } : {}),
+    ...(session.failureCode != null ? { failureCode: session.failureCode } : {}),
+    ...(session.retryable != null ? { retryable: session.retryable } : {}),
+    ...(activeTurn != null
+      ? {
+          activeTurn: {
+            ...activeTurn,
+            ...(activeTurn.error != null ? { error: text(activeTurn.error) } : {})
+          }
+        }
+      : {}),
+    ...(session.tokenUsage != null ? { tokenUsage: session.tokenUsage } : {})
+  };
+}
+
+/**
+ * Turn-scoped start/send result (`resultView: "turn"`): this turn's output and
+ * signals plus a session snapshot, without the session transcript, absolute
+ * context paths or skill source paths. The keyed and unkeyed paths yield the
+ * same shape.
+ */
+export function turnScopedResult(result: ToolResult): ToolResult {
+  const details = result.details as Record<string, unknown>;
+  const session = details.session;
+  const contextFiles = Array.isArray(details.contextFiles)
+    ? (details.contextFiles as Array<{ path?: unknown; bytes?: unknown; truncated?: unknown }>).map((file) => ({
+        path: typeof file.path === "string" ? (file.path.split(/[\\/]/u).at(-1) ?? file.path) : "",
+        bytes: file.bytes,
+        truncated: file.truncated
+      }))
+    : undefined;
+  const skills = Array.isArray(details.skills)
+    ? (details.skills as Array<{ name?: unknown }>).map((skill) => ({ name: skill.name }))
+    : undefined;
+  return {
+    content: result.content,
+    details: {
+      view: "turn",
+      ...details,
+      ...(session != null && typeof session === "object"
+        ? { session: turnSessionSnapshot(session as Record<string, unknown>) }
+        : {}),
+      ...(contextFiles != null ? { contextFiles } : {}),
+      ...(skills != null ? { skills } : {})
+    }
   };
 }
