@@ -38,7 +38,7 @@ async function until(condition: () => boolean | Promise<boolean>, timeoutMs = 5_
 }
 
 type Upstream = { url: string; calls: number; starts: number[]; maxActive: number; release: () => void; hold: boolean };
-/** A Responses-API fake: every call reports 10 input and 2 output tokens; `hold` keeps calls open until released. */
+/** A Responses-API fake: each call reports 10 input and 2 output tokens unless `usage` is false; `hold` keeps calls open until released. */
 async function upstream(options: { hold?: boolean; delayMs?: number; usage?: boolean } = {}): Promise<Upstream> {
   const pending: (() => void)[] = [];
   let active = 0;
