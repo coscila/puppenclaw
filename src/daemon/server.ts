@@ -3,7 +3,7 @@ import { randomUUID, timingSafeEqual } from "node:crypto";
 import { join } from "node:path";
 
 import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
-import { ZodError } from "zod";
+import { z, ZodError } from "zod";
 
 import { AcpxSessionManager } from "../manager/acpx.js";
 import {
@@ -19,7 +19,7 @@ import { OutputRouter, type OutputRouteEvent } from "../shared/output-router.js"
 import { REASONING_CAPABILITIES } from "../shared/reasoning.js";
 import { PuppenclawError } from "../shared/errors.js";
 import { SessionStore } from "../shared/store.js";
-import { UsageLedgerStore } from "../shared/usage-ledger.js";
+import { MAX_LEDGER_PAGE_ROWS, UsageLedgerStore } from "../shared/usage-ledger.js";
 import { TurnStatisticsStore } from "../statistics/store.js";
 import { TurnStatisticsRecorder } from "../statistics/recorder.js";
 import { ComputeRuntime } from "../compute/runtime.js";
@@ -69,6 +69,11 @@ import {
   transcriptPage,
   transcriptPageQueryZod
 } from "../shared/session-views.js";
+
+const usageLedgerQueryZod = z.object({
+  afterId: z.string().trim().min(1).max(256).optional(),
+  limit: z.coerce.number().int().min(1).max(MAX_LEDGER_PAGE_ROWS).default(500)
+});
 
 /** Live SSE responses; their queued backlog is reported by /v2/health and /ops/idle. */
 type OpenStream = { pendingEvents: number; pendingBytes: number };
@@ -428,8 +433,8 @@ export async function createDaemonServer(params: {
     activeTurns: () => manager.activeTurnCount(),
     pendingStateWrites: () => store.pendingMutationCount,
     streamBacklog,
-    features: () => ({ health: 1, opsIdle: 1 }),
-    limits: () => ({ turnKeyMax: 128 })
+    features: () => ({ health: 1, opsIdle: 1, usageLedger: 1 }),
+    limits: () => ({ turnKeyMax: 128, ledgerPageMax: MAX_LEDGER_PAGE_ROWS })
   });
 
   // Deploy idle check (plan H2): counts only, no names or identifiers. The ops
@@ -735,6 +740,28 @@ export async function createDaemonServer(params: {
         error: error instanceof Error ? error.message : String(error)
       });
     }
+  });
+
+  // Usage feed (plan H4): one cursor-paged call replaces one /cost call per session.
+  app.get("/usage/ledger", async (request, reply) => {
+    const query = usageLedgerQueryZod.parse(request.query ?? {});
+    let after = 0;
+    if (query.afterId != null) {
+      if (/^\d{1,15}$/u.test(query.afterId)) {
+        after = Number(query.afterId);
+      } else {
+        const seq = usageLedger.seqForId(query.afterId);
+        if (seq == null) {
+          return reply.code(400).send({
+            ok: false,
+            code: "INVALID_LEDGER_CURSOR",
+            error: "afterId is neither a ledger seq nor the id of a ledger row."
+          });
+        }
+        after = seq;
+      }
+    }
+    return { ok: true, ...identityEnvelope(identity), ...usageLedger.page(after, query.limit) };
   });
 
   app.get("/usage", async (request) =>

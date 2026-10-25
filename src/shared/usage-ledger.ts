@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type { DatabaseSync as DatabaseSyncType } from "node:sqlite";
 
@@ -14,6 +15,19 @@ export type UsageTotals = {
 export type ModelUsageRollup = UsageTotals & {
   provider: string;
   model: string;
+};
+
+export const MAX_LEDGER_PAGE_ROWS = 1_000;
+
+export type UsageLedgerPage = {
+  /** Identity of this ledger file; a change means every cursor must restart at 0. */
+  ledgerId: string;
+  rows: Array<UsageLedgerEntry & { seq: number }>;
+  /** Pass as `afterId` to continue; equals the input cursor when the page is empty. */
+  next: number;
+  hasMore: boolean;
+  /** Highest seq written so far. */
+  head: number;
 };
 
 function zeroUsage(): NormalizedUsage {
@@ -39,10 +53,21 @@ const TURN_COUNT_SQL = "COUNT(DISTINCT COALESCE(json_extract(payload, '$.turnId'
  * write), so a concurrent purge/gc cannot lose a just-recorded turn.
  */
 export class UsageLedgerStore {
+  private ledgerIdValue = "";
+
   private constructor(
     private readonly db: DatabaseSyncType,
     readonly rootDir: string
   ) {}
+
+  /**
+   * Rows are append-only and never deleted, so SQLite's rowid is a gap-free,
+   * insertion-ordered cursor (`seq`). The ledger id lives in a side table that
+   * older daemons ignore.
+   */
+  get ledgerId(): string {
+    return this.ledgerIdValue;
+  }
 
   static async open(rootDir: string): Promise<UsageLedgerStore> {
     await ensureDir(rootDir);
@@ -74,7 +99,46 @@ export class UsageLedgerStore {
       CREATE INDEX IF NOT EXISTS idx_usage_session ON usage_ledger(session_name);
       CREATE INDEX IF NOT EXISTS idx_usage_model ON usage_ledger(provider, model);
       CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_ledger(ts);
+      CREATE TABLE IF NOT EXISTS usage_ledger_meta (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        ledger_id TEXT NOT NULL
+      );
     `);
+    this.db.prepare("INSERT OR IGNORE INTO usage_ledger_meta (id, ledger_id) VALUES (1, ?)").run(randomUUID());
+    this.ledgerIdValue = String(
+      (this.db.prepare("SELECT ledger_id FROM usage_ledger_meta WHERE id = 1").get() as { ledger_id: string })
+        .ledger_id
+    );
+  }
+
+  /** Rows after `afterSeq` in insertion order (GET /usage/ledger). */
+  page(afterSeq: number, limit: number): UsageLedgerPage {
+    const bounded = Math.max(1, Math.min(Math.trunc(limit), MAX_LEDGER_PAGE_ROWS));
+    const rows = this.db
+      .prepare("SELECT rowid AS seq, payload FROM usage_ledger WHERE rowid > ? ORDER BY rowid LIMIT ?")
+      .all(afterSeq, bounded + 1) as Array<{ seq: number; payload: string }>;
+    const page = rows.slice(0, bounded).map((row) => ({
+      ...(JSON.parse(row.payload) as UsageLedgerEntry),
+      seq: Number(row.seq)
+    }));
+    const head = Number(
+      (this.db.prepare("SELECT COALESCE(MAX(rowid), 0) AS head FROM usage_ledger").get() as { head: number }).head
+    );
+    return {
+      ledgerId: this.ledgerIdValue,
+      rows: page,
+      next: page.at(-1)?.seq ?? afterSeq,
+      hasMore: rows.length > bounded,
+      head
+    };
+  }
+
+  /** The seq of a ledger row id, so a consumer can resume from a row it already holds. */
+  seqForId(id: string): number | null {
+    const row = this.db.prepare("SELECT rowid AS seq FROM usage_ledger WHERE id = ?").get(id) as
+      | { seq: number }
+      | undefined;
+    return row == null ? null : Number(row.seq);
   }
 
   close(): void {
