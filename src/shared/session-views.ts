@@ -19,6 +19,59 @@ export const statusViewQueryZod = z.object({
 
 export type StatusViewQuery = z.infer<typeof statusViewQueryZod>;
 
+export const MAX_TRANSCRIPT_PAGE_ENTRIES = 500;
+/** Soft size budget of one transcript page; a page always holds at least one entry. */
+export const MAX_TRANSCRIPT_PAGE_CHARS = 1_000_000;
+
+/** Query of GET /session/:name/transcript: `after` = entries already read (seq of the last one). */
+export const transcriptPageQueryZod = z.object({
+  after: z.coerce.number().int().min(0).max(Number.MAX_SAFE_INTEGER).default(0),
+  limit: z.coerce.number().int().min(1).max(MAX_TRANSCRIPT_PAGE_ENTRIES).default(100)
+});
+
+export type TranscriptPage = {
+  name: string;
+  /** Entries in the transcript now; seq runs from 1 to total. */
+  total: number;
+  /** Changes when the session is purged; with createdAt it tells a consumer to restart at 0. */
+  generation: number;
+  createdAt: string;
+  after: number;
+  entries: Array<SessionTranscriptEntry & { seq: number }>;
+  next: number;
+  hasMore: boolean;
+};
+
+export function transcriptPage(
+  session: Pick<SessionInfo, "name" | "createdAt" | "transcript">,
+  generation: number,
+  after: number,
+  limit: number
+): TranscriptPage {
+  const total = session.transcript.length;
+  const entries: TranscriptPage["entries"] = [];
+  let chars = 0;
+  for (let index = after; index < total && entries.length < limit; index += 1) {
+    const entry = session.transcript[index]!;
+    if (entries.length > 0 && chars + entry.text.length > MAX_TRANSCRIPT_PAGE_CHARS) {
+      break;
+    }
+    entries.push({ seq: index + 1, ...entry });
+    chars += entry.text.length;
+  }
+  const next = after + entries.length;
+  return {
+    name: session.name,
+    total,
+    generation,
+    createdAt: session.createdAt,
+    after,
+    entries,
+    next,
+    hasMore: next < total
+  };
+}
+
 export type TranscriptSummary = {
   entries: number;
   lastRole: SessionTranscriptEntry["role"] | null;

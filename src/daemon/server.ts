@@ -26,7 +26,7 @@ import { ComputeRuntime } from "../compute/runtime.js";
 import { computeJobSpecZod } from "../compute/types.js";
 import { ResourceMonitor } from "../resources/monitor.js";
 import { resourcesHistoryParamsZod } from "../resources/types.js";
-import { jsonToolResult } from "../shared/tool-results.js";
+import { jsonToolResult, textToolResult } from "../shared/tool-results.js";
 import {
   artifactListParamsZod,
   artifactReadParamsZod,
@@ -63,7 +63,12 @@ import { ensureDir, redactSensitiveText } from "../shared/utils.js";
 import { EventLoopMonitor } from "./event-loop.js";
 import { identityEnvelope, identityHeaders, resolveBuildId, type DaemonIdentity } from "./identity.js";
 import { registerV2Routes, type StreamBacklog } from "./v2.js";
-import { limitStatusTranscripts, statusViewQueryZod } from "../shared/session-views.js";
+import {
+  limitStatusTranscripts,
+  statusViewQueryZod,
+  transcriptPage,
+  transcriptPageQueryZod
+} from "../shared/session-views.js";
 
 /** Live SSE responses; their queued backlog is reported by /v2/health and /ops/idle. */
 type OpenStream = { pendingEvents: number; pendingBytes: number };
@@ -621,6 +626,17 @@ export async function createDaemonServer(params: {
     return query.transcriptLimit != null
       ? withIdentity(limitStatusTranscripts(result, query.transcriptLimit))
       : ok(result);
+  });
+
+  app.get("/session/:name/transcript", async (request) => {
+    const name = statusParamsZod.parse({ name: (request.params as { name: string }).name }).name!;
+    const query = transcriptPageQueryZod.parse(request.query ?? {});
+    const session = store.getSession(name);
+    if (session == null) {
+      throw new PuppenclawError("NO_SESSION", `Unknown session ${name}.`);
+    }
+    const page = transcriptPage(session, store.getTurnGeneration(name), query.after, query.limit);
+    return withIdentity(textToolResult(`Transcript of ${name}`, page));
   });
 
   app.get("/session/:name/output", async (request) =>
