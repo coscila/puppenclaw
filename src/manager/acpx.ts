@@ -358,7 +358,20 @@ const QUIESCENCE_RUNTIME_COMMAND_TIMEOUT_MS = 5_000;
 const QUIESCENCE_RUNTIME_TIMEOUT_MS = 15_000;
 const QUIESCENCE_DRAIN_TIMEOUT_MS = 4_000;
 const QUIESCENCE_POLL_MS = 25;
-const ACTIVE_TURN_CHECKPOINT_MS = 5_000;
+const DEFAULT_ACTIVE_TURN_CHECKPOINT_MS = 30_000;
+
+/**
+ * How often live-turn progress (lastOutputAt, outputChars) is persisted. All
+ * live turns share one tick so their checkpoints land in one group commit.
+ * Status reads overlay the in-memory values, so this only bounds how stale the
+ * persisted copy may be. `PUPPENCLAW_ACTIVE_TURN_CHECKPOINT_MS` overrides it.
+ */
+export function activeTurnCheckpointMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.PUPPENCLAW_ACTIVE_TURN_CHECKPOINT_MS?.trim();
+  return raw != null && /^\d{1,9}$/u.test(raw)
+    ? Math.max(250, Number(raw))
+    : DEFAULT_ACTIVE_TURN_CHECKPOINT_MS;
+}
 const RECOVERY_FENCE_TERMINATION_TIMEOUT_MS = 4_000;
 const NO_FINAL_MESSAGE_STOP_REASON = "no_final_message";
 const NO_FINAL_MESSAGE_STATUS_TEXT = "Runner completed without a final assistant message.";
@@ -1415,7 +1428,8 @@ export class AcpxSessionManager implements ISessionManager {
   private readonly capacityReservations = new Map<string, number>();
   private readonly forkTargetClaims = new Set<string>();
   private readonly activeTurnIds = new Map<string, string>();
-  private readonly activeTurnCheckpointAt = new Map<string, number>();
+  private readonly dirtyActiveTurnCheckpoints = new Set<string>();
+  private activeTurnCheckpointTimer: NodeJS.Timeout | null = null;
   private readonly activeTurnPersistence = new Map<string, Promise<void>>();
   private readonly activeTurnCompletion = new Map<
     string,
@@ -3751,8 +3765,17 @@ export class AcpxSessionManager implements ISessionManager {
     }
     const nowMs = Date.now();
     const startedMs = activeTurn?.startedAt != null ? Date.parse(activeTurn.startedAt) : Number.NaN;
-    const outputMs =
-      activeTurn?.lastOutputAt != null ? Date.parse(activeTurn.lastOutputAt) : Number.NaN;
+    // Progress is persisted only on the checkpoint tick; the live turn in this
+    // process has the current values.
+    const liveOutput =
+      activeTurn != null && this.activeTurnIds.get(session.name) === activeTurn.id
+        ? this.activeTurnOutputs.get(session.name)
+        : undefined;
+    const lastOutputAt =
+      liveOutput != null && liveOutput.totalChars > 0
+        ? liveOutput.updatedAt
+        : (activeTurn?.lastOutputAt ?? null);
+    const outputMs = lastOutputAt != null ? Date.parse(lastOutputAt) : Number.NaN;
     return {
       classification,
       lockHeld,
@@ -3764,8 +3787,8 @@ export class AcpxSessionManager implements ISessionManager {
         observedIdentity?.processGroupId ?? activeTurn?.processGroupId ?? null,
       startedAt: activeTurn?.startedAt ?? null,
       updatedAt: activeTurn?.updatedAt ?? null,
-      lastOutputAt: activeTurn?.lastOutputAt ?? null,
-      outputChars: activeTurn?.outputChars ?? 0,
+      lastOutputAt,
+      outputChars: Math.max(activeTurn?.outputChars ?? 0, liveOutput?.totalChars ?? 0),
       ageMs: Number.isFinite(startedMs) ? Math.max(0, nowMs - startedMs) : null,
       outputAgeMs: Number.isFinite(outputMs) ? Math.max(0, nowMs - outputMs) : null,
       conflict
@@ -5615,7 +5638,7 @@ export class AcpxSessionManager implements ISessionManager {
       complete: false,
       totalChars: 0
     });
-    this.activeTurnCheckpointAt.set(sessionName, Date.now());
+    this.dirtyActiveTurnCheckpoints.delete(sessionName);
     const keyedExecution = this.keyedTurnExecutions.get(sessionName);
     const buildSession = (stored: SessionInfo | null): SessionInfo => {
       const current = stored ?? session;
@@ -5764,20 +5787,37 @@ export class AcpxSessionManager implements ISessionManager {
     const output = this.activeTurnOutputs.get(sessionName);
     const turnId = this.activeTurnIds.get(sessionName);
     if (output == null || turnId == null) {
+      this.dirtyActiveTurnCheckpoints.delete(sessionName);
       return;
     }
-    const nowMs = Date.now();
-    const previousMs = this.activeTurnCheckpointAt.get(sessionName) ?? 0;
-    if (!force && nowMs - previousMs < ACTIVE_TURN_CHECKPOINT_MS) {
+    if (!force) {
+      this.dirtyActiveTurnCheckpoints.add(sessionName);
+      this.scheduleActiveTurnCheckpoints();
       return;
     }
-    this.activeTurnCheckpointAt.set(sessionName, nowMs);
+    this.dirtyActiveTurnCheckpoints.delete(sessionName);
     void this.patchActiveTurn(sessionName, turnId, (activeTurn) => ({
       ...activeTurn,
       updatedAt: output.updatedAt,
       lastOutputAt: output.updatedAt,
       outputChars: output.totalChars
     }));
+  }
+
+  /** One daemon-wide tick checkpoints every turn with new output in the same group commit. */
+  private scheduleActiveTurnCheckpoints(): void {
+    if (this.activeTurnCheckpointTimer != null) {
+      return;
+    }
+    this.activeTurnCheckpointTimer = setTimeout(() => {
+      this.activeTurnCheckpointTimer = null;
+      const due = [...this.dirtyActiveTurnCheckpoints];
+      this.dirtyActiveTurnCheckpoints.clear();
+      for (const sessionName of due) {
+        this.checkpointActiveTurnOutput(sessionName, true);
+      }
+    }, activeTurnCheckpointMs());
+    this.activeTurnCheckpointTimer.unref?.();
   }
 
   private patchActiveTurn(
@@ -5889,7 +5929,7 @@ export class AcpxSessionManager implements ISessionManager {
         : await this.deps.store.patchSession(sessionName, patchSession);
     this.stopRequests.delete(sessionName);
     this.activeTurnIds.delete(sessionName);
-    this.activeTurnCheckpointAt.delete(sessionName);
+    this.dirtyActiveTurnCheckpoints.delete(sessionName);
     if (nextSession == null) {
       throw new PuppenclawError("NO_SESSION", `Unknown session ${sessionName}.`);
     }

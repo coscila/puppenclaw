@@ -22,6 +22,14 @@ export async function resolveFakeAcpxCommand(): Promise<string> {
   return filePath;
 }
 
+/** The streaming fake runner (test/fixtures/fake-acpx-stream.mjs), run with this Node binary. */
+export function resolveFakeAcpxStreamCommand(): string {
+  const fixtureDir = dirname(fileURLToPath(import.meta.url));
+  return `${quoteCommandPart(process.execPath)} ${quoteCommandPart(
+    resolve(fixtureDir, "./fixtures/fake-acpx-stream.mjs")
+  )}`;
+}
+
 function quoteCommandPart(value: string): string {
   if (/^[A-Za-z0-9_./:@%+=,\\-]+$/u.test(value)) {
     return value;

@@ -46,6 +46,30 @@ const OWNER_LEASE_FILE = ".state-owner.json";
  * the loss of every turn the previous spool held.
  */
 const SPOOL_FILE = "spool.json";
+/**
+ * Captured at load so tests that fake timers cannot stall the group commit.
+ * One macrotask lets every mutation issued in the same event-loop turn (and its
+ * promise continuations) join the batch.
+ */
+const nextMacrotask: (callback: () => void) => unknown = globalThis.setImmediate;
+
+type PendingMutation = {
+  mutator: (state: StoredState) => unknown;
+  resolve: (value: unknown) => void;
+  reject: (error: unknown) => void;
+};
+
+export type SessionStorePersistenceStats = {
+  /** state.json writes. */
+  writes: number;
+  /** Mutations committed (successfully or not). */
+  mutations: number;
+  /** Commit rounds; a round with more than one mutation is a group commit. */
+  batches: number;
+  /** Group commits that fell back to per-mutation writes. */
+  fallbacks: number;
+  largestBatch: number;
+};
 const spoolRecordZod = z
   .object({
     version: z.literal(1),
@@ -724,6 +748,15 @@ export class SessionStore {
   private mutationTail: Promise<void> = Promise.resolve();
   private closed = false;
   private pendingMutations = 0;
+  private readonly mutationQueue: PendingMutation[] = [];
+  private flushScheduled = false;
+  private readonly stats: SessionStorePersistenceStats = {
+    writes: 0,
+    mutations: 0,
+    batches: 0,
+    fallbacks: 0,
+    largestBatch: 0
+  };
 
   private constructor(
     readonly rootDir: string,
@@ -770,6 +803,10 @@ export class SessionStore {
   /** Mutations accepted but not yet durably written (a backlog signal for health). */
   get pendingMutationCount(): number {
     return this.pendingMutations;
+  }
+
+  persistenceStats(): SessionStorePersistenceStats {
+    return { ...this.stats };
   }
 
   get statePath(): string {
@@ -1388,28 +1425,107 @@ export class SessionStore {
     await this.mutate(() => undefined);
   }
 
+  /**
+   * Group commit: mutations queued while a write is pending (or in the same
+   * event-loop turn) run in order on one clone, are validated once and written
+   * once. Each caller resolves only after the write that contains its change.
+   * If anything in a batch fails (a mutator throws, validation fails, or the
+   * write fails), the batch is discarded and every mutation is retried alone,
+   * exactly as before group commit, so one bad mutation never affects another.
+   * Mutators must therefore be pure functions of the state they are given.
+   */
   private async mutate<T>(mutator: (state: StoredState) => T): Promise<T> {
     this.assertWritable();
     this.pendingMutations += 1;
     try {
-      return await this.enqueueMutation(async () => {
-        const nextState = structuredClone(this.state);
-        const result = mutator(nextState);
-        const validated = storedStateZod.safeParse(nextState);
-        if (!validated.success) {
-          throw new PuppenclawError(
-            "INVALID_STATE_MUTATION",
-            `Refusing to persist invalid session state: ${z.prettifyError(validated.error)}`
-          );
-        }
-        await this.persistSpoolIdentity();
-        await writeJsonFileAtomic(this.statePath, nextState, { mode: 0o600 });
-        this.state = nextState;
-        return result;
+      return await new Promise<T>((resolve, reject) => {
+        this.mutationQueue.push({
+          mutator,
+          resolve: resolve as (value: unknown) => void,
+          reject
+        });
+        this.scheduleFlush();
       });
     } finally {
       this.pendingMutations -= 1;
     }
+  }
+
+  private scheduleFlush(): void {
+    if (this.flushScheduled) {
+      return;
+    }
+    this.flushScheduled = true;
+    void this.enqueueMutation(async () => {
+      await new Promise<void>((resolve) => {
+        nextMacrotask(resolve);
+      });
+      this.flushScheduled = false;
+      await this.commitBatch(this.mutationQueue.splice(0, this.mutationQueue.length));
+    }).catch(() => undefined);
+  }
+
+  private async commitBatch(batch: PendingMutation[]): Promise<void> {
+    if (batch.length === 0) {
+      return;
+    }
+    this.stats.batches += 1;
+    this.stats.mutations += batch.length;
+    this.stats.largestBatch = Math.max(this.stats.largestBatch, batch.length);
+    if (batch.length > 1) {
+      const nextState = structuredClone(this.state);
+      let results: unknown[] | null = [];
+      try {
+        for (const entry of batch) {
+          results.push(entry.mutator(nextState));
+        }
+        if (!storedStateZod.safeParse(nextState).success) {
+          results = null;
+        }
+      } catch {
+        results = null;
+      }
+      if (results != null) {
+        try {
+          await this.writeState(nextState);
+          for (const [index, entry] of batch.entries()) {
+            entry.resolve(results[index]);
+          }
+          return;
+        } catch {
+          // Fall back to per-mutation writes below.
+        }
+      }
+      this.stats.fallbacks += 1;
+    }
+    for (const entry of batch) {
+      try {
+        entry.resolve(await this.commitOne(entry.mutator));
+      } catch (error) {
+        entry.reject(error);
+      }
+    }
+  }
+
+  private async commitOne<T>(mutator: (state: StoredState) => T): Promise<T> {
+    const nextState = structuredClone(this.state);
+    const result = mutator(nextState);
+    const validated = storedStateZod.safeParse(nextState);
+    if (!validated.success) {
+      throw new PuppenclawError(
+        "INVALID_STATE_MUTATION",
+        `Refusing to persist invalid session state: ${z.prettifyError(validated.error)}`
+      );
+    }
+    await this.writeState(nextState);
+    return result;
+  }
+
+  private async writeState(nextState: StoredState): Promise<void> {
+    await this.persistSpoolIdentity();
+    await writeJsonFileAtomic(this.statePath, nextState, { mode: 0o600 });
+    this.stats.writes += 1;
+    this.state = nextState;
   }
 
   /** A fresh spool is written just before its first state write. */
