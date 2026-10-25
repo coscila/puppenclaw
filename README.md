@@ -512,7 +512,8 @@ carries `protocol`, `bootId` and `spoolId`. Ids are 1–128 characters of
   further item is admitted (the contract allows 5 s; the test measures a few
   ms). Items already dispatching finish, or abort with `cancel=1`. Every item
   the principal had not admitted ends `cancelled`. A revocation that a restart
-  interrupted completes at the next start.
+  interrupted completes at the next start. Revocation stays possible while
+  session state awaits an operator reset; PUT does not.
 
 Grants:
 

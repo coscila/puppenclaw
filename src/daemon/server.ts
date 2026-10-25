@@ -219,7 +219,9 @@ export async function createDaemonServer(params: {
     if (
       request.method === "GET" ||
       request.url.split("?")[0] === "/recovery/reset" ||
-      request.url.split("?")[0] === "/shutdown"
+      request.url.split("?")[0] === "/shutdown" ||
+      // Revoking a principal only removes authority and never touches session state.
+      (request.method === "DELETE" && request.url.startsWith("/v2/principals/"))
     ) {
       return;
     }

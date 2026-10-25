@@ -1,5 +1,5 @@
 import { request } from "node:http";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -151,6 +151,27 @@ describe("pcp/2 principals routes", () => {
       expect(detail).toMatchObject({ state: "active", socketPath });
     } finally {
       await second.app.close();
+    }
+  });
+
+  it("still revoke while session state awaits an operator reset, and grant nothing then", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const dataDir = await dataRoot();
+    const first = await daemon(dataDir);
+    await first.app.inject({ method: "PUT", url: "/v2/principals/run:study-1", headers: auth, payload: body() });
+    await first.app.close();
+    await writeFile(join(dataDir, "state.json"), "not json at all", "utf8");
+    const { app } = await daemon(dataDir);
+    try {
+      const granted = await app.inject({ method: "PUT", url: "/v2/principals/run:study-2", headers: auth, payload: body({ runId: "study-2" }) });
+      expect(granted.statusCode).toBe(503);
+      expect(JSON.parse(granted.body).code).toBe("STATE_RECOVERY_REQUIRED");
+      const revoked = await app.inject({ method: "DELETE", url: "/v2/principals/run:study-1", headers: auth });
+      expect(revoked.statusCode).toBe(200);
+      expect(JSON.parse((await app.inject({ method: "GET", url: "/v2/principals/run:study-1", headers: auth })).body).state).toBe("revoked");
+    } finally {
+      await app.close();
+      vi.restoreAllMocks();
     }
   });
 
