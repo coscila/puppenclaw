@@ -48,9 +48,25 @@ export function aggregateUsage(parts: UsageReceipt["usage"][]): UsageReceipt["us
   const result = noUsage(); for (const key of ["input", "output", "cacheRead", "cacheWrite", "reasoning", "total"] as const) { const values = parts.map((p) => p[key]); const total = values.reduce<number>((a,b) => a + (b ?? 0), 0); result[key] = values.some((v) => v === null) || !Number.isSafeInteger(total) ? null : total; }
   result.quality = parts.every((p) => p.quality === "measured") ? "measured" : parts.every((p) => p.quality === "unavailable") ? "unavailable" : "partial"; return result;
 }
-const ajv = new Ajv({ strict: false, allErrors: true, validateFormats: false });
-const ajv2020 = new Ajv2020({ strict: false, allErrors: true, validateFormats: false });
-function compileSchema(schema: Record<string, unknown>): ValidateFunction { return (String(schema.$schema ?? "").includes("2020-12") ? ajv2020 : ajv).compile(schema); }
+const ajvOptions = { strict: false, allErrors: true, validateFormats: false } as const;
+/** Formats validation errors only; it compiles nothing. */
+const ajv = new Ajv(ajvOptions);
+const SCHEMA_VALIDATORS_MAX = 64;
+/**
+ * Compiled response schemas, one per distinct schema (canonical JSON), reused by every job that names it. Each
+ * schema compiles on its own Ajv instance: one shared instance refuses a second, different schema under an `$id`
+ * it already holds, and keeps every compiled schema object in its cache for good. The least recently used entry
+ * goes once more than SCHEMA_VALIDATORS_MAX distinct schemas are in use.
+ */
+const schemaValidators = new Map<string, ValidateFunction>();
+function compileSchema(schema: Record<string, unknown>): ValidateFunction {
+  const key = hash(schema), cached = schemaValidators.get(key);
+  if (cached) { schemaValidators.delete(key); schemaValidators.set(key, cached); return cached; }
+  const validate = (String(schema.$schema ?? "").includes("2020-12") ? new Ajv2020(ajvOptions) : new Ajv(ajvOptions)).compile(schema);
+  schemaValidators.set(key, validate);
+  if (schemaValidators.size > SCHEMA_VALIDATORS_MAX) schemaValidators.delete(schemaValidators.keys().next().value!);
+  return validate;
+}
 
 async function body(req: IncomingMessage): Promise<Buffer> {
   const chunks: Buffer[] = []; let length = 0;

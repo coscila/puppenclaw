@@ -562,7 +562,9 @@ temperature, seed|null, reasoning, itemsPerCall, requiredModelFingerprint|null}`
 installs a bundle and answers `{ok, digest, settingsSha256}`; the same body again
 returns the same answer, a different body under an installed digest is refused
 with 409 `INSTRUMENT_DIGEST_CONFLICT`, an invalid one with 400
-`INVALID_INSTRUMENT`. The digest is opaque (1-128 characters of
+`INVALID_INSTRUMENT`. A response schema may carry `$id` and `$schema` (draft-07
+or 2020-12); each distinct schema is compiled once, on its own validator, and
+reused by every job that names it. The digest is opaque (1-128 characters of
 `[A-Za-z0-9._:-]`): coscila's instrument registry computes it
 (ocsl-instrument-digest-v1) and the daemon only allow-lists what was
 installed. `GET /v2/instruments` lists `digests` and `instruments`. The

@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Socket } from "node:net";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { Ajv2020 } from "ajv/dist/2020.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { AdvancedRuntime } from "../src/advanced/runtime.js";
 import { BulkResponseTransport } from "../src/advanced/bulk-transport.js";
@@ -107,6 +108,25 @@ describe("P2 instrument mode", () => {
     expect(up.requests).toHaveLength(0);
     expect(() => runtime.installInstrument(DIGEST, bundle({ temperature: 0.5 }))).toThrow(expect.objectContaining({ code: "INSTRUMENT_DIGEST_CONFLICT" }));
     expect(runtime.installInstrument(DIGEST, bundle()).digest).toBe(DIGEST);
+  });
+
+  it("runs an instrument whose response schema has an $id in every job, next to another schema under the same $id, compiling each schema once", async () => {
+    const up = await upstream((_body, res) => reply(res, answer('{"label":"T"}')));
+    const { runtime, socket } = await setup(up.url);
+    const schema = (extra: Record<string, unknown>) => ({ $schema: "https://json-schema.org/draft/2020-12/schema", $id: "https://example.org/schemas/label.schema.json", type: "object", properties: { label: { type: "string" } }, required: ["label"], ...extra });
+    runtime.installInstrument(DIGEST, bundle({ responseSchema: schema({}) }));
+    runtime.installInstrument("second", bundle({ responseSchema: schema({ additionalProperties: false }) }));
+    const compile = vi.spyOn(Ajv2020.prototype, "compile");
+    try {
+      for (const [index, digest] of [DIGEST, DIGEST, "second", "second", DIGEST].entries()) {
+        const job = (await unix(socket, "/bulk/submit", { configId: "refs", idempotencyKey: `schema-id-${index}`, instrumentDigest: digest, items: [{ id: "a", input: "x" }] })).body;
+        const done = await settled(socket, job.jobId);
+        expect(done.state).toBe("completed");
+        expect(done.results[0].output).toEqual({ label: "T" });
+      }
+      // Installing compiled both schemas; the five jobs reused them.
+      expect(compile).not.toHaveBeenCalled();
+    } finally { compile.mockRestore(); }
   });
 
   it("marks finish_reason=length truncated, keeps a text output and fails a cut structured output", async () => {
