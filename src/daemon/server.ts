@@ -274,7 +274,7 @@ export async function createDaemonServer(params: {
       });
       resourceMonitor.start();
       const outputRouter = new OutputRouter(logger);
-      advanced = await AdvancedRuntime.open(join(params.dataDir, "advanced"));
+      advanced = await AdvancedRuntime.open(join(params.dataDir, "advanced"), undefined, { store: { warn: (code) => logger.warn(code) } });
       const manager = new AcpxSessionManager({
         config: {
           ...params.config,

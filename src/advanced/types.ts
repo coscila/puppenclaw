@@ -3,10 +3,14 @@ import type { AdvancedOrchestration, InteractionMode, ModelProviderConfig, Permi
 import type { StatisticsTokens } from "../statistics/types.js";
 
 export const agentSubmitZod = z.object({ configId: z.string().min(1), idempotencyKey: z.string().min(1).max(128), task: z.string().min(1) }).strict();
+/** Opaque instrument digest installed through PUT /v2/instruments/{digest}; never recomputed by the daemon. */
+export const instrumentDigestZod = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u, "Instrument digests are 1-128 characters of [A-Za-z0-9._:-].");
 export const bulkSubmitZod = z.object({
   configId: z.string().min(1), idempotencyKey: z.string().min(1).max(128),
   items: z.array(z.object({ id: z.string().min(1).max(200), input: z.union([z.string(), z.record(z.string(), z.unknown())]) }).strict()).min(1),
   schema: z.record(z.string(), z.unknown()).optional(), concurrency: z.number().int().positive().safe().default(60),
+  /** Instrument mode (capability instrumentMode): request settings come from the installed bundle. */
+  instrumentDigest: instrumentDigestZod.optional(),
 }).strict().refine((r) => new Set(r.items.map((x) => x.id)).size === r.items.length, "Item ids must be unique.");
 export type AgentSubmit = z.infer<typeof agentSubmitZod>;
 export type BulkSubmit = z.infer<typeof bulkSubmitZod>;
