@@ -17,6 +17,8 @@ export type WorkerJob = {
   jobId: string; kind: "agent" | "bulk"; state: JobState; parentSessionName: string; attemptId: string; ownerKey?: string;
   configRevision: number; config: WorkerConfig; idempotencyKey: string; fingerprint: string; createdAt: string; updatedAt: string;
   request: AgentSubmit | BulkSubmit; childSessionName?: string; resumedFromJobId?: string; results: ItemResult[]; error?: string;
+  /** Set for jobs submitted over a principal socket (P3); parentSessionName is then `principal:<principalId>`. */
+  principalId?: string; runId?: string;
 };
 /** Job metadata stays bounded regardless of the number or size of item inputs. */
 export type WorkerJobHeader = Omit<WorkerJob, "request" | "results"> & {
@@ -35,6 +37,8 @@ export type RuntimeParticipant = {
   sessionName: string; parentSessionName: string; attemptId: string; directory: string; provider: ModelProviderConfig;
   ownerKey?: string; permissionMode: PermissionMode; interactionMode: InteractionMode; config: AdvancedOrchestration;
   jobId?: string; admissionOpen: boolean;
+  /** A run principal (P3) instead of a chat turn: its grants, not the turn mode, carry bulk authority. */
+  principalId?: string; runId?: string;
 };
 export type RuntimeDriver = {
   start: (params: StartParams) => Promise<ToolResult>;
