@@ -63,7 +63,11 @@ describe("pcp/2 health and identity", () => {
       expect(body.spoolId).toMatch(UUID);
       expect(body.build).toMatch(/^[0-9A-Za-z.-]+\+[0-9a-f]{12}$/u);
       expect(typeof (body.eventLoop as { p99Ms: number }).p99Ms).toBe("number");
-      expect(body.rssBytes).toBeGreaterThan(0);
+      expect(body.memory).toMatchObject({
+        rssBytes: expect.any(Number) as number,
+        heapUsedBytes: expect.any(Number) as number,
+        heapLimitBytes: expect.any(Number) as number
+      });
       expect(response.headers["x-puppenclaw-boot-id"]).toBe(body.bootId);
       expect(response.headers["x-puppenclaw-spool-id"]).toBe(body.spoolId);
       expect(response.headers["x-puppenclaw-protocol"]).toBe("2.0");

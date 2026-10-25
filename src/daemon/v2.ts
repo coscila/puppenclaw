@@ -1,3 +1,5 @@
+import { getHeapStatistics } from "node:v8";
+
 import type { FastifyInstance } from "fastify";
 
 import { STRUCTURED_OUTPUT_DIALECTS } from "../advanced/response-schema.js";
@@ -29,7 +31,9 @@ export type V2RouteDeps = {
 };
 
 export function registerV2Routes(app: FastifyInstance, deps: V2RouteDeps): void {
+  const heapLimitBytes = getHeapStatistics().heap_size_limit;
   app.get("/v2/health", async () => {
+    const memory = process.memoryUsage();
     const recoveryRequired = deps.recoveryRequired();
     const backlog = deps.streamBacklog();
     return {
@@ -47,7 +51,7 @@ export function registerV2Routes(app: FastifyInstance, deps: V2RouteDeps): void 
         stateWrites: deps.pendingStateWrites()
       },
       eventLoop: deps.eventLoop.snapshot(),
-      rssBytes: process.memoryUsage.rss()
+      memory: { rssBytes: memory.rss, heapUsedBytes: memory.heapUsed, heapLimitBytes }
     };
   });
 
