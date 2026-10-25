@@ -238,6 +238,31 @@ describe("P2 receipts, retries and the pooled upstream", () => {
     expect(events.map((payload) => [payload.itemId, payload.status, payload.attempt])).toEqual([["a", "cancelled", 1]]);
   });
 
+  it("settles an item whose retry is refused before dispatch with the receipt of its last call", async () => {
+    const up = await upstream((body, res) => {
+      if (JSON.stringify(body.input).includes("LIMITED")) reply(res, { error: { type: "rate_limit_error" } }, 429);
+      else reply(res, { error: { type: "bad_gateway" } }, 502);
+    });
+    const { runtime, socket } = await setup(up.url, { attempts: 3, backoffMs: 300 });
+    const job = (await unix(socket, "/bulk/submit", { configId: "refs", idempotencyKey: "refused-retry", concurrency: 2, items: [{ id: "a", input: "FLAKY" }, { id: "b", input: "LIMITED" }] })).body;
+    let done: any;
+    for (let i = 0; i < 400; i++) {
+      done = (await unix(socket, `/jobs/${job.jobId}`)).body;
+      if (done.results.every((result: { state: string }) => !["queued", "running"].includes(result.state))) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(done.state).toBe("paused");
+    // b's 429 paused the provider while a waited to retry its 502; a's retry was refused before dispatch.
+    expect(done.results.map((result: { id: string; state: string; errorCode: string; attempts?: number }) => [result.id, result.state, result.errorCode, result.attempts ?? null]))
+      .toEqual([["a", "paused", "PROVIDER_PAUSED", 1], ["b", "paused", "PROVIDER_RATE_LIMITED", 1]]);
+    expect(done.results[0].settingsSha256).toMatch(/^[0-9a-f]{64}$/u);
+    expect(done.results[0].serverFingerprint).toBeTruthy();
+    expect(up.requests).toHaveLength(2);
+    const events = runtime.store.events(0, 100).events.filter((event) => event.type === "broker.receipt").map((event) => event.payload as BrokerReceiptPayload);
+    expect(events.map((payload) => [payload.itemId, payload.attempt, payload.status, payload.error?.code]).sort())
+      .toEqual([["a", 1, "failed", "PROVIDER_PAUSED"], ["b", 1, "failed", "PROVIDER_RATE_LIMITED"]]);
+  });
+
   it("never retries a rate limit: the provider pauses at once with resumeAfter, and a lasting 503 pauses after the last attempt", async () => {
     const up = await upstream((body, res) => {
       if (JSON.stringify(body.input).includes("limited")) reply(res, { error: { type: "rate_limit_error" } }, 429, { "retry-after": "120" });

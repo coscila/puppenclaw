@@ -114,6 +114,12 @@ type BulkOutcome =
   | { dispatched: false; code: "CANCELLED" | "PROVIDER_PAUSED" | "PROVIDER_AUTH_REQUIRED"; message: string }
   | { dispatched: false; code: "PRINCIPAL_REFUSED"; refusal: PrincipalPauseReason; message: string }
   | { dispatched: true; ok: boolean; receipt: UsageReceipt; payload: unknown; finishReason: string | null; httpStatus?: number; code?: string; retryable: boolean; message: string; resumeAfter?: string; cancelled: boolean };
+type DispatchedBulkOutcome = Extract<BulkOutcome, { dispatched: true }>;
+/** What an item records of the call that settles it; `attempts` counts the provider calls made for the item. */
+function measuredFields(call: DispatchedBulkOutcome, attempts: number): Partial<ItemResult> {
+  const { receipt } = call;
+  return { usage: receipt.usage, model: receipt.model, promptSha256: receipt.promptSha256, attempts, finishReason: call.finishReason, ...(receipt.serverFingerprint ? { serverFingerprint: receipt.serverFingerprint } : {}), ...(receipt.settingsSha256 ? { settingsSha256: receipt.settingsSha256 } : {}) };
+}
 export class AdvancedRuntime {
   private driver: RuntimeDriver | null = null;
   private readonly participants = new Map<string, RuntimeParticipant>();
@@ -497,10 +503,11 @@ export class AdvancedRuntime {
     let request: BuiltBulkRequest;
     try { request = this.buildBulkRequest(job, item, instrument, route); }
     catch (error) { this.settleBulkItem(job, base, { state: "failed", error: message(error), errorCode: "INVALID_REQUEST" }); return true; }
-    let outcome: BulkOutcome, attempt = 0;
+    let outcome: BulkOutcome, attempt = 0, lastCall: DispatchedBulkOutcome | undefined;
     for (;;) {
       attempt += 1;
       outcome = await this.bulkCall(participant, job, item.id, request, route, attempt, instrumentDigest);
+      if (outcome.dispatched) lastCall = outcome;
       if (!outcome.dispatched || outcome.ok || active.cancelled || active.stopping || !outcome.retryable || attempt >= this.retry.attempts) break;
       // A retried attempt keeps its receipt row (usage, diagnostics) but never becomes the item's receipt.
       this.store.putReceipt(outcome.receipt);
@@ -512,20 +519,27 @@ export class AdvancedRuntime {
       return false;
     }
     if (!outcome.dispatched) {
-      if (outcome.code === "CANCELLED" || active.cancelled) return false;
+      // A later attempt was refused before dispatch. An item that already made a provider call settles with
+      // that call's receipt, so its provenance and usage still reach the feed; one that made none has no receipt.
+      const earlier = lastCall ? { fields: measuredFields(lastCall, attempt - 1), receipt: lastCall.receipt } : undefined;
+      if (outcome.code === "CANCELLED" || active.cancelled) {
+        if (!earlier) return false;
+        this.settleBulkItem(job, base, { ...earlier.fields, state: "cancelled", error: active.reason ?? "Worker cancelled by its controller or parent turn closure.", errorCode: "CANCELLED" }, earlier.receipt, instrumentDigest);
+        return true;
+      }
       if (outcome.code === "PRINCIPAL_REFUSED") {
         if (outcome.refusal === PRINCIPAL_PAUSE_REASONS.shutdown) { active.stopping = true; return false; }
-        // Never dispatched: the item settles paused without a receipt, like a provider pause, and the job pauses.
-        this.settleBulkItem(job, base, { state: "paused", error: outcome.message, errorCode: principalPauseCode(outcome.refusal) });
+        // The item settles paused, like a provider pause, and the job pauses.
+        this.settleBulkItem(job, base, { ...earlier?.fields, state: "paused", error: outcome.message, errorCode: principalPauseCode(outcome.refusal) }, earlier?.receipt, instrumentDigest);
         this.pauseJob(job.jobId, outcome.refusal, pauseKey, active);
         return true;
       }
-      this.settleBulkItem(job, base, { state: outcome.code === "PROVIDER_PAUSED" ? "paused" : "failed", error: outcome.message, errorCode: outcome.code });
+      this.settleBulkItem(job, base, { ...earlier?.fields, state: outcome.code === "PROVIDER_PAUSED" ? "paused" : "failed", error: outcome.message, errorCode: outcome.code }, earlier?.receipt, instrumentDigest);
       if (outcome.code === "PROVIDER_PAUSED") this.pauseJob(job.jobId, outcome.message, pauseKey, active);
       return true;
     }
     const receipt = outcome.receipt;
-    const measured: Partial<ItemResult> = { usage: receipt.usage, model: receipt.model, promptSha256: receipt.promptSha256, attempts: attempt, finishReason: outcome.finishReason, ...(receipt.serverFingerprint ? { serverFingerprint: receipt.serverFingerprint } : {}), ...(receipt.settingsSha256 ? { settingsSha256: receipt.settingsSha256 } : {}) };
+    const measured = measuredFields(outcome, attempt);
     if (!outcome.ok) {
       // Cancelled in flight, or during the backoff before another attempt: the job's cancellation wins.
       if (outcome.cancelled || active.cancelled) { this.settleBulkItem(job, base, { ...measured, state: "cancelled", error: active.reason ?? "Worker cancelled by its controller or parent turn closure.", errorCode: "CANCELLED" }, receipt, instrumentDigest); return true; }

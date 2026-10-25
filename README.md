@@ -499,8 +499,9 @@ and every body carries `protocol`, `bootId` and `spoolId`; errors add `code`,
 **Outbox.** `advanced.sqlite` holds an outbox table (`seq INTEGER PRIMARY KEY
 AUTOINCREMENT, type, jobId, itemId, payload, createdAt`, plus `receiptId`).
 Every job creation and job state change writes a `broker.job` row, and every
-item that settles after a provider call writes one `broker.receipt` row, in the
-same transaction as the change itself: a crash keeps the change and its row
+item that settles after a provider call writes one `broker.receipt` row (an item
+whose retry is refused before dispatch settles with the receipt of its last
+call), in the same transaction as the change itself: a crash keeps the change and its row
 together or loses both. An item gets at most one receipt row per job; a
 duplicate completion is refused. Seqs only grow and are never reused, also
 after pruning; gaps can only appear at or below the acknowledged cursor
