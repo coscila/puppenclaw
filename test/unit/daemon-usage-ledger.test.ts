@@ -127,6 +127,11 @@ describe("GET /usage/ledger", () => {
       const unknown = await app.inject({ method: "GET", url: "/usage/ledger?afterId=usage-missing", headers: auth });
       expect(unknown.statusCode).toBe(400);
       expect(JSON.parse(unknown.body)).toMatchObject({ code: "INVALID_LEDGER_CURSOR" });
+      // A seq beyond the head belongs to another copy of the ledger (e.g. a restored file).
+      const ahead = await app.inject({ method: "GET", url: "/usage/ledger?afterId=5", headers: auth });
+      expect(ahead.statusCode).toBe(400);
+      expect(JSON.parse(ahead.body)).toMatchObject({ code: "INVALID_LEDGER_CURSOR" });
+      expect((await app.inject({ method: "GET", url: "/usage/ledger?afterId=0", headers: auth })).statusCode).toBe(200);
       for (const query of ["limit=0", "limit=1001", "limit=x"]) {
         expect((await app.inject({ method: "GET", url: `/usage/ledger?${query}`, headers: auth })).statusCode, query).toBe(400);
       }
@@ -140,6 +145,10 @@ describe("GET /usage/ledger", () => {
       const page = JSON.parse((await app.inject({ method: "GET", url: "/usage/ledger", headers: auth })).body) as Page;
       expect(page.rows).toHaveLength(1);
       expect(page.rows[0]).toMatchObject({ seq: 1, sessionName: "lab-ledger", agent: "claude", usage: { output: 12 } });
+      expect(
+        JSON.parse((await app.inject({ method: "GET", url: "/usage/ledger?afterId=1", headers: auth })).body)
+      ).toMatchObject({ rows: [], next: 1, head: 1 });
+      expect((await app.inject({ method: "GET", url: "/usage/ledger?afterId=2", headers: auth })).statusCode).toBe(400);
     } finally {
       await app.close();
     }

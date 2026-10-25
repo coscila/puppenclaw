@@ -819,7 +819,18 @@ export async function createDaemonServer(params: {
         after = seq;
       }
     }
-    return { ok: true, ...identityEnvelope(identity), ...usageLedger.page(after, query.limit) };
+    const page = usageLedger.page(after, query.limit);
+    // Rows are never deleted, so a seq cursor of this ledger never exceeds its
+    // head. A larger one comes from another copy of the file (a restore keeps
+    // the ledger id) and would silently skip the rows written up to it.
+    if (after > page.head) {
+      return reply.code(400).send({
+        ok: false,
+        code: "INVALID_LEDGER_CURSOR",
+        error: "afterId is beyond the newest ledger row; read the ledger from its start."
+      });
+    }
+    return { ok: true, ...identityEnvelope(identity), ...page };
   });
 
   app.get("/usage", async (request) =>

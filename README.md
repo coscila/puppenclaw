@@ -441,7 +441,9 @@ set; none of them is added to the open `/health` and `/capabilities`.
   entries with `seq`, `total`, `next`, `hasMore`, and the session `generation`.
 - `GET /usage/ledger?afterId=SEQ&limit=N` (1–1000): ledger rows in insertion
   order with `seq`, `next`, `hasMore`, `head` and a stable `ledgerId`; `afterId`
-  also accepts a ledger row id.
+  also accepts a ledger row id. An unknown row id or a seq beyond `head` (a
+  cursor of another copy of the ledger) is refused with 400
+  `INVALID_LEDGER_CURSOR`; read the ledger from its start then.
 - `POST /session/start` and `POST /session/:name/send` (and their `/stream`
   variants) accept `"resultView": "turn"`: the result holds this turn's output
   and signals and the same compact session snapshot a keyed replay returns,
