@@ -12,11 +12,22 @@ export type AgentSubmit = z.infer<typeof agentSubmitZod>;
 export type BulkSubmit = z.infer<typeof bulkSubmitZod>;
 export type JobState = "queued" | "running" | "paused" | "completed" | "failed" | "cancelled" | "interrupted";
 export type WorkerConfig = AdvancedOrchestration["workers"][number];
-export type ItemResult = { id: string; state: JobState; output?: unknown; providerId: string; model: string; promptSha256: string; inputSha256?: string; usage: StatisticsTokens | null; receiptDigests?: { requestId: string; model: string; promptSha256: string }[]; error?: string };
+export type ItemResult = { id: string; state: JobState; output?: unknown; providerId: string; model: string; promptSha256: string; inputSha256?: string; usage: StatisticsTokens | null; receiptDigests?: { requestId: string; model: string; promptSha256: string }[]; error?: string;
+  /** Provider calls made for this item (retries included). */
+  attempts?: number;
+  /** The provider stopped at the output-token limit (finish_reason=length). */
+  truncated?: boolean; finishReason?: string | null;
+  serverFingerprint?: string; settingsSha256?: string; outputDigest?: string; outputBytes?: number;
+  /** Closed failure code of a settled item, e.g. PROVIDER_RATE_LIMITED or STRUCTURED_OUTPUT_INVALID. */
+  errorCode?: string };
 export type WorkerJob = {
   jobId: string; kind: "agent" | "bulk"; state: JobState; parentSessionName: string; attemptId: string; ownerKey?: string;
   configRevision: number; config: WorkerConfig; idempotencyKey: string; fingerprint: string; createdAt: string; updatedAt: string;
   request: AgentSubmit | BulkSubmit; childSessionName?: string; resumedFromJobId?: string; results: ItemResult[]; error?: string;
+  /** Earliest time a provider-limit pause may be resumed (Retry-After or a provider reset header). */
+  resumeAfter?: string;
+  /** Run principal that owns the job (pcp/2 principals); absent for chat-attempt jobs. */
+  principalId?: string; runId?: string;
 };
 /** Job metadata stays bounded regardless of the number or size of item inputs. */
 export type WorkerJobHeader = Omit<WorkerJob, "request" | "results"> & {
@@ -30,6 +41,13 @@ export type UsageReceipt = {
   providerId: string; model: string; role: "main" | "subagent"; promptSha256: string;
   httpStatus?: number; errorCode?: string; authTransport?: "authorization" | "api-key" | "missing";
   state: "running" | "completed" | "failed" | "cancelled" | "interrupted"; usage: StatisticsTokens; createdAt: string; updatedAt: string;
+  /** Attempt number of a bulk item call (1 for the first call, higher for broker retries). */
+  attempt?: number;
+  /** Upstream system_fingerprint, else the served model plus a digest of the server identity headers; never empty. */
+  serverFingerprint?: string;
+  /** sha256 of the canonical JSON of the effective request settings. */
+  settingsSha256?: string;
+  finishReason?: string | null; instrumentDigest?: string;
 };
 export type RuntimeParticipant = {
   sessionName: string; parentSessionName: string; attemptId: string; directory: string; provider: ModelProviderConfig;
