@@ -38,8 +38,11 @@ async function until(condition: () => boolean | Promise<boolean>, timeoutMs = 5_
 }
 
 type Upstream = { url: string; calls: number; starts: number[]; bodies: Record<string, unknown>[]; maxActive: number; release: () => void; hold: boolean };
-/** A Responses-API fake: each call reports 10 input and 2 output tokens unless `usage` is false; `hold` keeps calls open until released. */
-async function upstream(options: { hold?: boolean; delayMs?: number; usage?: boolean } = {}): Promise<Upstream> {
+/**
+ * A Responses-API fake: each call reports 10 input and 2 output tokens unless `usage` is false; `hold` keeps calls open
+ * until released; `fail` answers a call (1-based) with that HTTP status instead.
+ */
+async function upstream(options: { hold?: boolean; delayMs?: number; usage?: boolean; fail?: (call: number, body: Record<string, unknown>) => number | undefined } = {}): Promise<Upstream> {
   const pending: (() => void)[] = [];
   let active = 0;
   const state: Upstream = { url: "", calls: 0, starts: [], bodies: [], maxActive: 0, release: () => { while (pending.length) pending.shift()!(); }, hold: options.hold ?? false };
@@ -49,6 +52,12 @@ async function upstream(options: { hold?: boolean; delayMs?: number; usage?: boo
     try { state.bodies.push(JSON.parse(text) as Record<string, unknown>); } catch { state.bodies.push({}); }
     state.calls += 1;
     state.starts.push(performance.now());
+    const failure = options.fail?.(state.calls, state.bodies.at(-1)!);
+    if (failure !== undefined) {
+      res.writeHead(failure, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { type: "upstream_error" } }));
+      return;
+    }
     active += 1;
     state.maxActive = Math.max(state.maxActive, active);
     const finish = () => {
@@ -75,10 +84,10 @@ function provider(id: string, baseUrl: string): ModelProviderConfig {
 }
 
 type Harness = { runtime: AdvancedRuntime; registry: PrincipalRegistry; dataDir: string; close: () => Promise<void> };
-async function harness(options: { dataDir?: string; providers?: ModelProviderConfig[]; legacy?: boolean; now?: () => number } = {}): Promise<Harness> {
+async function harness(options: { dataDir?: string; providers?: ModelProviderConfig[]; legacy?: boolean; now?: () => number; retryAttempts?: number } = {}): Promise<Harness> {
   process.env.TEST_MODEL_KEY = "test-secret";
   const dataDir = options.dataDir ?? await dataRoot();
-  const runtime = await AdvancedRuntime.open(join(dataDir, "advanced"), { defaultLimit: 60 });
+  const runtime = await AdvancedRuntime.open(join(dataDir, "advanced"), { defaultLimit: 60 }, options.retryAttempts ? { retry: { attempts: options.retryAttempts, baseDelayMs: 1, maxDelayMs: 5 } } : {});
   let registry: PrincipalRegistry | undefined;
   runtime.attach({
     start: async () => ({ content: [{ type: "text", text: "done" }], details: { output: "done", session: { state: "completed" } } }),
@@ -422,6 +431,50 @@ describe("principal budgets", () => {
     expect(registry.detail("run:a")!.usage.remaining.items).toBe(0);
   });
 
+  it("counts a retried item once: maxItems equal to the item count lets a job with a retried 502 finish", async () => {
+    const service = await upstream({ fail: (call) => (call === 1 ? 502 : undefined) });
+    const { registry, runtime } = await harness({ providers: [provider("judge", service.url)], retryAttempts: 3 });
+    const socket = (await registry.put("run:a", runBody({}, { maxConcurrency: 1, maxItems: 2 }))).socketPath!;
+    const job = (await unix(socket, "/bulk/submit?view=summary", { body: { configId: "judge", idempotencyKey: "retry", concurrency: 1, items: items("t", 2) } })).body;
+    const done = await settledJob(runtime, job.jobId);
+    expect(done.state).toBe("completed");
+    expect(done.results.map((r) => [r.state, r.attempts])).toEqual([["completed", 2], ["completed", 1]]);
+    expect(service.calls).toBe(3);
+    expect(registry.detail("run:a")!.usage).toMatchObject({ items: 2, remaining: { items: 0 } });
+  });
+
+  it("counts an item once across a resume of its job", async () => {
+    // t-1 fails for good (400 is not retried): the job fails, its resume re-runs t-1 without counting it again.
+    let failing = true;
+    const service = await upstream({ fail: (_call, body) => (failing && JSON.stringify(body).includes("t-1") ? 400 : undefined) });
+    const { registry, runtime } = await harness({ providers: [provider("judge", service.url)], retryAttempts: 3 });
+    const socket = (await registry.put("run:a", runBody({}, { maxConcurrency: 1, maxItems: 3 }))).socketPath!;
+    const items3 = Array.from({ length: 3 }, (_, index) => ({ id: `t-${index}`, input: `Review t-${index}` }));
+    const job = (await unix(socket, "/bulk/submit?view=summary", { body: { configId: "judge", idempotencyKey: "resume", concurrency: 1, items: items3 } })).body;
+    const failed = await settledJob(runtime, job.jobId);
+    expect(failed.state).toBe("failed");
+    expect(registry.detail("run:a")!.usage.items).toBe(3);
+    failing = false;
+    const resumed = await unix(socket, `/jobs/${job.jobId}/resume?view=summary`, { method: "POST" });
+    expect(resumed.status).toBe(200);
+    const done = await settledJob(runtime, resumed.body.jobId as string);
+    expect(done).toMatchObject({ state: "completed", resumedFromJobId: job.jobId });
+    expect(done.results.map((r) => r.id)).toEqual(["t-1"]);
+    expect(registry.detail("run:a")!.usage.items).toBe(3);
+  });
+
+  it("refunds the item charge of an admission that dispatched no call", async () => {
+    const service = await upstream();
+    const { registry, runtime } = await harness({ providers: [provider("judge", service.url)] });
+    const socket = (await registry.put("run:a", runBody({}, { maxConcurrency: 1, maxItems: 2 }))).socketPath!;
+    delete process.env.TEST_MODEL_KEY;
+    const job = (await unix(socket, "/bulk/submit?view=summary", { body: { configId: "judge", idempotencyKey: "nokey", concurrency: 1, items: items("k", 2) } })).body;
+    const done = await settledJob(runtime, job.jobId);
+    expect(done.results.map((r) => [r.state, r.errorCode])).toEqual([["failed", "PROVIDER_AUTH_REQUIRED"], ["failed", "PROVIDER_AUTH_REQUIRED"]]);
+    expect(service.calls).toBe(0);
+    expect(registry.detail("run:a")!.usage).toMatchObject({ items: 0, remaining: { items: 2 } });
+  });
+
   it("pauses expired principals and resumes once coscila extends the expiry", async () => {
     const service = await upstream();
     let now = Date.parse("2026-10-25T12:00:00Z");
@@ -566,6 +619,35 @@ describe("daemon shutdown", () => {
     const states = events.filter((event) => event.type === "broker.job").map((event) => (event.payload as { state: string; principalId: string | null; runId: string | null }));
     expect(states.every((payload) => payload.principalId === "run:a" && payload.runId === "study-1")).toBe(true);
     expect(states.map((payload) => payload.state)).toEqual(["queued", "running", "queued", "running", "completed"]);
+  });
+
+  it("counts the items a restart returned to the queue once when the job relaunches", async () => {
+    const service = await upstream({ hold: true });
+    const first = await harness({ providers: [provider("judge", service.url)] });
+    const socket = (await first.registry.put("run:a", runBody({}, { maxConcurrency: 2, maxItems: 6 }))).socketPath!;
+    const job = (await unix(socket, "/bulk/submit?view=summary", { body: { configId: "judge", idempotencyKey: "m", concurrency: 2, items: items("m", 6) } })).body;
+    await until(() => service.calls === 2);
+    expect(first.registry.detail("run:a")!.usage.items).toBe(2);
+    await first.close();
+    service.hold = false;
+    const second = await harness({ dataDir: first.dataDir, providers: [provider("judge", service.url)] });
+    const done = await settledJob(second.runtime, job.jobId);
+    expect(done.state).toBe("completed");
+    expect(service.calls).toBe(8);
+    expect(second.registry.detail("run:a")!.usage).toMatchObject({ items: 6, remaining: { items: 0 } });
+  });
+
+  it("relaunches a job whose every item was counted before the restart, although maxItems has no room left", async () => {
+    const service = await upstream({ hold: true });
+    const first = await harness({ providers: [provider("judge", service.url)] });
+    const socket = (await first.registry.put("run:a", runBody({}, { maxConcurrency: 2, maxItems: 2 }))).socketPath!;
+    const job = (await unix(socket, "/bulk/submit?view=summary", { body: { configId: "judge", idempotencyKey: "full", concurrency: 2, items: items("f", 2) } })).body;
+    await until(() => service.calls === 2);
+    await first.close();
+    service.hold = false;
+    const second = await harness({ dataDir: first.dataDir, providers: [provider("judge", service.url)] });
+    expect((await settledJob(second.runtime, job.jobId)).state).toBe("completed");
+    expect(second.registry.detail("run:a")!.usage).toMatchObject({ items: 2, remaining: { items: 0 } });
   });
 
   it("leaves a job interrupted for an explicit resume when its principal no longer admits it after the restart", async () => {

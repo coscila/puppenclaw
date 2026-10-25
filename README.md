@@ -693,8 +693,12 @@ Grants:
 - `maxConcurrency` bounds the dispatching items of all the principal's jobs
   together. The principal's slot is taken before provider capacity, so a
   principal at its limit holds no provider permit.
-- `maxItems` caps the items the principal admits over its lifetime, exactly.
-  `tokenBudget` caps the settled input tokens (every prompt token the provider
+- `maxItems` caps the items the principal admits over its lifetime, exactly. An
+  item counts once per job lineage (a job and the jobs resumed from it), at its
+  first admission: a broker retry, a relaunch after a restart and a resume admit
+  it again without counting it again, and an admission that dispatched no call
+  (cancelled, provider paused, missing credential) gives its count back. The
+  counted items persist in `principals.sqlite`. `tokenBudget` caps the settled input tokens (every prompt token the provider
   reports, cached ones included) and output tokens. Calls already dispatching,
   at most `maxConcurrency` of them, can overshoot a token budget. Reaching either
   pauses the job with `error: "budget_exhausted"`. The budget refills only when
@@ -717,7 +721,7 @@ The socket is the identity:
 
 - `socket: true` opens `<data-dir>/principals/<random>/broker.sock`: the
   directory is 0700, the socket 0600, and `principals.sqlite` (records, usage,
-  audit) lies next to them. The data directory is inside the daemon state root
+  counted items, audit) lies next to them. The data directory is inside the daemon state root
   (`PUPPENCLAW_STATE_ROOT`), which the lab sandbox policy hides from every
   sandbox and never binds. All lab and daemon processes share one user, so this
   separates sandboxes, not unsandboxed processes.

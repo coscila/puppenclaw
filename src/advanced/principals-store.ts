@@ -42,7 +42,9 @@ export class PrincipalStore {
         input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS principal_audit (seq INTEGER PRIMARY KEY AUTOINCREMENT, principal_id TEXT NOT NULL, at TEXT NOT NULL,
         action TEXT NOT NULL, before TEXT, after TEXT);
-      CREATE INDEX IF NOT EXISTS principal_audit_id ON principal_audit(principal_id, seq);`);
+      CREATE INDEX IF NOT EXISTS principal_audit_id ON principal_audit(principal_id, seq);
+      CREATE TABLE IF NOT EXISTS principal_item_charges (principal_id TEXT NOT NULL, lineage TEXT NOT NULL, item_id TEXT NOT NULL, charged_at TEXT NOT NULL,
+        PRIMARY KEY(principal_id, lineage, item_id)) WITHOUT ROWID;`);
     const version = db.prepare("SELECT value FROM meta WHERE key='schema'").get() as { value: string } | undefined;
     if (version && version.value !== SCHEMA_VERSION) {
       db.close();
@@ -93,6 +95,29 @@ export class PrincipalStore {
     const row = this.db.prepare("SELECT items, input_tokens, output_tokens FROM principal_usage WHERE principal_id=?").get(id) as
       { items: number; input_tokens: number; output_tokens: number } | undefined;
     return row ? { items: row.items, inputTokens: row.input_tokens, outputTokens: row.output_tokens } : { items: 0, inputTokens: 0, outputTokens: 0 };
+  }
+
+  /** Whether maxItems already counted this item of the job lineage. */
+  charged(id: string, lineage: string, itemId: string): boolean {
+    return this.db.prepare("SELECT 1 FROM principal_item_charges WHERE principal_id=? AND lineage=? AND item_id=?").get(id, lineage, itemId) !== undefined;
+  }
+
+  /** Counts one item of a job lineage against maxItems, once; false when it was counted before. */
+  charge(id: string, lineage: string, itemId: string, at: string): boolean {
+    return this.transaction(() => {
+      const inserted = Number(this.db.prepare("INSERT OR IGNORE INTO principal_item_charges (principal_id, lineage, item_id, charged_at) VALUES (?,?,?,?)").run(id, lineage, itemId, at).changes) === 1;
+      if (inserted) this.db.prepare("UPDATE principal_usage SET items=items+1 WHERE principal_id=?").run(id);
+      return inserted;
+    });
+  }
+
+  /** Returns an item charge (its admission never dispatched a call); false when there was none. */
+  refund(id: string, lineage: string, itemId: string): boolean {
+    return this.transaction(() => {
+      const deleted = Number(this.db.prepare("DELETE FROM principal_item_charges WHERE principal_id=? AND lineage=? AND item_id=?").run(id, lineage, itemId).changes) === 1;
+      if (deleted) this.db.prepare("UPDATE principal_usage SET items=MAX(items-1,0) WHERE principal_id=?").run(id);
+      return deleted;
+    });
   }
 
   addUsage(id: string, items: number, inputTokens: number, outputTokens: number): void {

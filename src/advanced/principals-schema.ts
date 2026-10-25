@@ -109,6 +109,11 @@ export function principalPauseOf(error: unknown): PrincipalPauseReason | undefin
   return typeof pause === "string" && Object.hasOwn(PAUSE_CODES, pause) ? pause as PrincipalPauseReason : undefined;
 }
 
+/** One item as maxItems counts it: its id within the job lineage (the first job of a resume chain). */
+export type PrincipalItemKey = { lineage: string; itemId: string };
+/** A held principal slot. `refund` takes back the item charge this admission made when its call never left. */
+export type PrincipalAdmission = { release(): void; refund(): void };
+
 /**
  * What the broker runtime asks of the principal registry. Chat-turn
  * participants (no principalId) never reach these hooks except for
@@ -123,13 +128,17 @@ export type PrincipalHooks = {
   readonly legacyAttemptAuthority: boolean;
   /** Throws when a principal may not submit this job (kind, provider, instrument, revoked, expired). */
   admitJob(participant: RuntimeParticipant, kind: "agent" | "bulk", request: AgentSubmit | BulkSubmit, config: WorkerConfig): void;
-  /** The pause reason that stops a principal job from dispatching another item, if any. No side effects, no store access. */
-  refusal(participant: RuntimeParticipant, job: Pick<WorkerJobHeader, "config" | "request">): PrincipalPauseReason | undefined;
   /**
-   * Waits for a concurrency slot of the principal and admits (counts) one item; the result releases the slot.
-   * The runtime passes the job it runs, so admission never reads the store per item.
+   * The pause reason that stops a principal job from dispatching another item, if any; no side effects. With
+   * `items`, maxItems refuses only when one of them is not counted yet in its lineage.
    */
-  admitItem(participant: RuntimeParticipant, signal: AbortSignal, job?: Pick<WorkerJobHeader, "config" | "request">): Promise<() => void>;
+  refusal(participant: RuntimeParticipant, job: Pick<WorkerJobHeader, "config" | "request">, items?: readonly PrincipalItemKey[]): PrincipalPauseReason | undefined;
+  /**
+   * Waits for a concurrency slot of the principal and admits one call of an item. maxItems counts each item of a
+   * job lineage once, at its first admission: a retry, a relaunch after a restart or a resume admits it again
+   * without a new charge. The runtime passes the job it runs, so admission never reads the job store per item.
+   */
+  admitItem(participant: RuntimeParticipant, signal: AbortSignal, job?: Pick<WorkerJobHeader, "config" | "request">, item?: PrincipalItemKey): Promise<PrincipalAdmission>;
   /** Charges a settled principal receipt to the principal's token budget (once per request); others are ignored. */
   observeReceipt(receipt: UsageReceipt): void;
 };

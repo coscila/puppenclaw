@@ -18,7 +18,9 @@ import {
   principalPutZod,
   principalRefusalError,
   type PrincipalGrants,
+  type PrincipalAdmission,
   type PrincipalHooks,
+  type PrincipalItemKey,
   type PrincipalKind,
   type PrincipalPauseReason,
   type PrincipalRecord,
@@ -333,17 +335,19 @@ export class PrincipalRegistry implements PrincipalHooks {
     if (digest === undefined && grants.instruments.length > 0) throw new PuppenclawError("INSTRUMENT_REQUIRED", "This principal may submit only work under one of its granted instruments.");
   }
 
-  refusal(participant: RuntimeParticipant, job: Pick<WorkerJobHeader, "config" | "request">): PrincipalPauseReason | undefined {
+  refusal(participant: RuntimeParticipant, job: Pick<WorkerJobHeader, "config" | "request">, items?: readonly PrincipalItemKey[]): PrincipalPauseReason | undefined {
     const entry = participant.principalId === undefined ? undefined : this.entries.get(participant.principalId);
-    return entry ? this.refusalFor(entry, job) : PRINCIPAL_PAUSE_REASONS.revoked;
+    return entry ? this.refusalFor(entry, job, { newItem: this.anyUncounted(entry, items) }) : PRINCIPAL_PAUSE_REASONS.revoked;
   }
 
-  async admitItem(participant: RuntimeParticipant, signal: AbortSignal, jobOfItem?: Pick<WorkerJobHeader, "config" | "request">): Promise<() => void> {
+  async admitItem(participant: RuntimeParticipant, signal: AbortSignal, jobOfItem?: Pick<WorkerJobHeader, "config" | "request">, item?: PrincipalItemKey): Promise<PrincipalAdmission> {
     const entry = this.entryFor(participant);
     const job = jobOfItem ?? (participant.jobId !== undefined ? this.runtime.store.jobHeader(participant.jobId) : null);
     for (;;) {
       signal.throwIfAborted();
-      const refusal = this.refusalFor(entry, job);
+      // An item its lineage already counted (a retry, a relaunch after a restart, a resume) needs no room under maxItems.
+      const counted = item !== undefined && !this.anyUncounted(entry, [item]);
+      const refusal = this.refusalFor(entry, job, { newItem: !counted });
       if (refusal) {
         // A refused waiter takes no slot: pass the wake-up on, so a refusal no event announced (expiry) reaches every waiter.
         entry.waiters.values().next().value?.();
@@ -351,14 +355,20 @@ export class PrincipalRegistry implements PrincipalHooks {
       }
       if (entry.active < entry.record.grants.maxConcurrency) {
         entry.active += 1;
-        entry.usage.items += 1;
-        this.store.addUsage(entry.record.id, 1, 0, 0);
-        let released = false;
-        return () => {
-          if (released) return;
-          released = true;
-          entry.active -= 1;
-          entry.waiters.values().next().value?.();
+        const charged = !counted && this.charge(entry, item);
+        let released = false, refunded = false;
+        return {
+          release: () => {
+            if (released) return;
+            released = true;
+            entry.active -= 1;
+            entry.waiters.values().next().value?.();
+          },
+          refund: () => {
+            if (!charged || refunded || item === undefined) return;
+            refunded = true;
+            this.refund(entry, item);
+          }
         };
       }
       await this.waitForSlot(entry, signal);
@@ -452,7 +462,8 @@ export class PrincipalRegistry implements PrincipalHooks {
     return state === "revoked" ? PRINCIPAL_PAUSE_REASONS.revoked : state === "expired" ? PRINCIPAL_PAUSE_REASONS.expired : undefined;
   }
 
-  private refusalFor(entry: Entry, job: Pick<WorkerJobHeader, "config" | "request"> | null): PrincipalPauseReason | undefined {
+  /** `newItem: false` for an item maxItems already counted; tokens and every other limit still apply. */
+  private refusalFor(entry: Entry, job: Pick<WorkerJobHeader, "config" | "request"> | null, options: { newItem: boolean } = { newItem: true }): PrincipalPauseReason | undefined {
     const lifecycle = this.lifecycleRefusal(entry);
     if (lifecycle) return lifecycle;
     const grants = entry.record.grants;
@@ -462,10 +473,33 @@ export class PrincipalRegistry implements PrincipalHooks {
       if (digest !== undefined ? !grants.instruments.includes(digest) : grants.instruments.length > 0) return PRINCIPAL_PAUSE_REASONS.grant;
     }
     const { usage } = entry;
-    if (grants.maxItems !== null && usage.items >= grants.maxItems) return PRINCIPAL_PAUSE_REASONS.budget;
+    if (options.newItem && grants.maxItems !== null && usage.items >= grants.maxItems) return PRINCIPAL_PAUSE_REASONS.budget;
     if (grants.tokenBudget?.input != null && usage.inputTokens >= grants.tokenBudget.input) return PRINCIPAL_PAUSE_REASONS.budget;
     if (grants.tokenBudget?.output != null && usage.outputTokens >= grants.tokenBudget.output) return PRINCIPAL_PAUSE_REASONS.budget;
     return undefined;
+  }
+
+  /** Whether any of these items is not counted yet in its lineage; without a list, every admission is a new item. */
+  private anyUncounted(entry: Entry, items: readonly PrincipalItemKey[] | undefined): boolean {
+    return items === undefined || items.some((item) => !this.store.charged(entry.record.id, item.lineage, item.itemId));
+  }
+
+  /** Counts a newly admitted item against maxItems, durably and once per job lineage; an unkeyed admission always counts. */
+  private charge(entry: Entry, item: PrincipalItemKey | undefined): boolean {
+    if (item === undefined) {
+      entry.usage.items += 1;
+      this.store.addUsage(entry.record.id, 1, 0, 0);
+      return true;
+    }
+    if (!this.store.charge(entry.record.id, item.lineage, item.itemId, timestamp())) return false;
+    entry.usage.items += 1;
+    return true;
+  }
+
+  private refund(entry: Entry, item: PrincipalItemKey): void {
+    if (this.storeClosed) return;
+    try { if (this.store.refund(entry.record.id, item.lineage, item.itemId)) entry.usage.items = Math.max(0, entry.usage.items - 1); }
+    catch (error) { this.warn(`puppenclaw: principal item charge was not refunded: ${errorText(error)}`); }
   }
 
   private waitForSlot(entry: Entry, signal: AbortSignal): Promise<void> {
@@ -630,9 +664,14 @@ export class PrincipalRegistry implements PrincipalHooks {
       throw new PuppenclawError("INSTRUMENT_NOT_GRANTED", "This principal is not granted that instrument.");
   }
 
-  /** A paused job resumes only once its principal may admit items again (e.g. after a PUT raised the budget). */
+  /**
+   * A paused job resumes only once its principal may admit its items again (e.g. after a PUT raised the budget).
+   * Items its lineage already counted need no room under maxItems.
+   */
   private assertResumable(entry: Entry, job: WorkerJob): void {
-    const refusal = this.refusalFor(entry, job);
+    const lineage = this.runtime.lineageOf(job);
+    const items = job.results.filter((result) => result.state !== "completed").map((result) => ({ lineage, itemId: result.id }));
+    const refusal = this.refusalFor(entry, job, { newItem: this.anyUncounted(entry, items) });
     if (refusal) throw principalRefusalError(refusal);
   }
 
