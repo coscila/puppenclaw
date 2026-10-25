@@ -63,6 +63,8 @@ import { ensureDir, redactSensitiveText } from "../shared/utils.js";
 import { EventLoopMonitor } from "./event-loop.js";
 import { identityEnvelope, identityHeaders, resolveBuildId, type DaemonIdentity } from "./identity.js";
 import { registerV2Routes, type StreamBacklog } from "./v2.js";
+import { registerV2BrokerRoutes } from "./v2-broker.js";
+import { EVENT_PAGE_MAX, EVENT_WAIT_MAX_MS, INLINE_OUTPUT_MAX_BYTES } from "../advanced/outbox.js";
 import { SseEventStream, sseMaxPendingBytesFromEnv, type SseEvent } from "./sse.js";
 import {
   compactOutputView,
@@ -466,22 +468,31 @@ export async function createDaemonServer(params: {
     streamBacklog,
     // compactStatus: status view=summary and transcriptLimit, GET /session/:name/transcript,
     // and start/send resultView=turn; every one is opt-in per request.
+    // eventFeed/brokerOutbox: GET /v2/events and POST /v2/events/ack over the broker
+    // outbox; instrumentMode: PUT|GET /v2/instruments and bulk jobs naming a digest.
     features: () => ({
       health: 1,
       opsIdle: 1,
       usageLedger: 1,
       compactStatus: 1,
       keyedStreaming: 1,
-      sseGap: 1
+      sseGap: 1,
+      eventFeed: 1,
+      brokerOutbox: 1,
+      instrumentMode: 1
     }),
     limits: () => ({
       turnKeyMax: 128,
       ledgerPageMax: MAX_LEDGER_PAGE_ROWS,
       transcriptLimitMax: MAX_TRANSCRIPT_LIMIT,
       transcriptPageMax: MAX_TRANSCRIPT_PAGE_ENTRIES,
-      sseMaxPendingBytes
+      sseMaxPendingBytes,
+      eventPageMax: EVENT_PAGE_MAX,
+      eventWaitMsMax: EVENT_WAIT_MAX_MS,
+      eventInlineOutputMax: INLINE_OUTPUT_MAX_BYTES
     })
   });
+  registerV2BrokerRoutes(app, { identity, advanced });
 
   // Deploy idle check (plan H2): counts only, no names or identifiers. The ops
   // CLI decides what blocks a deploy; the daemon only reports. Every count is
