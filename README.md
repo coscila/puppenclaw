@@ -674,7 +674,11 @@ Grants:
   secret. A socket client can never choose one. Unset means no provider for
   principals; an invalid value fails startup.
 - `instruments` are opaque digests. A principal with instrument grants may submit
-  only jobs that name one of them (`INSTRUMENT_REQUIRED`, `INSTRUMENT_NOT_GRANTED`).
+  only jobs that name one of them (403 `INSTRUMENT_REQUIRED`, 403
+  `INSTRUMENT_NOT_GRANTED`), and a granted digest must also be installed through
+  `PUT /v2/instruments/{digest}` (400 `INSTRUMENT_NOT_ALLOWED`): grants restrict
+  which installed instruments a principal's jobs may run, never widen the
+  allow-list.
 - `maxConcurrency` bounds the dispatching items of all the principal's jobs
   together. The principal's slot is taken before provider capacity, so a
   principal at its limit holds no provider permit.
@@ -712,11 +716,12 @@ The socket is the identity:
   `?view=summary` where the turn socket has it. `GET /configs` returns
   `authorization.principalId` (also as `attemptId`), `runId`, `state`,
   `instruments` and `publicLiteratureAllowed` (true for an active run principal),
-  the principal's grants and usage, and one bulk worker per granted, configured
-  provider, whose `id` is the provider id. Its `revision` changes only when that
-  worker list changes, never on budget changes. Agent workers, native model
-  routes, proxying and CONNECT are refused. No header, body field or environment
-  variable names a principal.
+  the principal's grants and usage, `instrumentMode: 1` with `instruments` (the
+  installed instruments it is granted, in the turn socket's shape), and one bulk
+  worker per granted, configured provider, whose `id` is the provider id. Its
+  `revision` changes only when that worker list changes, never on budget changes.
+  Agent workers, native model routes, proxying and CONNECT are refused. No
+  header, body field or environment variable names a principal.
 - Principals and sockets persist: a restart reopens each socket at the same path
   in the same directory; only the socket file is replaced.
 

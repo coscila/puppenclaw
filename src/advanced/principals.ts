@@ -157,6 +157,9 @@ function socketStatus(error: unknown): [number, string] {
     case "INSTRUMENT_REQUIRED":
     case "PRINCIPAL_AGENT_UNSUPPORTED":
       return [403, error.code];
+    case "INSTRUMENT_NOT_ALLOWED":
+    case "INSTRUMENT_REQUEST_CONFLICT":
+      return [400, error.code];
     case "WORKER_NOT_FOUND":
     case "WORKER_CONFIG_NOT_FOUND":
     case "UNKNOWN_PRINCIPAL_ROUTE":
@@ -651,6 +654,10 @@ export class PrincipalRegistry implements PrincipalHooks {
         publicLiteratureAllowed: record.kind === "run" && state === "active", instruments: grants.instruments
       },
       principal: { id: record.id, kind: record.kind, runId: record.runId, state, grants, revision: record.revision, usage: this.usageView(record, entry.usage, entry.active) },
+      // Instrument mode, like the turn socket, but only the installed instruments this principal is granted.
+      instrumentMode: 1,
+      instruments: this.runtime.instruments().filter((installed) => grants.instruments.includes(installed.digest))
+        .map((installed) => ({ digest: installed.digest, instrumentId: installed.bundle.instrumentId, version: installed.bundle.version, itemsPerCall: installed.bundle.itemsPerCall })),
       workers: participant.config.workers.map((worker) => ({
         id: worker.id, assignment: worker.assignment, providerId: worker.modelProvider.id, model: worker.modelProvider.model,
         modelProvider: { id: worker.modelProvider.id, model: worker.modelProvider.model, kind: worker.modelProvider.kind, label: worker.modelProvider.label, reasoningProfile: worker.modelProvider.reasoningProfile },

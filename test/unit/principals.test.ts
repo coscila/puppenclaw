@@ -37,14 +37,16 @@ async function until(condition: () => boolean | Promise<boolean>, timeoutMs = 5_
   }
 }
 
-type Upstream = { url: string; calls: number; starts: number[]; maxActive: number; release: () => void; hold: boolean };
+type Upstream = { url: string; calls: number; starts: number[]; bodies: Record<string, unknown>[]; maxActive: number; release: () => void; hold: boolean };
 /** A Responses-API fake: each call reports 10 input and 2 output tokens unless `usage` is false; `hold` keeps calls open until released. */
 async function upstream(options: { hold?: boolean; delayMs?: number; usage?: boolean } = {}): Promise<Upstream> {
   const pending: (() => void)[] = [];
   let active = 0;
-  const state: Upstream = { url: "", calls: 0, starts: [], maxActive: 0, release: () => { while (pending.length) pending.shift()!(); }, hold: options.hold ?? false };
+  const state: Upstream = { url: "", calls: 0, starts: [], bodies: [], maxActive: 0, release: () => { while (pending.length) pending.shift()!(); }, hold: options.hold ?? false };
   const handler: RequestListener = async (req, res: ServerResponse) => {
-    for await (const _chunk of req) { /* drain */ }
+    let text = "";
+    for await (const chunk of req) text += chunk;
+    try { state.bodies.push(JSON.parse(text) as Record<string, unknown>); } catch { state.bodies.push({}); }
     state.calls += 1;
     state.starts.push(performance.now());
     active += 1;
@@ -290,6 +292,38 @@ describe("grant enforcement", () => {
     expect(registry.refusal(participant, { config: { modelProvider: { id: "judge" } }, request: { instrumentDigest: "a".repeat(64) } } as never)).toBeUndefined();
     expect(service.calls).toBe(0);
     expect(runtime.store.jobHeaders("principal:run:a")).toEqual([]);
+  });
+
+  it("gates instrument mode: grants restrict which installed instruments a principal runs; events carry principalId, runId and provenance", async () => {
+    const service = await upstream();
+    const { registry, runtime } = await harness({ providers: [provider("judge", service.url)] });
+    const bundle = { instrumentId: "census-judge", version: 1, systemPrompt: "Judge each citation.", responseSchema: null, maxOutputTokens: { perItem: 64, minimum: 128 }, temperature: 0, seed: 7, reasoning: "none", itemsPerCall: 4, requiredModelFingerprint: null };
+    const [granted, missing, ungranted] = ["a", "b", "c"].map((c) => c.repeat(64));
+    runtime.installInstrument(granted!, bundle);
+    runtime.installInstrument(ungranted!, { ...bundle, systemPrompt: "Another instrument." });
+    const socket = (await registry.put("run:i", runBody({ runId: "study-i" }, { instruments: [granted, missing] }))).socketPath!;
+    expect((await unix(socket, "/configs")).body).toMatchObject({ instrumentMode: 1, instruments: [{ digest: granted, instrumentId: "census-judge", version: 1, itemsPerCall: 4 }] });
+    // Granted but not installed: the allow-list still refuses it. Installed but not granted: the grant refuses it.
+    expect(await unix(socket, "/bulk/submit", { body: { configId: "judge", idempotencyKey: "m", instrumentDigest: missing, items: items("m", 1) } })).toMatchObject({ status: 400, body: { code: "INSTRUMENT_NOT_ALLOWED" } });
+    expect(await unix(socket, "/bulk/submit", { body: { configId: "judge", idempotencyKey: "u", instrumentDigest: ungranted, items: items("u", 1) } })).toMatchObject({ status: 403, body: { code: "INSTRUMENT_NOT_GRANTED" } });
+    expect(service.calls).toBe(0);
+    const job = (await unix(socket, "/bulk/submit?view=summary", { body: { configId: "judge", idempotencyKey: "g", instrumentDigest: granted, items: items("g", 3) } })).body;
+    expect(job).toMatchObject({ instrumentDigest: granted });
+    expect(await settledJob(runtime, job.jobId)).toMatchObject({ state: "completed", principalId: "run:i", runId: "study-i" });
+    // Instrument settings reached the upstream: worker policy plus instrument prompt, max(minimum, perItem x items), sampling.
+    expect(service.bodies).toHaveLength(3);
+    for (const sent of service.bodies) {
+      expect(sent).toMatchObject({ max_output_tokens: 128, temperature: 0, seed: 7, reasoning: { effort: "none" } });
+      expect(String((sent.input as { content: string }[])[0]!.content)).toMatch(/\n\nJudge each citation\.$/u);
+    }
+    const events = runtime.store.events(0, 1000).events.filter((event) => event.jobId === job.jobId);
+    const jobEvents = events.filter((event) => event.type === "broker.job").map((event) => event.payload);
+    expect(jobEvents.at(-1)).toMatchObject({ principalId: "run:i", runId: "study-i", instrumentDigest: granted, state: "completed", counts: { total: 3, succeeded: 3 } });
+    expect(jobEvents.every((payload) => (payload as { principalId: string }).principalId === "run:i")).toBe(true);
+    const receipts = events.filter((event) => event.type === "broker.receipt").map((event) => event.payload);
+    expect(receipts).toHaveLength(3);
+    for (const receipt of receipts) expect(receipt).toMatchObject({ status: "succeeded", instrumentDigest: granted, serverFingerprint: expect.stringMatching(/\S/u), settingsSha256: expect.stringMatching(/^[0-9a-f]{64}$/u), usage: { input: 10, output: 2 } });
+    expect(registry.detail("run:i")!.usage).toMatchObject({ items: 3, inputTokens: 30, outputTokens: 6 });
   });
 
   it("pauses running work when a provider grant is withdrawn and makes no further calls", async () => {
