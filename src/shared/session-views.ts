@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-import { jsonToolResult } from "./tool-results.js";
+import { jsonToolResult, textToolResult } from "./tool-results.js";
 import type { SessionInfo, SessionTranscriptEntry, ToolResult } from "./types.js";
 import { redactSensitiveText } from "./utils.js";
 
@@ -127,6 +127,24 @@ export function limitStatusTranscripts(result: ToolResult, limit: number): ToolR
     return jsonToolResult({ ...details, session: limitTranscript(details.session as SessionInfo, limit) }, label);
   }
   return result;
+}
+
+/**
+ * The output view (GET /session/:name/output, opt-in `view=summary`) with its
+ * session compacted like the status summary: no transcript, or only the
+ * newest `transcriptLimit` entries, plus `transcriptSummary`, and no JSON copy
+ * of the payload in the text block. The latest output itself is kept.
+ */
+export function compactOutputView(result: ToolResult, transcriptLimit?: number): ToolResult {
+  const details = result.details as Record<string, unknown>;
+  const label = result.content.find((block) => block.type === "text")?.text.split("\n")[0] ?? "Output";
+  return textToolResult(label, {
+    view: "summary",
+    ...details,
+    ...(details.session != null
+      ? { session: compactSessionView(details.session as SessionInfo, transcriptLimit) }
+      : {})
+  });
 }
 
 function limitTranscript<T extends SessionInfo>(session: T, limit: number): T & { transcriptSummary: TranscriptSummary } {

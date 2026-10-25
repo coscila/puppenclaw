@@ -154,6 +154,70 @@ describe("compact status views", () => {
     }
   });
 
+  it("serves /output in the summary view without the session transcript or JSON duplication", async () => {
+    const dataDir = await createTempDir("puppenclaw-output-summary-");
+    const workspace = await createTempDir("puppenclaw-output-summary-ws-");
+    await writeSeedState(dataDir, [
+      seedSession("lab-out", workspace, { transcript: seedTranscript(400, 5_000, "turn-1") })
+    ]);
+    const { app } = await createDaemonServer({
+      config: makeConfig({ acpxCommand: await resolveFakeAcpxCommand() }),
+      dataDir,
+      logger: quiet
+    });
+    type OutputBody = {
+      content: Array<{ type: string; text: string }>;
+      details: Record<string, unknown> & {
+        session: Record<string, unknown> & { transcript?: Array<{ text: string }> };
+        output: { text: string; source: string; turnId: string | null };
+      };
+      bootId?: string;
+    };
+    try {
+      const legacy = await app.inject({ method: "GET", url: "/session/lab-out/output" });
+      expect(legacy.statusCode).toBe(200);
+      const legacyBody = JSON.parse(legacy.body) as OutputBody;
+      expect(legacyBody.details.session.transcript).toHaveLength(400);
+      expect(legacyBody).not.toHaveProperty("bootId");
+      expect(Buffer.byteLength(legacy.body)).toBeGreaterThan(2_000_000);
+
+      const summary = await app.inject({
+        method: "GET",
+        url: "/session/lab-out/output?view=summary&transcriptLimit=1"
+      });
+      expect(summary.statusCode).toBe(200);
+      expect(Buffer.byteLength(summary.body)).toBeLessThan(16_384);
+      const body = JSON.parse(summary.body) as OutputBody;
+      expect(body.content).toEqual([{ type: "text", text: "Output for lab-out" }]);
+      expect(body.bootId).toBe(summary.headers["x-puppenclaw-boot-id"]);
+      expect(body.details.view).toBe("summary");
+      expect(body.details.output).toEqual(legacyBody.details.output);
+      expect(body.details.output).toMatchObject({ source: "transcript", turnId: "turn-1" });
+      expect(body.details.session.transcript?.map((entry) => entry.text.split(":")[0])).toEqual(["399"]);
+      expect(body.details.session).toMatchObject({
+        name: "lab-out",
+        transcriptSummary: { entries: 400, lastRole: "assistant", lastTurnId: "turn-1" }
+      });
+
+      const bare = JSON.parse(
+        (await app.inject({ method: "GET", url: "/session/lab-out/output?view=summary" })).body
+      ) as OutputBody;
+      expect(bare.details.session).not.toHaveProperty("transcript");
+
+      const limited = JSON.parse(
+        (await app.inject({ method: "GET", url: "/session/lab-out/output?transcriptLimit=2" })).body
+      ) as OutputBody;
+      expect(limited.details.session.transcript?.map((entry) => entry.text.split(":")[0])).toEqual(["398", "399"]);
+      expect(limited.details.output).toEqual(legacyBody.details.output);
+
+      const refused = await app.inject({ method: "GET", url: "/session/lab-out/output?view=compact" });
+      expect(refused.statusCode).toBe(400);
+      expect(JSON.parse(refused.body)).toMatchObject({ code: "INVALID_PARAMS" });
+    } finally {
+      await app.close();
+    }
+  });
+
   it("reports quiesced sessions, rejects bad view parameters and keeps NO_SESSION", async () => {
     const dataDir = await createTempDir("puppenclaw-summary-edges-");
     const workspace = await createTempDir("puppenclaw-summary-edges-ws-");

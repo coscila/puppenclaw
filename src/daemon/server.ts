@@ -65,6 +65,7 @@ import { identityEnvelope, identityHeaders, resolveBuildId, type DaemonIdentity 
 import { registerV2Routes, type StreamBacklog } from "./v2.js";
 import { SseEventStream, sseMaxPendingBytesFromEnv, type SseEvent } from "./sse.js";
 import {
+  compactOutputView,
   limitStatusTranscripts,
   MAX_TRANSCRIPT_LIMIT,
   MAX_TRANSCRIPT_PAGE_ENTRIES,
@@ -694,15 +695,22 @@ export async function createDaemonServer(params: {
     return withIdentity(textToolResult(`Transcript of ${name}`, page));
   });
 
-  app.get("/session/:name/output", async (request) =>
-    ok(
-      await manager.output(
-        statusParamsZod.parse({
-          name: (request.params as { name: string }).name
-        })
-      )
-    )
-  );
+  // The same opt-ins as status (capability compactStatus): view=summary drops
+  // the session transcript, transcriptLimit keeps its newest entries.
+  app.get("/session/:name/output", async (request) => {
+    const query = statusViewQueryZod.parse(request.query ?? {});
+    const result = await manager.output(
+      statusParamsZod.parse({
+        name: (request.params as { name: string }).name
+      })
+    );
+    if (query.view === "summary") {
+      return withIdentity(compactOutputView(result, query.transcriptLimit));
+    }
+    return query.transcriptLimit != null
+      ? withIdentity(limitStatusTranscripts(result, query.transcriptLimit))
+      : ok(result);
+  });
 
   app.get("/session/:name/cost", async (request) => {
     const limit = boundedCostHistoryLimit((request.query as { limit?: unknown } | undefined)?.limit);

@@ -435,7 +435,8 @@ set; none of them is added to the open `/health` and `/capabilities`.
 - `GET /session/:name?view=summary` and `GET /sessions?view=summary`: the
   session without its transcript (plus `transcriptSummary`) and without the
   `acpx status` probe. `transcriptLimit=N` (0–1000) keeps the newest N entries
-  in either view.
+  in either view. `GET /session/:name/output` takes the same two options: its
+  latest output stays, its session snapshot is compacted the same way.
 - `GET /session/:name/transcript?after=SEQ&limit=N` (1–500, about 1 MB per page):
   entries with `seq`, `total`, `next`, `hasMore`, and the session `generation`.
 - `GET /usage/ledger?afterId=SEQ&limit=N` (1–1000): ledger rows in insertion
