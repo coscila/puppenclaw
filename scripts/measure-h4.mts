@@ -1,7 +1,8 @@
 /**
  * Plan H4 acceptance measurements against a real daemon process.
  *
- *   npm run build && node --experimental-strip-types scripts/measure-h4.mts [--window-ms N] [--stall-ms N]
+ *   npm run build && node --experimental-strip-types scripts/measure-h4.mts \
+ *     [--window-ms N] [--stall-ms N] [--stall-rate BYTES_PER_S] [--only load|stall]
  *
  * Starts dist/daemon/cli.js on a free loopback port with a throwaway data
  * directory, a production-sized session store (about 9 MB of transcripts in 165
@@ -10,8 +11,11 @@
  *   next to the size of the legacy GET /sessions probe;
  * - load: state.json writes per minute and event-loop p99 with 5 live turns at
  *   the default 30 s checkpoint tick (targets <= 12/min and < 50 ms);
- * - stall: daemon RSS growth while one SSE consumer stays stalled during a
- *   streaming turn (target < 10 MB over 10 min; pass --stall-ms 600000).
+ * - stall: daemon memory growth while one SSE consumer stays stalled during a
+ *   streaming turn, against the same turn with a reading consumer, each in a
+ *   fresh daemon (target < 10 MB over 10 min: --stall-ms 600000 at the default
+ *   50 KB/s, or a byte-equivalent scaled run such as --stall-ms 60000
+ *   --stall-rate 500000).
  * Never point it at a deployment: it only talks to the daemon it starts.
  */
 import { spawn, type ChildProcess } from "node:child_process";
@@ -33,6 +37,8 @@ const option = (name: string, fallback: number): number => {
 };
 const WINDOW_MS = option("--window-ms", 120_000);
 const STALL_MS = option("--stall-ms", 120_000);
+const STALL_RATE = option("--stall-rate", 50_000);
+const ONLY = args.includes("--only") ? args[args.indexOf("--only") + 1] : undefined;
 const TOKEN = randomBytes(32).toString("base64url");
 const sleep = (ms: number) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
 
@@ -220,18 +226,20 @@ async function loadAndHealth(report: Record<string, unknown>): Promise<void> {
 }
 
 /**
- * One SSE consumer stops reading while its turn streams about 50 KB/s. The
- * daemon keeps each turn's full output until the turn ends, so the same run
- * with a reading consumer is the baseline; the difference is what the stalled
- * stream costs. Fresh daemon, small store, so GC noise stays low.
+ * One SSE consumer stops reading while its turn streams STALL_RATE bytes/s. The
+ * daemon keeps every turn's full output in memory until the turn ends, so the
+ * same turn with a reading consumer is the baseline; each phase runs in a fresh
+ * daemon with a small store, and the difference is what the stalled stream costs.
  */
-async function stall(report: Record<string, unknown>): Promise<void> {
+async function stallPhase(stalled: boolean) {
   const { dataDir, workspace, configPath } = await prepare(false);
   const port = await freePort();
   const daemon = await startDaemon(dataDir, configPath, port);
   const pid = daemon.pid!;
-  const phase = async (name: string, stalled: boolean) => {
-    const stallChunks = Math.ceil((STALL_MS + 30_000) / 20);
+  const intervalMs = 20;
+  const chunkChars = Math.max(16, Math.round((STALL_RATE * intervalMs) / 1_000));
+  const chunks = Math.ceil((STALL_MS + 30_000) / intervalMs);
+  try {
     const response = await new Promise<IncomingMessage>((resolveResponse, reject) => {
       const req = request(
         { host: "127.0.0.1", port, path: "/session/start/stream", method: "POST", headers: { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" } },
@@ -241,9 +249,9 @@ async function stall(report: Record<string, unknown>): Promise<void> {
       req.end(
         JSON.stringify({
           agent: "claude",
-          name,
+          name: stalled ? "lab-stalled-consumer" : "lab-reading-consumer",
           directory: workspace,
-          task: `STREAM_CHUNKS=${stallChunks} STREAM_INTERVAL_MS=20 STREAM_CHUNK_CHARS=1000 STREAM_NEWLINES`,
+          task: `STREAM_CHUNKS=${chunks} STREAM_INTERVAL_MS=${intervalMs} STREAM_CHUNK_CHARS=${chunkChars} STREAM_NEWLINES`,
           resultView: "turn"
         })
       );
@@ -253,49 +261,57 @@ async function stall(report: Record<string, unknown>): Promise<void> {
     } else {
       response.resume();
     }
-    await sleep(15_000);
-    const warmHealth = JSON.parse((await api(port, "/v2/health")).body) as Health;
+    await sleep(10_000);
     const rssWarm = await rssBytes(pid);
+    const heapWarm = (JSON.parse((await api(port, "/v2/health")).body) as Health).memory.heapUsedBytes;
     const rss: number[] = [];
     const heap: number[] = [];
     let maxStreamBytes = 0;
     const startedAt = Date.now();
+    const sampleMs = Math.max(1_000, Math.min(5_000, Math.floor(STALL_MS / 30)));
     while (Date.now() - startedAt < STALL_MS) {
-      await sleep(5_000);
+      await sleep(sampleMs);
       rss.push(await rssBytes(pid));
       const health = JSON.parse((await api(port, "/v2/health")).body) as Health;
       heap.push(health.memory.heapUsedBytes);
       maxStreamBytes = Math.max(maxStreamBytes, health.backlog.streamBytes);
     }
+    const durationMs = Date.now() - startedAt;
     response.destroy();
-    await api(port, `/session/${name}`, { method: "DELETE" });
     return {
-      durationMs: Date.now() - startedAt,
+      durationMs,
+      producedBytes: Math.round((STALL_RATE * durationMs) / 1_000),
       rssGrowthBytes: (rss.at(-1) ?? rssWarm) - rssWarm,
       rssPeakGrowthBytes: Math.max(...rss) - rssWarm,
-      heapGrowthBytes: (heap.at(-1) ?? warmHealth.memory.heapUsedBytes) - warmHealth.memory.heapUsedBytes,
+      heapGrowthBytes: (heap.at(-1) ?? heapWarm) - heapWarm,
+      heapPeakGrowthBytes: Math.max(...heap) - heapWarm,
       maxStreamBacklogBytes: maxStreamBytes
-    };
-  };
-  try {
-    const reading = await phase("lab-reading-consumer", false);
-    const stalled = await phase("lab-stalled-consumer", true);
-    report.stall = {
-      producedBytesPerSecond: 50_000,
-      readingConsumer: reading,
-      stalledConsumer: stalled,
-      stallAttributableRssGrowthBytes: stalled.rssGrowthBytes - reading.rssGrowthBytes,
-      stallAttributableHeapGrowthBytes: stalled.heapGrowthBytes - reading.heapGrowthBytes
     };
   } finally {
     await stop(daemon);
   }
 }
 
+async function stall(report: Record<string, unknown>): Promise<void> {
+  const reading = await stallPhase(false);
+  const stalled = await stallPhase(true);
+  report.stall = {
+    producedBytesPerSecond: STALL_RATE,
+    readingConsumer: reading,
+    stalledConsumer: stalled,
+    stallAttributableRssGrowthBytes: stalled.rssGrowthBytes - reading.rssGrowthBytes,
+    stallAttributableHeapGrowthBytes: stalled.heapGrowthBytes - reading.heapGrowthBytes
+  };
+}
+
 async function main(): Promise<void> {
   const report: Record<string, unknown> = {};
-  await loadAndHealth(report);
-  await stall(report);
+  if (ONLY !== "stall") {
+    await loadAndHealth(report);
+  }
+  if (ONLY !== "load") {
+    await stall(report);
+  }
   console.log(JSON.stringify(report, null, 2));
 }
 
