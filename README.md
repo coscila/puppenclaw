@@ -403,6 +403,73 @@ Stop it:
 node dist/daemon/cli.js stop --host 127.0.0.1 --port 18795
 ```
 
+SIGTERM and SIGINT close the daemon: it stops accepting requests, ends
+connections still open after 2 s, closes its stores and releases the state owner
+lease, then exits 0. A second signal, a failing close, or a close that outlasts
+`PUPPENCLAW_SHUTDOWN_TIMEOUT_MS` (default 20000) exits 1 at once. Runner process
+groups are detached and keep running; see the boot reaper below.
+
+### pcp/2 identity, health and opt-in compact shapes
+
+Every response carries the headers `x-puppenclaw-protocol` (`2.0`),
+`x-puppenclaw-boot-id` (new on every start) and `x-puppenclaw-spool-id` (the
+identity of the persisted in-flight state in `spool.json`; it changes only when
+that state is replaced: a fresh data directory, unreadable state, or a recovery
+reset). The routes below require the bearer token whenever `daemonAuthToken` is
+set; none of them is added to the open `/health` and `/capabilities`.
+
+- `GET /v2/health`: constant-cost and under 1 KB: `ok`, `protocol`, `bootId`,
+  `spoolId`, `build` (`PUPPENCLAW_BUILD_ID` or version plus bundle digest),
+  `activeTurns`, `backlog` (open streams, queued stream events and bytes,
+  pending state writes), `eventLoop` (`monitorEventLoopDelay` p99 and max lag in
+  ms over a 30 s window) and `memory`.
+- `GET /v2/capabilities`: `features` (`health`, `opsIdle`, `usageLedger`,
+  `compactStatus`, `keyedStreaming`, `sseGap`), `limits`, and provider dialect
+  limits, e.g. the structured-output keywords removed for `qwen-3.8`.
+- `GET /ops/idle`: counts only (active turns, turn and runner processes, running
+  turn keys, fenced sessions, active and paused broker jobs, active compute
+  jobs, open streams, leftover runner groups from the previous boot).
+- `GET /session/:name?view=summary` and `GET /sessions?view=summary`: the
+  session without its transcript (plus `transcriptSummary`) and without the
+  `acpx status` probe. `transcriptLimit=N` (0–1000) keeps the newest N entries
+  in either view.
+- `GET /session/:name/transcript?after=SEQ&limit=N` (1–500, about 1 MB per page):
+  entries with `seq`, `total`, `next`, `hasMore`, and the session `generation`.
+- `GET /usage/ledger?afterId=SEQ&limit=N` (1–1000): ledger rows in insertion
+  order with `seq`, `next`, `hasMore`, `head` and a stable `ledgerId`; `afterId`
+  also accepts a ledger row id.
+- `POST /session/start` and `POST /session/:name/send` (and their `/stream`
+  variants) accept `"resultView": "turn"`: the result holds this turn's output
+  and signals and the same compact session snapshot a keyed replay returns,
+  never the transcript. On the stream routes, `"keyedStreaming": true` lets a
+  keyed turn stream its own live output with the same event sequence as an
+  unkeyed turn; a repeated request for a running key joins its remaining output,
+  and replays or rejected requests never see another turn's output. These
+  options are not part of the turn fingerprint.
+
+Without these options every route answers exactly as before. Opted-in bodies
+also carry `protocol`, `bootId` and `spoolId`.
+
+Each SSE stream writes straight through while the client reads. When the client
+falls behind, events wait in that stream's queue and chunks are coalesced; above
+`PUPPENCLAW_SSE_MAX_PENDING_BYTES` (default 8 MiB) further `chunk` and
+`activity` events are dropped and replaced by one `gap` event with
+`droppedEvents` and `droppedBytes`. `final`, `question`, `complete`, `error`,
+`result` and `done` are never dropped. A stalled client never slows the runner.
+
+Live-turn progress is checkpointed for all turns together every
+`PUPPENCLAW_ACTIVE_TURN_CHECKPOINT_MS` (default 30000), and session state
+writes are group-committed; status reads report the live values.
+
+Every detached runner group is recorded under `<data-dir>/runners`.
+`PUPPENCLAW_BOOT_REAPER` decides what the next start does with groups a
+crashed daemon left behind: `observe` (default) logs and counts them, `on`
+terminates those whose leader is provably the recorded process (SIGTERM, then
+SIGKILL) and asks their acpx runtimes to cancel the interrupted prompt, and
+`off` keeps no records. A group whose leader is gone is never signalled.
+`node --experimental-strip-types scripts/measure-h4.mts` measures health cost,
+state writes, event-loop lag and stalled-stream memory against a built daemon.
+
 Advanced worker jobs store each input and result in its own SQLite row. Existing
 job records migrate transactionally at startup; completed items and idempotency
 keys survive the migration. Back up the daemon state before updating it.
