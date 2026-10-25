@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { readPluginConfig } from "../shared/config.js";
 import { DAEMON_PORT } from "../shared/schema.js";
 import { startDaemonServer } from "./main.js";
+import { installShutdownHandlers, shutdownTimeoutFromEnv } from "./shutdown.js";
 
 type CliOptions = {
   host?: string;
@@ -85,11 +86,15 @@ async function main(): Promise<void> {
   }
 
   const config = await loadConfig(parsed.options.configPath);
-  await startDaemonServer({
+  const daemon = await startDaemonServer({
     ...(parsed.options.host != null ? { host: parsed.options.host } : {}),
     port: parsed.options.port,
     ...(parsed.options.dataDir != null ? { dataDir: parsed.options.dataDir } : {}),
     ...(config != null ? { config } : {})
+  });
+  installShutdownHandlers({
+    close: daemon.close,
+    timeoutMs: shutdownTimeoutFromEnv()
   });
   const entryDir = dirname(fileURLToPath(import.meta.url));
   console.log(
