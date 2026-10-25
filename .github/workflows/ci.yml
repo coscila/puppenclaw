@@ -1,27 +1,48 @@
 name: CI
 
 on:
-  push:
-    paths:
-      - "puppenclaw/**"
   pull_request:
-    paths:
-      - "puppenclaw/**"
+  push:
+    branches:
+      - main
+      - dev
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Commit and content guard
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ "$EVENT" = "pull_request" ]; then RANGE="$BASE..$HEAD_SHA";
+          elif [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then RANGE="$BEFORE..$GITHUB_SHA";
+          else RANGE="origin/main..$GITHUB_SHA"; fi
+          echo "RANGE=$RANGE" >> "$GITHUB_ENV"
+          python3 scripts/guard/guard.py ci --range "$RANGE"
+
   verify:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: puppenclaw
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version-file: .nvmrc
           cache: npm
-          cache-dependency-path: puppenclaw/package.json
-      - run: npm install
+      - run: npm ci
+      - run: npm run build
       - run: npm run lint
       - run: npm run typecheck
       - run: npm run test
