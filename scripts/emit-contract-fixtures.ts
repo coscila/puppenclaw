@@ -5,7 +5,8 @@
  *
  * The generator seeds a session store with one session per scenario, boots the
  * real daemon HTTP server (createDaemonServer) against it, and captures the
- * exact JSON bodies of GET /session/:name and GET /session/:name/output via
+ * exact JSON bodies of GET /session/:name, GET /session/:name?view=summary and
+ * GET /session/:name/output via
  * Fastify's inject — the same route handlers, manager methods, and envelope
  * builders that serve production traffic. Consumer-side contract tests can
  * treat the committed fixtures as the daemon's authoritative wire format;
@@ -55,6 +56,8 @@ export type ContractScenario = (typeof CONTRACT_SCENARIOS)[number];
 export type ContractCapture = {
   status: unknown;
   output: unknown;
+  /** GET /session/:name?view=summary, the compact pcp/2 step-1 status view. */
+  summary: unknown;
 };
 
 export const CONTRACT_FIXTURES_DIR = join(
@@ -72,6 +75,8 @@ const FIXED_PROCESS_START_IDENTITY = "431602:8888888";
 const FIXED_AGE_MS = 61_000;
 const FIXED_OUTPUT_AGE_MS = 32_000;
 const DEAD_PID = 999_999_999;
+const FIXED_BOOT_ID = "00000000-0000-4000-8000-000000000001";
+const FIXED_SPOOL_ID = "00000000-0000-4000-8000-000000000002";
 
 const T_CREATED = "2026-01-01T10:00:00.000Z";
 const T_USER = "2026-01-01T10:00:05.000Z";
@@ -296,7 +301,9 @@ function sanitizeBody(
     )
     .replace(/(\\?"detectedAt\\?":\s*\\?")[^"\\]+(\\?")/gu, `$1${T_LAST_ACTIVITY}$2`)
     .replace(/(\\?"ageMs\\?":\s*)\d+/gu, `$1${FIXED_AGE_MS}`)
-    .replace(/(\\?"outputAgeMs\\?":\s*)\d+/gu, `$1${FIXED_OUTPUT_AGE_MS}`);
+    .replace(/(\\?"outputAgeMs\\?":\s*)\d+/gu, `$1${FIXED_OUTPUT_AGE_MS}`)
+    .replace(/("bootId":\s*")[^"]+(")/gu, `$1${FIXED_BOOT_ID}$2`)
+    .replace(/("spoolId":\s*")[^"]+(")/gu, `$1${FIXED_SPOOL_ID}$2`);
   return JSON.parse(sanitized);
 }
 
@@ -359,14 +366,23 @@ export async function generateContractFixtures(): Promise<
           method: "GET",
           url: `/session/${scenario}/output`
         });
-        if (statusResponse.statusCode !== 200 || outputResponse.statusCode !== 200) {
+        const summaryResponse = await app.inject({
+          method: "GET",
+          url: `/session/${scenario}?view=summary`
+        });
+        if (
+          statusResponse.statusCode !== 200 ||
+          outputResponse.statusCode !== 200 ||
+          summaryResponse.statusCode !== 200
+        ) {
           throw new Error(
-            `Scenario ${scenario} returned HTTP ${statusResponse.statusCode}/${outputResponse.statusCode}.`
+            `Scenario ${scenario} returned HTTP ${statusResponse.statusCode}/${outputResponse.statusCode}/${summaryResponse.statusCode}.`
           );
         }
         captures[scenario] = {
           status: sanitizeBody(statusResponse.body, workspaceDir, liveTurn),
-          output: sanitizeBody(outputResponse.body, workspaceDir, liveTurn)
+          output: sanitizeBody(outputResponse.body, workspaceDir, liveTurn),
+          summary: sanitizeBody(summaryResponse.body, workspaceDir, liveTurn)
         };
       }
       return captures;
@@ -394,7 +410,12 @@ async function main(): Promise<void> {
       `${JSON.stringify(capture.output, null, 2)}\n`,
       "utf8"
     );
-    console.info(`Wrote ${scenario}.status.json and ${scenario}.output.json`);
+    await writeFile(
+      join(CONTRACT_FIXTURES_DIR, `${scenario}.summary.json`),
+      `${JSON.stringify(capture.summary, null, 2)}\n`,
+      "utf8"
+    );
+    console.info(`Wrote ${scenario}.status.json, ${scenario}.output.json and ${scenario}.summary.json`);
   }
 }
 

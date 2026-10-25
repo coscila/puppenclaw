@@ -1,0 +1,69 @@
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "Status summary for failed"
+    }
+  ],
+  "details": {
+    "view": "summary",
+    "session": {
+      "name": "failed",
+      "agent": "claude",
+      "directory": "/workspace/project",
+      "state": "failed",
+      "createdAt": "2026-01-01T10:00:00.000Z",
+      "lastActivity": "2026-01-01T10:02:00.000Z",
+      "permissionMode": "approve-reads",
+      "warnings": [],
+      "handle": {
+        "runtimeSessionName": "failed",
+        "cwd": "/workspace/project",
+        "agent": "claude",
+        "mode": "persistent"
+      },
+      "reasoningProfile": "claude",
+      "activeTurn": {
+        "id": "turn-failed-1",
+        "state": "failed",
+        "startedAt": "2026-01-01T10:01:00.000Z",
+        "updatedAt": "2026-01-01T10:01:30.000Z",
+        "outputChars": 0,
+        "exitCode": 0,
+        "signal": null,
+        "lastOutputAt": "2026-01-01T10:01:30.000Z",
+        "completedAt": "2026-01-01T10:01:30.000Z",
+        "error": "Simulated turn failure"
+      },
+      "lastError": "Simulated turn failure",
+      "transcriptSummary": {
+        "entries": 2,
+        "lastRole": "status",
+        "lastEntryAt": "2026-01-01T10:00:20.000Z",
+        "lastTurnId": "turn-failed-1"
+      }
+    },
+    "turn": {
+      "classification": "failed",
+      "lockHeld": false,
+      "trackedChild": false,
+      "processAlive": null,
+      "identityMatches": null,
+      "pid": null,
+      "processGroupId": null,
+      "startedAt": "2026-01-01T10:01:00.000Z",
+      "updatedAt": "2026-01-01T10:01:30.000Z",
+      "lastOutputAt": "2026-01-01T10:01:30.000Z",
+      "outputChars": 0,
+      "ageMs": 61000,
+      "outputAgeMs": 32000,
+      "conflict": null
+    }
+  },
+  "protocol": {
+    "major": 2,
+    "minor": 0
+  },
+  "bootId": "00000000-0000-4000-8000-000000000001",
+  "spoolId": "00000000-0000-4000-8000-000000000002"
+}

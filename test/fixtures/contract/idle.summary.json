@@ -1,0 +1,75 @@
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "Status summary for idle"
+    }
+  ],
+  "details": {
+    "view": "summary",
+    "session": {
+      "name": "idle",
+      "agent": "claude",
+      "directory": "/workspace/project",
+      "state": "idle",
+      "createdAt": "2026-01-01T10:00:00.000Z",
+      "lastActivity": "2026-01-01T10:02:00.000Z",
+      "permissionMode": "approve-reads",
+      "warnings": [],
+      "handle": {
+        "runtimeSessionName": "idle",
+        "cwd": "/workspace/project",
+        "agent": "claude",
+        "mode": "persistent"
+      },
+      "reasoningProfile": "claude",
+      "activeTurn": {
+        "id": "turn-idle-1",
+        "state": "completed",
+        "startedAt": "2026-01-01T10:01:00.000Z",
+        "updatedAt": "2026-01-01T10:01:30.000Z",
+        "outputChars": 33,
+        "exitCode": 0,
+        "signal": null,
+        "lastOutputAt": "2026-01-01T10:01:30.000Z",
+        "completedAt": "2026-01-01T10:01:30.000Z"
+      },
+      "tokenUsage": {
+        "used": 24,
+        "size": 4096,
+        "input": 24,
+        "output": 12,
+        "cacheRead": 5,
+        "cacheWrite": 3
+      },
+      "transcriptSummary": {
+        "entries": 2,
+        "lastRole": "assistant",
+        "lastEntryAt": "2026-01-01T10:00:20.000Z",
+        "lastTurnId": "turn-idle-1"
+      }
+    },
+    "turn": {
+      "classification": "completed",
+      "lockHeld": false,
+      "trackedChild": false,
+      "processAlive": null,
+      "identityMatches": null,
+      "pid": null,
+      "processGroupId": null,
+      "startedAt": "2026-01-01T10:01:00.000Z",
+      "updatedAt": "2026-01-01T10:01:30.000Z",
+      "lastOutputAt": "2026-01-01T10:01:30.000Z",
+      "outputChars": 33,
+      "ageMs": 61000,
+      "outputAgeMs": 32000,
+      "conflict": null
+    }
+  },
+  "protocol": {
+    "major": 2,
+    "minor": 0
+  },
+  "bootId": "00000000-0000-4000-8000-000000000001",
+  "spoolId": "00000000-0000-4000-8000-000000000002"
+}
