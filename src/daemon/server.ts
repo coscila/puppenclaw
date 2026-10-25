@@ -609,8 +609,9 @@ export async function createDaemonServer(params: {
     eventLoop.stop();
     resourceMonitor.close();
     await maintenance.stop();
-    // Principal jobs pause (resumable) rather than end: the registry refuses new
-    // items before the runtime aborts their calls; its store closes last.
+    // Principal jobs stop rather than end: the registry refuses new items before the
+    // runtime aborts their calls and returns them to the queue; restart recovery
+    // relaunches them while their principal still admits them. Its store closes last.
     await principals.shutdown();
     await advanced.close();
     await principals.close();

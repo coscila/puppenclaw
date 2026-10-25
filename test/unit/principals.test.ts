@@ -89,6 +89,8 @@ async function harness(options: { dataDir?: string; providers?: ModelProviderCon
     dataDir, runtime, providers: new Map((options.providers ?? []).map((p) => [p.id, p])),
     legacyAttemptAuthority: options.legacy ?? true, ...(options.now ? { now: options.now } : {})
   });
+  // As the daemon does: principals reattach first, then broker recovery may relaunch their jobs.
+  await runtime.recover();
   let closed = false;
   const close = async () => {
     if (closed) return;
@@ -497,7 +499,7 @@ describe("principal revocation", () => {
 });
 
 describe("daemon shutdown", () => {
-  it("pauses principal jobs instead of ending them; they resume over the reopened socket", async () => {
+  it("stops principal jobs without settling what is in flight; the next start relaunches them under the same job id", async () => {
     const service = await upstream({ hold: true });
     const first = await harness({ providers: [provider("judge", service.url)] });
     const socket = (await first.registry.put("run:a", runBody({}, { maxConcurrency: 2 }))).socketPath!;
@@ -506,8 +508,40 @@ describe("daemon shutdown", () => {
     await first.close();
     service.hold = false;
     const second = await harness({ dataDir: first.dataDir, providers: [provider("judge", service.url)] });
-    const paused = second.runtime.store.job(job.jobId)!;
-    expect(paused).toMatchObject({ state: "paused", error: "daemon_shutdown" });
+    const done = await settledJob(second.runtime, job.jobId);
+    expect(done).toMatchObject({ state: "completed", principalId: "run:a", runId: "study-1" });
+    expect(done.results.map((r) => r.state)).toEqual(Array(6).fill("completed"));
+    // The two calls aborted by the shutdown ran again; no resumed copy of the job exists.
+    expect(service.calls).toBe(8);
+    expect(second.runtime.store.jobHeaders("principal:run:a").map((header) => header.jobId)).toEqual([job.jobId]);
+    // Exactly one receipt event per item; the aborted calls kept their transport receipts only.
+    const events = second.runtime.store.events(0, 1000).events;
+    const receipts = events.filter((event) => event.type === "broker.receipt");
+    expect(receipts.map((event) => event.itemId).sort()).toEqual(items("s", 6).map((item) => item.id).sort());
+    expect(receipts.every((event) => (event.payload as { status: string }).status === "succeeded")).toBe(true);
+    expect(second.runtime.store.jobReceipts(job.jobId).filter((receipt) => receipt.state === "cancelled")).toHaveLength(2);
+    const states = events.filter((event) => event.type === "broker.job").map((event) => (event.payload as { state: string; principalId: string | null; runId: string | null }));
+    expect(states.every((payload) => payload.principalId === "run:a" && payload.runId === "study-1")).toBe(true);
+    expect(states.map((payload) => payload.state)).toEqual(["queued", "running", "queued", "running", "completed"]);
+  });
+
+  it("leaves a job interrupted for an explicit resume when its principal no longer admits it after the restart", async () => {
+    const service = await upstream({ hold: true });
+    const first = await harness({ providers: [provider("judge", service.url)] });
+    const socket = (await first.registry.put("run:a", runBody({}, { maxConcurrency: 1 }))).socketPath!;
+    const job = (await unix(socket, "/bulk/submit?view=summary", { body: { configId: "judge", idempotencyKey: "x", concurrency: 1, items: items("x", 3) } })).body;
+    await until(() => service.calls === 1);
+    await first.close();
+    service.hold = false;
+    // The provider grant was withdrawn while the daemon was down.
+    const store = await PrincipalStore.open(join(first.dataDir, "principals"));
+    const record = store.get("run:a")!;
+    store.save({ ...record, grants: { ...record.grants, providers: [] }, revision: record.revision + 1, updatedAt: new Date().toISOString() }, { action: "updated", before: null, after: null });
+    store.close();
+    const second = await harness({ dataDir: first.dataDir, providers: [provider("judge", service.url)] });
+    expect(second.runtime.store.jobHeader(job.jobId)).toMatchObject({ state: "interrupted" });
+    expect(second.runtime.store.job(job.jobId)!.results.map((r) => r.state)).toEqual(["queued", "queued", "queued"]);
+    await second.registry.put("run:a", runBody({}, { maxConcurrency: 1 }));
     const resumed = await unix(socket, `/jobs/${job.jobId}/resume`, { method: "POST" });
     expect(resumed.status).toBe(200);
     expect((await settledJob(second.runtime, resumed.body.jobId as string)).state).toBe("completed");

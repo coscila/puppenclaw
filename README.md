@@ -612,8 +612,10 @@ Statistics and the usage ledger receive bulk receipt updates in batches (newest
 state per call, at most once a second, always before a parent turn's statistics
 settle). On restart, bulk jobs written by this version are requeued: their
 unsettled items return to `queued` and the job waits for an explicit resume
-(`interrupted`) unless its authority survives the restart. Jobs written before
-this version and agent jobs are interrupted as before.
+(`interrupted`) unless its authority survives the restart, which only a run
+principal's does (see "pcp/2 run principals"): such a job relaunches under its
+own job id. Jobs written before this version and agent jobs are interrupted as
+before.
 
 Rollback: an older daemon (c36cfa2, cea4c29) opens a store written by this
 version and reads and writes it; it ignores the new tables. It cannot resume
@@ -684,11 +686,17 @@ Grants:
   the caller raises it with a PUT; until then `POST /jobs/{id}/resume` on the
   socket answers 409 `BUDGET_EXHAUSTED`, afterwards it continues the remaining
   items as a new job.
-- Expiry pauses jobs with `principal_expired`, a withdrawn provider or instrument
-  grant with `grant_withdrawn`, and a daemon shutdown with `daemon_shutdown`.
-  Each resumes explicitly once its cause is gone. An item refused at admission
-  was never dispatched: it settles `paused` with the refusal's code (for example
-  `BUDGET_EXHAUSTED`) and no receipt.
+- Expiry pauses jobs with `principal_expired` and a withdrawn provider or
+  instrument grant with `grant_withdrawn`; each resumes explicitly once its cause
+  is gone. An item refused at admission was never dispatched: it settles
+  `paused` with the refusal's code (for example `BUDGET_EXHAUSTED`) and no receipt.
+- A daemon shutdown or crash pauses nothing. Admission stops, calls in flight are
+  aborted and their items return to the queue unsettled (each aborted call keeps
+  its transport receipt, but no `broker.receipt` event), and the job keeps its
+  state. The next start requeues it and relaunches it under the same job id while
+  its principal is live and still admits it (grants, budget, expiry, unchanged
+  worker configuration); otherwise it waits as `interrupted` for an explicit
+  resume. Every item therefore settles, and is reported, exactly once per job.
 
 The socket is the identity:
 
