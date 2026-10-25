@@ -4,6 +4,7 @@ import { join } from "node:path";
 
 import {
   processGroupMayExist,
+  readKernelBootId,
   readLinuxProcessStat
 } from "../shared/process-identity.js";
 
@@ -21,7 +22,10 @@ import {
  *   (pid plus /proc start ticks), SIGTERM first and SIGKILL after a grace period.
  *
  * A group whose leader is gone but which still has members is only reported:
- * its members cannot be proven to belong to the recorded group.
+ * its members cannot be proven to belong to the recorded group. A record from
+ * an earlier host boot (its kernel boot id differs) names processes that no
+ * longer exist: pids and start ticks restart at boot, so whatever matches them
+ * now is foreign. Such a record is removed, never signalled and never counted.
  */
 
 export type RunnerKind = "turn" | "control";
@@ -38,6 +42,8 @@ export type RunnerRecord = {
   bootId: string;
   ownerPid: number;
   spawnedAt: string;
+  /** /proc/sys/kernel/random/boot_id when the group was spawned; absent in records written before it was kept. */
+  kernelBootId?: string;
 };
 
 export type BootReapReport = {
@@ -76,7 +82,8 @@ export class RunnerRegistry {
   private constructor(
     private readonly rootDir: string | null,
     readonly bootId: string,
-    private readonly warn: (message: string) => void
+    private readonly warn: (message: string) => void,
+    private readonly kernelBootId: string | null = null
   ) {}
 
   static async open(params: {
@@ -90,7 +97,12 @@ export class RunnerRegistry {
     if (rootDir != null) {
       await mkdir(rootDir, { recursive: true, mode: 0o700 });
     }
-    return new RunnerRegistry(rootDir, params.bootId, params.warn ?? (() => undefined));
+    return new RunnerRegistry(
+      rootDir,
+      params.bootId,
+      params.warn ?? (() => undefined),
+      rootDir != null ? await readKernelBootId() : null
+    );
   }
 
   /** In-memory registry for callers that do not persist (plugin mode, tests). */
@@ -124,7 +136,8 @@ export class RunnerRegistry {
               sessionName: meta.sessionName ?? "",
               bootId: this.bootId,
               ownerPid: process.pid,
-              spawnedAt: new Date().toISOString()
+              spawnedAt: new Date().toISOString(),
+              ...(this.kernelBootId != null ? { kernelBootId: this.kernelBootId } : {})
             };
             const file = join(rootDir, `${key}.json`);
             await writeFile(file, `${JSON.stringify(record)}\n`, { mode: 0o600 });
@@ -179,11 +192,19 @@ function parseRecord(raw: string): RunnerRecord | null {
       sessionName: typeof value.sessionName === "string" ? value.sessionName : "",
       bootId: value.bootId,
       ownerPid: Number.isSafeInteger(value.ownerPid) ? (value.ownerPid as number) : 0,
-      spawnedAt: typeof value.spawnedAt === "string" ? value.spawnedAt : ""
+      spawnedAt: typeof value.spawnedAt === "string" ? value.spawnedAt : "",
+      ...(typeof value.kernelBootId === "string" && value.kernelBootId.length > 0
+        ? { kernelBootId: value.kernelBootId }
+        : {})
     };
   } catch {
     return null;
   }
+}
+
+/** True when the record was written during another host boot than the current one. */
+function fromEarlierHostBoot(record: RunnerRecord, kernelBootId: string | null): boolean {
+  return record.kernelBootId != null && kernelBootId != null && record.kernelBootId !== kernelBootId;
 }
 
 async function leaderMatches(record: RunnerRecord): Promise<boolean> {
@@ -249,6 +270,7 @@ export async function reapRunnerGroups(params: {
   const log = params.log ?? (() => undefined);
   const rootDir = runnerRegistryDir(params.dataDir);
   const entries = await readdir(rootDir).catch(() => [] as string[]);
+  const kernelBootId = await readKernelBootId();
   for (const entry of entries.sort()) {
     if (!entry.endsWith(".json")) {
       continue;
@@ -263,6 +285,13 @@ export async function reapRunnerGroups(params: {
       continue;
     }
     report.records += 1;
+    if (fromEarlierHostBoot(record, kernelBootId)) {
+      // The host rebooted since: the group is gone, and a process that now
+      // matches its pid and start ticks is not ours. Never signal it.
+      report.gone += 1;
+      await unlink(file).catch(() => undefined);
+      continue;
+    }
     const leaderAlive = await leaderMatches(record);
     if (!leaderAlive && !processGroupMayExist(record.processGroupId)) {
       report.gone += 1;
@@ -321,13 +350,14 @@ export async function countLiveLeftoverRunnerGroups(params: {
   }
   const rootDir = runnerRegistryDir(params.dataDir);
   const entries = await readdir(rootDir).catch(() => [] as string[]);
+  const kernelBootId = await readKernelBootId();
   let live = 0;
   for (const entry of entries) {
     if (!entry.endsWith(".json")) {
       continue;
     }
     const record = parseRecord(await readFile(join(rootDir, entry), "utf8").catch(() => ""));
-    if (record == null || record.bootId === params.bootId) {
+    if (record == null || record.bootId === params.bootId || fromEarlierHostBoot(record, kernelBootId)) {
       continue;
     }
     if ((await leaderMatches(record)) || processGroupMayExist(record.processGroupId)) {

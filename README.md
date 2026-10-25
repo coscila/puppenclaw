@@ -479,7 +479,9 @@ Every detached runner group is recorded under `<data-dir>/runners`.
 crashed daemon left behind: `observe` (default) logs and counts them, `on`
 terminates those whose leader is provably the recorded process (SIGTERM, then
 SIGKILL) and asks their acpx runtimes to cancel the interrupted prompt, and
-`off` keeps no records. A group whose leader is gone is never signalled.
+`off` keeps no records. A group whose leader is gone is never signalled, and
+neither is one recorded during an earlier host boot (each record carries the
+kernel boot id; pids and start ticks restart at boot): its record is removed.
 `node --experimental-strip-types scripts/measure-h4.mts` measures health cost,
 state writes, event-loop lag and stalled-stream memory against a built daemon.
 

@@ -7,12 +7,17 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDaemonServer } from "../../src/daemon/server.js";
 import {
   bootReaperModeFromEnv,
+  countLiveLeftoverRunnerGroups,
   reapRunnerGroups,
   RunnerRegistry,
   runnerRegistryDir,
   type RunnerRecord
 } from "../../src/manager/runner-registry.js";
-import { processGroupMayExist, readLinuxProcessStat } from "../../src/shared/process-identity.js";
+import {
+  processGroupMayExist,
+  readKernelBootId,
+  readLinuxProcessStat
+} from "../../src/shared/process-identity.js";
 import { createTempDir, makeConfig, resolveFakeAcpxCommand } from "../helpers.js";
 
 const spawned: ChildProcess[] = [];
@@ -101,7 +106,8 @@ describe.runIf(process.platform === "linux")("runner registry and boot reaper", 
       kind: "turn",
       sessionName: "registry-demo",
       bootId: "boot-a",
-      ownerPid: process.pid
+      ownerPid: process.pid,
+      kernelBootId: await readKernelBootId()
     });
     expect(record.processStartIdentity).toMatch(new RegExp(`^${child.pid}:\\d+$`, "u"));
 
@@ -172,6 +178,26 @@ describe.runIf(process.platform === "linux")("runner registry and boot reaper", 
 
     expect(report).toMatchObject({ records: 1, terminated: 1, survivors: 0, terminatedTurnSessions: ["lab-chat-1"] });
     expect(processGroupMayExist(leader.pid!)).toBe(false);
+    expect(await readdir(runnerRegistryDir(dataDir))).toEqual([]);
+  });
+
+  it("never signals or counts a group recorded during an earlier host boot, even when its pid and start ticks match", async () => {
+    const dataDir = await createTempDir("puppenclaw-runner-other-boot-");
+    // A live group whose pid and start ticks match the record: after a host
+    // reboot, an unrelated process that happens to match them.
+    const foreign = spawnGroup("sleep 30 & wait");
+    await writeRecord(dataDir, await recordFor(foreign, { kernelBootId: "an-earlier-host-boot" }));
+    // The same group recorded during this host boot still counts as live.
+    const current = await readKernelBootId();
+    const ours = spawnGroup("sleep 30 & wait");
+    await writeRecord(dataDir, await recordFor(ours, current != null ? { kernelBootId: current } : {}));
+
+    expect(await countLiveLeftoverRunnerGroups({ dataDir, bootId: "boot-e", mode: "on" })).toBe(1);
+    const report = await reapRunnerGroups({ dataDir, bootId: "boot-e", mode: "on", terminationTimeoutMs: 1_000 });
+
+    expect(report).toMatchObject({ records: 2, gone: 1, terminated: 1 });
+    expect(processGroupMayExist(foreign.pid!)).toBe(true);
+    expect(processGroupMayExist(ours.pid!)).toBe(false);
     expect(await readdir(runnerRegistryDir(dataDir))).toEqual([]);
   });
 

@@ -7,7 +7,7 @@ export type LinuxProcessStat = {
   processGroupId: number;
   sessionId: number;
   startTicks: string;
-  /** `<pid>:<start ticks>`: unique for the lifetime of the boot. */
+  /** `<pid>:<start ticks>`: unique for the lifetime of the host boot (see readKernelBootId). */
   processStartIdentity: string;
 };
 
@@ -59,4 +59,17 @@ export function processGroupMayExist(processGroupId: number): boolean {
   } catch (error) {
     return (error as NodeJS.ErrnoException).code !== "ESRCH";
   }
+}
+
+/**
+ * The kernel's boot id (/proc/sys/kernel/random/boot_id): new on every host boot. A process identity recorded under
+ * another boot id names a process that no longer exists, whatever now runs under its pid and start ticks.
+ */
+export async function readKernelBootId(): Promise<string | null> {
+  if (process.platform !== "linux") {
+    return null;
+  }
+  const raw = await readFile("/proc/sys/kernel/random/boot_id", "utf8").catch(() => null);
+  const value = raw?.trim();
+  return value != null && value.length > 0 ? value : null;
 }
