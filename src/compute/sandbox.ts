@@ -19,6 +19,26 @@ function trustedFile(value: string | undefined, label: string): string {
   return file;
 }
 
+/**
+ * The principal socket binding a compute launcher receives (P3): the principal
+ * id, its private socket directory (bind the directory, so a socket the daemon
+ * reopens after a restart stays reachable) and the socket path inside it.
+ */
+export const PRINCIPAL_BINDING_ENV = ["PUPPENCLAW_PRINCIPAL_ID", "PUPPENCLAW_PRINCIPAL_SOCKET_DIR", "PUPPENCLAW_PRINCIPAL_SOCKET"] as const;
+export type PrincipalSocketBinding = { principalId: string; directory: string; path: string };
+
+/** A controller environment carrying exactly this binding, or none. */
+export function withPrincipalBinding(env: NodeJS.ProcessEnv, binding?: PrincipalSocketBinding): NodeJS.ProcessEnv {
+  const result: NodeJS.ProcessEnv = { ...env };
+  for (const name of PRINCIPAL_BINDING_ENV) delete result[name];
+  if (binding) {
+    result.PUPPENCLAW_PRINCIPAL_ID = binding.principalId;
+    result.PUPPENCLAW_PRINCIPAL_SOCKET_DIR = binding.directory;
+    result.PUPPENCLAW_PRINCIPAL_SOCKET = binding.path;
+  }
+  return result;
+}
+
 /** Job arguments/environment never select a launcher, config, or host mounts. */
 export function resolveComputeSandbox(env: NodeJS.ProcessEnv = process.env) {
   if (process.platform !== "linux") throw new Error("Managed compute requires Linux Bubblewrap isolation.");
@@ -66,7 +86,16 @@ export function computeSandboxLaunch(spec: ComputeJobSpec, env: NodeJS.ProcessEn
   }
   const serializedEnv = JSON.stringify(jobEnv);
   if (Object.keys(jobEnv).length > 256 || Buffer.byteLength(serializedEnv) > 64 * 1024) throw new Error("Compute environment exceeds its size limit.");
-  const childEnv: NodeJS.ProcessEnv = { ...env, LAB_SANDBOX_CONFIG: trusted.configPath };
+  // A principal binding reaches the launcher only for the job that names that principal.
+  let binding: PrincipalSocketBinding | undefined;
+  if (spec.principalId !== undefined) {
+    const directory = env.PUPPENCLAW_PRINCIPAL_SOCKET_DIR, path = env.PUPPENCLAW_PRINCIPAL_SOCKET;
+    if (env.PUPPENCLAW_PRINCIPAL_ID !== spec.principalId || !directory || !path || !isAbsolute(directory) || dirname(path) !== directory) {
+      throw new Error("Compute job principal binding is missing.");
+    }
+    binding = { principalId: spec.principalId, directory, path };
+  }
+  const childEnv: NodeJS.ProcessEnv = withPrincipalBinding({ ...env, LAB_SANDBOX_CONFIG: trusted.configPath }, binding);
   return {
     command: process.execPath,
     args: [trusted.launcher, "--compute-env-fd", "3", "--cwd", spec.cwd, "--", ...spec.command],

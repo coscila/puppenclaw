@@ -24,7 +24,13 @@ export const computeJobSpecZod = z.object({
   env: z.record(z.string(), z.string()).default({}),
   resources: computeResourcesZod,
   /** Optional owning chat session so detached jobs can be attributed to it. */
-  sessionName: z.string().trim().min(1).max(200).optional()
+  sessionName: z.string().trim().min(1).max(200).optional(),
+  /**
+   * Optional run principal (P3) whose socket directory the launcher binds into
+   * the sandbox. Only the authenticated submitter names it; the binding reaches
+   * the host-side launcher through the controller environment, never the job's.
+   */
+  principalId: z.string().regex(/^[A-Za-z0-9._:-]{1,128}$/u).optional()
 });
 
 export const computeJobStateZod = z.enum([

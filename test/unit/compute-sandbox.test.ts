@@ -42,6 +42,24 @@ describe.runIf(process.platform === "linux")("trusted managed compute sandbox", 
     expect(JSON.parse(launch.serializedEnv)).toEqual({ ...spec.env, OMP_NUM_THREADS: "3", OPENBLAS_NUM_THREADS: "3", MKL_NUM_THREADS: "3" });
   });
 
+  it("hands a principal socket binding to the launcher only for the job that names that principal", async () => {
+    const f = await fixture();
+    const binding = { PUPPENCLAW_PRINCIPAL_ID: "run:study-1", PUPPENCLAW_PRINCIPAL_SOCKET_DIR: "/state/data/principals/0123456789abcdef", PUPPENCLAW_PRINCIPAL_SOCKET: "/state/data/principals/0123456789abcdef/broker.sock" };
+    const bound = computeSandboxLaunch({ ...f.spec, principalId: "run:study-1", env: { SCIENTIFIC_PARAMETER: "value" } }, { ...f.env, ...binding });
+    expect(bound.env).toMatchObject(binding);
+    // The job's own environment (FD3, inside the sandbox) never carries the binding.
+    expect(Object.keys(JSON.parse(bound.serializedEnv))).not.toContain("PUPPENCLAW_PRINCIPAL_SOCKET_DIR");
+    // A job that names no principal gets none, even when the controller environment holds one.
+    const plain = computeSandboxLaunch(f.spec, { ...f.env, ...binding });
+    for (const name of Object.keys(binding)) expect(plain.env).not.toHaveProperty(name);
+    // A binding for another principal, or none at all, is refused rather than passed on.
+    expect(() => computeSandboxLaunch({ ...f.spec, principalId: "run:study-2" }, { ...f.env, ...binding })).toThrow(/principal binding/);
+    expect(() => computeSandboxLaunch({ ...f.spec, principalId: "run:study-1" }, f.env)).toThrow(/principal binding/);
+    // Job environment cannot forge the controller-side binding.
+    const forged = computeSandboxLaunch({ ...f.spec, env: { PUPPENCLAW_PRINCIPAL_SOCKET_DIR: "/attacker" } }, f.env);
+    expect(forged.env).not.toHaveProperty("PUPPENCLAW_PRINCIPAL_SOCKET_DIR");
+  });
+
   it("rejects writable workspace launcher/config and oversized or invalid environment", async () => {
     const f = await fixture();
     const forged = join(f.cwd, "launcher.mjs");

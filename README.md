@@ -633,12 +633,132 @@ unacknowledged events or a pending erasure stay.
 completions per second and event-loop lag against a mock upstream, with the
 daemon's statistics and usage-ledger hooks.
 
+### pcp/2 run principals (`principals:1`)
+
+A principal is bulk authority that the caller grants and the daemon enforces:
+a study run (`kind: "run"`, bound to its `runId`) or, later, a person
+(`kind: "human"`, stored now, no credential logic yet). `/v2/capabilities`
+advertises `features.principals: 1` only when `daemonAuthToken` is set; without
+it the routes answer 503 `DAEMON_AUTH_REQUIRED`. Every response, errors included,
+carries `protocol`, `bootId` and `spoolId`. Ids are 1–128 characters of
+`A-Za-z0-9._:-`.
+
+- `PUT /v2/principals/{id}` with `{kind, runId, ownerKey, grants: {providers,
+  instruments, maxConcurrency, maxItems, tokenBudget: {input, output},
+  expiresAt}, socket}` returns `{ok, protocol, bootId, spoolId, principalId,
+  kind, runId, grants, socketPath, createdAt, updatedAt}`. The same body returns
+  the same result. Changed grants or a changed `socket` take effect at once and
+  are audited. `kind`, `runId` and `ownerKey` never change (409
+  `PRINCIPAL_CONFLICT`), and a revoked id stays revoked (409 `PRINCIPAL_REVOKED`).
+  No response ever contains `ownerKey`.
+- `GET /v2/principals/{id}` adds `state` (`active`, `expired`, `revoked`),
+  `revokedAt`, `revision`, `usage` (admitted `items`, settled `inputTokens` and
+  `outputTokens`, `activeItems`, `remaining`), `providersUnavailable` and the last
+  50 audit entries.
+- `DELETE /v2/principals/{id}[?cancel=1]` returns `{ok, principalId, revokedAt}`
+  and is idempotent. Before it returns, the principal's socket is gone and no
+  further item is admitted (the contract allows 5 s; the test measures a few
+  ms). Items already dispatching finish, or abort with `cancel=1`. Every item
+  the principal had not admitted ends `cancelled`. A revocation that a restart
+  interrupted completes at the next start. Revocation stays possible while
+  session state awaits an operator reset; PUT does not.
+
+Grants:
+
+- `providers` name entries of `PUPPENCLAW_MODEL_PROVIDERS`, a JSON array of
+  model provider configurations (the shape of a turn's `modelProvider`). It is
+  the only source of a principal provider's endpoint, model and credential
+  variable; `authTokenEnv` names a variable of the daemon environment, never a
+  secret. A socket client can never choose one. Unset means no provider for
+  principals; an invalid value fails startup.
+- `instruments` are opaque digests. A principal with instrument grants may submit
+  only jobs that name one of them (`INSTRUMENT_REQUIRED`, `INSTRUMENT_NOT_GRANTED`).
+- `maxConcurrency` bounds the dispatching items of all the principal's jobs
+  together. The principal's slot is taken before provider capacity, so a
+  principal at its limit holds no provider permit.
+- `maxItems` caps the items the principal admits over its lifetime, exactly.
+  `tokenBudget` caps the settled input tokens (every prompt token the provider
+  reports, cached ones included) and output tokens. Calls already dispatching,
+  at most `maxConcurrency` of them, can overshoot a token budget. Reaching either
+  pauses the job with `error: "budget_exhausted"`. The budget refills only when
+  the caller raises it with a PUT; until then `POST /jobs/{id}/resume` on the
+  socket answers 409 `BUDGET_EXHAUSTED`, afterwards it continues the remaining
+  items as a new job.
+- Expiry pauses jobs with `principal_expired`, a withdrawn provider or instrument
+  grant with `grant_withdrawn`, and a daemon shutdown with `daemon_shutdown`.
+  Each resumes explicitly once its cause is gone. An item refused at admission
+  was never dispatched: it settles `paused` with the refusal's code (for example
+  `BUDGET_EXHAUSTED`) and no receipt.
+
+The socket is the identity:
+
+- `socket: true` opens `<data-dir>/principals/<random>/broker.sock`: the
+  directory is 0700, the socket 0600, and `principals.sqlite` (records, usage,
+  audit) lies next to them. The data directory is inside the daemon state root
+  (`PUPPENCLAW_STATE_ROOT`), which the lab sandbox policy hides from every
+  sandbox and never binds. All lab and daemon processes share one user, so this
+  separates sandboxes, not unsandboxed processes.
+- The socket serves the turn socket's worker routes for the principal's own jobs
+  only: `GET /configs`, `POST /bulk/submit`, `GET /jobs`, `GET /jobs/{id}`,
+  `GET /jobs/{id}/results` and `POST /jobs/{id}/cancel|resume`, all with
+  `?view=summary` where the turn socket has it. `GET /configs` returns
+  `authorization.principalId` (also as `attemptId`), `runId`, `state`,
+  `instruments` and `publicLiteratureAllowed` (true for an active run principal),
+  the principal's grants and usage, and one bulk worker per granted, configured
+  provider, whose `id` is the provider id. Its `revision` changes only when that
+  worker list changes, never on budget changes. Agent workers, native model
+  routes, proxying and CONNECT are refused. No header, body field or environment
+  variable names a principal.
+- Principals and sockets persist: a restart reopens each socket at the same path
+  in the same directory; only the socket file is replaced.
+
+How a sandbox gets its principal socket (the lab launcher does this; plan R5/E4):
+
+- Bind the principal's directory read-only, for example
+  `--ro-bind <dir> /run/ocsl/principal`, and point the client at
+  `/run/ocsl/principal/broker.sock` (coscila-review reads
+  `PUPPENCLAW_ORCHESTRATION_SOCKET`). Bind the directory, not the socket file, so
+  the socket a restart re-creates stays reachable. Validate the directory first:
+  inside the state root, owned by the daemon user, mode 0700, not a symlink, a
+  0600 socket inside.
+- `POST /compute/jobs` accepts `principalId`. The daemon refuses it unless that
+  principal is live with an open socket, and passes the binding only to the
+  host-side launcher, in its controller environment: `PUPPENCLAW_PRINCIPAL_ID`,
+  `PUPPENCLAW_PRINCIPAL_SOCKET_DIR` and `PUPPENCLAW_PRINCIPAL_SOCKET`. The job's
+  own environment never carries it, and a job without `principalId` never gets
+  one.
+- Revocation, or a PUT with `socket: false`, removes the socket and its
+  directory, so a bound sandbox then reaches nothing.
+
+Principal jobs live in `advanced.sqlite` like turn jobs, with
+`parentSessionName` `principal:<id>`, the principal id as `attemptId`, and
+`principalId` and `runId` fields. Their usage reaches the caller through the
+broker receipts, not the turn usage ledger. An account purge
+(`/sessions/owner/purge`) revokes the owner's principals with `cancel` before
+it erases their jobs. Daemons from before principals never open
+`principals.sqlite` and read the added job fields unchanged.
+
+`PUPPENCLAW_LEGACY_ATTEMPT_AUTHORITY` keeps today's turn authority:
+
+- `on` (the default, `features.legacyAttemptAuthority: 1`): a turn in execute and
+  approve-all mode may submit bulk work over its turn socket and reports
+  `publicLiteratureAllowed: true`, as before.
+- `off`: only principal sockets carry bulk authority. A turn socket answers bulk
+  submissions with 409 `PRINCIPAL_REQUIRED` and reports
+  `publicLiteratureAllowed: false` and `bulkAvailable: false`. Turn processes
+  still receive `PUPPENCLAW_ORCHESTRATION_ATTEMPT_ID` as an identifier, because
+  the deployed sandbox wrappers validate it, but it grants nothing. The egress
+  deny list built from endpoint-like variable names stays active in both modes:
+  it only denies, never grants.
+- Any other value fails startup.
+
+
 Advanced worker jobs store each result in its own SQLite row and each distinct
 input once, as a blob keyed by the sha256 of its JSON (a resumed job reuses the
 inputs of its predecessor). Existing job records migrate transactionally at
 startup; completed items and idempotency keys survive the migration. Back up the
 daemon state before updating it. See "pcp/2 broker feed and instrument mode"
-below for the store's group commit, recovery and rollback behaviour.
+above for the store's group commit, recovery and rollback behaviour.
 
 For large runs, use `GET /orchestration/jobs?session=NAME&view=summary&after=0&limit=100`
 and `GET /orchestration/jobs/JOB/results?session=NAME&after=0&limit=100`. The scoped

@@ -1,6 +1,8 @@
 import { AdvancedRuntime } from "../advanced/runtime.js";
 import { AdvancedMaintenance, maintenanceFromEnvironment } from "../advanced/maintenance.js";
 import type { UsageReceipt } from "../advanced/types.js";
+import { PrincipalRegistry } from "../advanced/principals.js";
+import { legacyAttemptAuthorityFromEnvironment, modelProvidersFromEnvironment } from "../advanced/principals-schema.js";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { join } from "node:path";
 
@@ -67,6 +69,7 @@ import { identityEnvelope, identityHeaders, resolveBuildId, type DaemonIdentity 
 import { registerV2Routes, type StreamBacklog } from "./v2.js";
 import { registerV2BrokerRoutes } from "./v2-broker.js";
 import { EVENT_PAGE_MAX, EVENT_WAIT_MAX_MS, INLINE_OUTPUT_MAX_BYTES } from "../advanced/outbox.js";
+import { registerV2PrincipalRoutes } from "./v2-principals.js";
 import { SseEventStream, sseMaxPendingBytesFromEnv, type SseEvent } from "./sse.js";
 import {
   compactOutputView,
@@ -220,7 +223,9 @@ export async function createDaemonServer(params: {
     if (
       request.method === "GET" ||
       request.url.split("?")[0] === "/recovery/reset" ||
-      request.url.split("?")[0] === "/shutdown"
+      request.url.split("?")[0] === "/shutdown" ||
+      // Revoking a principal only removes authority and never touches session state.
+      (request.method === "DELETE" && request.url.startsWith("/v2/principals/"))
     ) {
       return;
     }
@@ -241,6 +246,7 @@ export async function createDaemonServer(params: {
     let statistics: TurnStatisticsRecorder | undefined;
     let advanced: AdvancedRuntime | undefined;
     let maintenance: AdvancedMaintenance | undefined;
+    let principals: PrincipalRegistry | undefined;
     try {
       // The owner lease is held, so every leftover record belongs to a dead
       // daemon. Reap before reconciliation so killed runners read as orphaned.
@@ -306,6 +312,7 @@ export async function createDaemonServer(params: {
         start: (request) => manager.start(request), quiesce: async (name) => { await manager.quiesce({ name }); },
         purge: async (name) => { await manager.purge({ name }); },
         getSession: (name) => store.getSession(name), getOwner: (name) => store.getSessionOwner(name) ?? undefined,
+        // Principal budgets are charged by the runtime as each call settles (PrincipalHooks.observeReceipt).
         contribution: (receipt) => {
           statistics!.observeBrokerReceipt(receipt.parentSessionName, receipt);
           const entry = brokerLedgerEntry(receipt);
@@ -318,6 +325,15 @@ export async function createDaemonServer(params: {
           for (const [name, list] of bySession) statistics!.observeBrokerReceipts(name, list);
           usageLedger!.appendMany(receipts.flatMap((receipt) => brokerLedgerEntry(receipt) ?? []));
         },
+      });
+      // Run principals (P3) reattach before broker recovery, so recovered principal
+      // work finds its participant; their sockets reopen at the same paths.
+      principals = await PrincipalRegistry.open({
+        dataDir: params.dataDir,
+        runtime: advanced,
+        providers: modelProvidersFromEnvironment(),
+        legacyAttemptAuthority: legacyAttemptAuthorityFromEnvironment(),
+        warn: (message) => logger.warn(message)
       });
       const runningAtBoot = store
         .listSessions()
@@ -350,6 +366,7 @@ export async function createDaemonServer(params: {
         statistics,
         advanced,
         maintenance,
+        principals,
         outputRouter,
         manager,
         orchestrator,
@@ -359,7 +376,9 @@ export async function createDaemonServer(params: {
       eventLoop.stop();
       resourceMonitor?.close();
       await maintenance?.stop();
+      await principals?.shutdown();
       await advanced?.close();
+      await principals?.close();
       await statistics?.close();
       computeRuntime?.close();
       usageLedger?.close();
@@ -376,6 +395,7 @@ export async function createDaemonServer(params: {
     statistics,
     advanced,
     maintenance,
+    principals,
     outputRouter,
     manager,
     orchestrator,
@@ -500,7 +520,10 @@ export async function createDaemonServer(params: {
       sseGap: 1,
       eventFeed: 1,
       brokerOutbox: 1,
-      instrumentMode: 1
+      instrumentMode: 1,
+      // Run principals need the bearer token; legacyAttemptAuthority says chat turns still carry bulk authority.
+      ...(authToken.length > 0 ? { principals: 1 } : {}),
+      ...(principals.legacyAttemptAuthority ? { legacyAttemptAuthority: 1 } : {})
     }),
     limits: () => ({
       turnKeyMax: 128,
@@ -514,6 +537,7 @@ export async function createDaemonServer(params: {
     })
   });
   registerV2BrokerRoutes(app, { identity, advanced });
+  registerV2PrincipalRoutes(app, { identity, principals, authenticated: authToken.length > 0 });
 
   // Deploy idle check (plan H2): counts only, no names or identifiers. The ops
   // CLI decides what blocks a deploy; the daemon only reports. Every count is
@@ -552,7 +576,10 @@ export async function createDaemonServer(params: {
 
   app.post("/compute/jobs", async (request, reply) => {
     try {
-      return await computeRuntime.submit(computeJobSpecZod.parse(request.body));
+      const spec = computeJobSpecZod.parse(request.body);
+      // A compute job may run as a principal: its launcher binds that principal's socket directory.
+      const principal = spec.principalId === undefined ? null : principals.socketBinding(spec.principalId);
+      return await computeRuntime.submit(spec, principal ? { principal } : {});
     } catch (error) {
       return reply.code(400).send({
         error: error instanceof Error ? error.message : String(error)
@@ -582,7 +609,11 @@ export async function createDaemonServer(params: {
     eventLoop.stop();
     resourceMonitor.close();
     await maintenance.stop();
+    // Principal jobs pause (resumable) rather than end: the registry refuses new
+    // items before the runtime aborts their calls; its store closes last.
+    await principals.shutdown();
     await advanced.close();
+    await principals.close();
     await statistics.close();
     computeRuntime.close();
     orchestratorStore.close();
@@ -682,6 +713,8 @@ export async function createDaemonServer(params: {
       } catch (error) {
         throw ownerCleanupIncomplete("purge", sessions.length, error);
       }
+      // The owner's run principals stop first, so none admits work into a purged account.
+      await principals.revokeOwner(parsed.ownerKey);
       await advanced.purgeOwner(parsed.ownerKey);
       const remaining = store.listSessionsByOwner(parsed.ownerKey);
       if (remaining.length > 0) {

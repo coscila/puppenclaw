@@ -30,7 +30,7 @@ export type WorkerJob = {
   request: AgentSubmit | BulkSubmit; childSessionName?: string; resumedFromJobId?: string; results: ItemResult[]; error?: string;
   /** Earliest time a provider-limit pause may be resumed (Retry-After or a provider reset header). */
   resumeAfter?: string;
-  /** Run principal that owns the job (pcp/2 principals); absent for chat-attempt jobs. */
+  /** Set for jobs submitted over a principal socket (P3); parentSessionName is then `principal:<principalId>`. Absent for chat-attempt jobs. */
   principalId?: string; runId?: string;
 };
 /** Job metadata stays bounded regardless of the number or size of item inputs. */
@@ -57,6 +57,8 @@ export type RuntimeParticipant = {
   sessionName: string; parentSessionName: string; attemptId: string; directory: string; provider: ModelProviderConfig;
   ownerKey?: string; permissionMode: PermissionMode; interactionMode: InteractionMode; config: AdvancedOrchestration;
   jobId?: string; admissionOpen: boolean;
+  /** A run principal (P3) instead of a chat turn: its grants, not the turn mode, carry bulk authority. */
+  principalId?: string; runId?: string;
 };
 export type RuntimeDriver = {
   start: (params: StartParams) => Promise<ToolResult>;
