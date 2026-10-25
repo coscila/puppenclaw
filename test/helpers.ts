@@ -149,3 +149,30 @@ export function seedTranscript(count: number, chars: number, turnId?: string): A
     ...(turnId != null ? { turnId } : {})
   }));
 }
+
+/**
+ * SSE body reduced to one string per event: kind plus visible text, activity
+ * type and title, error code, or the result's output.
+ */
+export function normalizeSse(body: string): string[] {
+  return body
+    .split(/\r?\n/u)
+    .filter((line) => line.startsWith("data: "))
+    .map((line) => JSON.parse(line.slice("data: ".length)) as Record<string, unknown>)
+    .map((event) => {
+      switch (event.kind) {
+        case "result":
+          return `result:${JSON.stringify((event.result as { details: { output?: unknown } }).details.output)}`;
+        case "activity": {
+          const activity = event.activity as { type: string; title?: string; text?: string };
+          return `activity:${activity.type}:${activity.title ?? activity.text ?? ""}`;
+        }
+        case "error":
+          return `error:${String(event.code)}`;
+        case "done":
+          return "done";
+        default:
+          return `${String(event.kind)}:${JSON.stringify(event.text)}`;
+      }
+    });
+}
