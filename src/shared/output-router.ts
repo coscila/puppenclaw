@@ -52,7 +52,17 @@ export type OutputDispatcher = (event: OutputRouteEvent) => Promise<void> | void
 export type OutputSubscription = {
   readonly sessionName: string;
   readonly dispatcher: OutputDispatcher;
+  /**
+   * Turn-scoped subscription: only events emitted while the keyed turn with
+   * this key is executing are delivered. Session output is otherwise shared by
+   * every turn of the session, so a replay or a rejected request must never see
+   * another turn's output.
+   */
+  readonly turnKey?: string;
 };
+
+/** Key of the keyed turn executing in a session right now, or null. */
+export type TurnKeyResolver = (sessionName: string) => string | null;
 
 type SessionBuffer = {
   pending: string;
@@ -63,6 +73,8 @@ export class OutputRouter {
 
   private readonly subscriptions = new Map<string, Set<OutputSubscription>>();
 
+  private turnKeyResolver: TurnKeyResolver | null = null;
+
   constructor(
     private readonly logger: PluginLogger,
     private readonly options: {
@@ -70,8 +82,16 @@ export class OutputRouter {
     } = {}
   ) {}
 
-  attach(sessionName: string, dispatcher: OutputDispatcher): OutputSubscription {
-    const subscription: OutputSubscription = { sessionName, dispatcher };
+  attach(
+    sessionName: string,
+    dispatcher: OutputDispatcher,
+    options: { turnKey?: string } = {}
+  ): OutputSubscription {
+    const subscription: OutputSubscription = {
+      sessionName,
+      dispatcher,
+      ...(options.turnKey != null ? { turnKey: options.turnKey } : {})
+    };
     const existing = this.subscriptions.get(sessionName);
     if (existing != null) {
       existing.add(subscription);
@@ -79,6 +99,11 @@ export class OutputRouter {
       this.subscriptions.set(sessionName, new Set([subscription]));
     }
     return subscription;
+  }
+
+  /** Set by the session manager, which knows which keyed turn is executing. */
+  setTurnKeyResolver(resolver: TurnKeyResolver | null): void {
+    this.turnKeyResolver = resolver;
   }
 
   detach(subscription: OutputSubscription): void {
@@ -217,7 +242,12 @@ export class OutputRouter {
     if (subscriptions == null || subscriptions.size === 0) {
       return;
     }
+    // Resolved once, before any await: the event belongs to the turn executing now.
+    const eventTurnKey = this.turnKeyResolver?.(sessionName) ?? null;
     for (const subscription of [...subscriptions]) {
+      if (subscription.turnKey != null && subscription.turnKey !== eventTurnKey) {
+        continue;
+      }
       try {
         await subscription.dispatcher(event);
       } catch (error) {

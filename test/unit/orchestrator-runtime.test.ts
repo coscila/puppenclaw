@@ -808,7 +808,7 @@ describe("OrchestratorRuntime", () => {
     await writeFile(join(workspaceDir, "README.md"), "# Reassess Demo\n", "utf8");
     await writeFile(
       join(workspaceDir, ".gitignore"),
-      [".orchestrator/", "state.json", ".state-owner.json", ".fake-acpx-state/"].join("\n") + "\n",
+      [".orchestrator/", "state.json", "spool.json", ".state-owner.json", ".fake-acpx-state/"].join("\n") + "\n",
       "utf8"
     );
     runGit(workspaceDir, ["init"]);
@@ -946,7 +946,7 @@ describe("OrchestratorRuntime", () => {
     await writeFile(join(workspaceDir, "src.ts"), "export const value = 1;\n", "utf8");
     await writeFile(
       join(workspaceDir, ".gitignore"),
-      [".orchestrator/", "state.json", ".state-owner.json", ".fake-acpx-state/"].join("\n") + "\n",
+      [".orchestrator/", "state.json", "spool.json", ".state-owner.json", ".fake-acpx-state/"].join("\n") + "\n",
       "utf8"
     );
     runGit(workspaceDir, ["init"]);

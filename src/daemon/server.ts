@@ -1,11 +1,17 @@
 import { AdvancedRuntime } from "../advanced/runtime.js";
-import { timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { join } from "node:path";
 
 import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
-import { ZodError } from "zod";
+import { z, ZodError } from "zod";
 
 import { AcpxSessionManager } from "../manager/acpx.js";
+import {
+  bootReaperModeFromEnv,
+  countLiveLeftoverRunnerGroups,
+  reapRunnerGroups,
+  RunnerRegistry
+} from "../manager/runner-registry.js";
 import { OrchestratorRuntime } from "../orchestrator/runtime.js";
 import { OrchestratorStore } from "../orchestrator/store.js";
 import type { PluginLogger } from "../shared/logger.js";
@@ -13,14 +19,14 @@ import { OutputRouter, type OutputRouteEvent } from "../shared/output-router.js"
 import { REASONING_CAPABILITIES } from "../shared/reasoning.js";
 import { PuppenclawError } from "../shared/errors.js";
 import { SessionStore } from "../shared/store.js";
-import { UsageLedgerStore } from "../shared/usage-ledger.js";
+import { MAX_LEDGER_PAGE_ROWS, UsageLedgerStore } from "../shared/usage-ledger.js";
 import { TurnStatisticsStore } from "../statistics/store.js";
 import { TurnStatisticsRecorder } from "../statistics/recorder.js";
 import { ComputeRuntime } from "../compute/runtime.js";
 import { computeJobSpecZod } from "../compute/types.js";
 import { ResourceMonitor } from "../resources/monitor.js";
 import { resourcesHistoryParamsZod } from "../resources/types.js";
-import { jsonToolResult } from "../shared/tool-results.js";
+import { jsonToolResult, textToolResult } from "../shared/tool-results.js";
 import {
   artifactListParamsZod,
   artifactReadParamsZod,
@@ -54,6 +60,55 @@ import {
 } from "../shared/schema.js";
 import type { ParsedPluginConfig, StateRecoveryStatus, ToolResult } from "../shared/types.js";
 import { ensureDir, redactSensitiveText } from "../shared/utils.js";
+import { EventLoopMonitor } from "./event-loop.js";
+import { identityEnvelope, identityHeaders, resolveBuildId, type DaemonIdentity } from "./identity.js";
+import { registerV2Routes, type StreamBacklog } from "./v2.js";
+import { SseEventStream, sseMaxPendingBytesFromEnv, type SseEvent } from "./sse.js";
+import {
+  compactOutputView,
+  limitStatusTranscripts,
+  MAX_TRANSCRIPT_LIMIT,
+  MAX_TRANSCRIPT_PAGE_ENTRIES,
+  statusViewQueryZod,
+  transcriptPage,
+  transcriptPageQueryZod,
+  turnScopedResult
+} from "../shared/session-views.js";
+
+/**
+ * Per-request opt-ins of the pcp/2 step-1 shapes (capability `compactStatus`).
+ * They change only the response, never the turn, so they are not part of the
+ * keyed-turn fingerprint.
+ */
+const responseOptInsZod = {
+  resultView: z.enum(["session", "turn"]).optional(),
+  /** Keyed turns stream their own live output (capability keyedStreaming). */
+  keyedStreaming: z.boolean().optional()
+};
+
+/**
+ * Which live output a stream request receives: an unkeyed turn gets the
+ * session's output (as always); a keyed turn gets none unless it opts in, and
+ * then only the output of its own turn key.
+ */
+function streamSubscription(turnKey: string | undefined, keyedStreaming: boolean | undefined): StreamSubscription {
+  if (turnKey == null) {
+    return { mode: "session" };
+  }
+  return keyedStreaming === true ? { mode: "turn", turnKey } : { mode: "none" };
+}
+
+type StreamSubscription = { mode: "session" } | { mode: "turn"; turnKey: string } | { mode: "none" };
+const daemonStartParamsZod = startParamsZod.extend(responseOptInsZod);
+const daemonSendParamsZod = sendParamsZod.extend(responseOptInsZod);
+
+const usageLedgerQueryZod = z.object({
+  afterId: z.string().trim().min(1).max(256).optional(),
+  limit: z.coerce.number().int().min(1).max(MAX_LEDGER_PAGE_ROWS).default(500)
+});
+
+/** Live SSE responses; their queued backlog is reported by /v2/health and /ops/idle. */
+type OpenStream = { readonly pendingEvents: number; readonly pendingBytes: number };
 
 export async function createDaemonServer(params: {
   config: ParsedPluginConfig;
@@ -126,6 +181,37 @@ export async function createDaemonServer(params: {
   }
 
   const store = await SessionStore.open(params.dataDir);
+  const bootId = randomUUID();
+  const reaperMode = bootReaperModeFromEnv();
+  const startedAtMs = Date.now();
+  const identity: DaemonIdentity = {
+    bootId,
+    build: await resolveBuildId(),
+    startedAt: new Date(startedAtMs).toISOString(),
+    startedAtMs,
+    spoolId: () => store.spoolId
+  };
+  // Identity headers on every response, v1 included: headers cannot break a
+  // JSON consumer, so old labs are unaffected.
+  app.addHook("onSend", async (_request, reply, payload) => {
+    for (const [name, value] of Object.entries(identityHeaders(identity))) {
+      reply.header(name, value);
+    }
+    return payload;
+  });
+  const eventLoop = new EventLoopMonitor();
+  eventLoop.start();
+  const openStreams = new Set<OpenStream>();
+  const sseMaxPendingBytes = sseMaxPendingBytesFromEnv();
+  const streamBacklog = (): StreamBacklog => {
+    let events = 0;
+    let bytes = 0;
+    for (const stream of openStreams) {
+      events += stream.pendingEvents;
+      bytes += stream.pendingBytes;
+    }
+    return { streams: openStreams.size, events, bytes };
+  };
   app.addHook("onRequest", async (request) => {
     if (
       request.method === "GET" ||
@@ -151,6 +237,20 @@ export async function createDaemonServer(params: {
     let statistics: TurnStatisticsRecorder | undefined;
     let advanced: AdvancedRuntime | undefined;
     try {
+      // The owner lease is held, so every leftover record belongs to a dead
+      // daemon. Reap before reconciliation so killed runners read as orphaned.
+      await reapRunnerGroups({
+        dataDir: params.dataDir,
+        bootId,
+        mode: reaperMode,
+        log: (message) => logger.warn(message)
+      });
+      const runners = await RunnerRegistry.open({
+        dataDir: params.dataDir,
+        bootId,
+        mode: reaperMode,
+        warn: (message) => logger.warn(message)
+      });
       orchestratorStore = await OrchestratorStore.open(join(params.dataDir, "orchestrator"));
       usageLedger = await UsageLedgerStore.open(join(params.dataDir, "usage"));
       computeRuntime = await ComputeRuntime.open({
@@ -185,7 +285,8 @@ export async function createDaemonServer(params: {
         outputRouter,
         ledger: usageLedger,
         statistics,
-        advanced
+        advanced,
+        runners
       });
       advanced.attach({
         start: (request) => manager.start(request), quiesce: async (name) => { await manager.quiesce({ name }); },
@@ -201,7 +302,14 @@ export async function createDaemonServer(params: {
             durationMs: Date.parse(receipt.updatedAt) - Date.parse(receipt.createdAt), timestamp: receipt.updatedAt, turnId: receipt.attemptId, role: receipt.role, threads: 1 });
         },
       });
+      const runningAtBoot = store
+        .listSessions()
+        .filter((session) => session.activeTurn?.state === "running")
+        .map((session) => session.name);
       await manager.reconcilePersistedSessions();
+      if (reaperMode === "on" && runningAtBoot.length > 0) {
+        await manager.cancelInterruptedRuntimeTurns(runningAtBoot);
+      }
       await advanced.recover();
       const orchestrator = new OrchestratorRuntime({
         config: {
@@ -223,9 +331,11 @@ export async function createDaemonServer(params: {
         advanced,
         outputRouter,
         manager,
-        orchestrator
+        orchestrator,
+        runners
       };
     } catch (error) {
+      eventLoop.stop();
       resourceMonitor?.close();
       await advanced?.close();
       await statistics?.close();
@@ -245,7 +355,8 @@ export async function createDaemonServer(params: {
     advanced,
     outputRouter,
     manager,
-    orchestrator
+    orchestrator,
+    runners
   } = initialized;
 
   const ok = (result: ToolResult) => result;
@@ -346,6 +457,65 @@ export async function createDaemonServer(params: {
     defaultAgent: params.config.defaultAgent
   }));
 
+  registerV2Routes(app, {
+    identity,
+    eventLoop,
+    recoveryRequired: () => store.getRecoveryStatus().required,
+    activeTurns: () => manager.activeTurnCount(),
+    pendingStateWrites: () => store.pendingMutationCount,
+    streamBacklog,
+    // compactStatus: status view=summary and transcriptLimit, GET /session/:name/transcript,
+    // and start/send resultView=turn; every one is opt-in per request.
+    features: () => ({
+      health: 1,
+      opsIdle: 1,
+      usageLedger: 1,
+      compactStatus: 1,
+      keyedStreaming: 1,
+      sseGap: 1
+    }),
+    limits: () => ({
+      turnKeyMax: 128,
+      ledgerPageMax: MAX_LEDGER_PAGE_ROWS,
+      transcriptLimitMax: MAX_TRANSCRIPT_LIMIT,
+      transcriptPageMax: MAX_TRANSCRIPT_PAGE_ENTRIES,
+      sseMaxPendingBytes
+    })
+  });
+
+  // Deploy idle check (plan H2): counts only, no names or identifiers. The ops
+  // CLI decides what blocks a deploy; the daemon only reports. Every count is
+  // measured now: restart survivors (fenced sessions, leftover runner groups)
+  // count only while their processes may still be alive. Fences that record
+  // no process are reported apart: nothing to wait for, but their sessions
+  // refuse new turns until they are stopped.
+  app.get("/ops/idle", async () => {
+    const jobs = advanced.store.countJobsByState();
+    const runnerCounts = runners.counts();
+    const fences = await manager.countRecoveryFences();
+    return {
+      ok: true,
+      ...identityEnvelope(identity),
+      counts: {
+        activeTurns: manager.activeTurnCount(),
+        turnProcesses: manager.activeTurnProcessCount(),
+        runnerProcesses: runnerCounts.total,
+        runningTurnKeys: store.listRunningTurnRequests().length,
+        recoveryFencedSessions: fences.withProcess,
+        recoveryFencesWithoutProcess: fences.withoutProcess,
+        brokerJobsActive: jobs.queued + jobs.running,
+        brokerJobsPaused: jobs.paused,
+        computeJobsActive: computeRuntime.listActiveJobs().length,
+        streams: openStreams.size,
+        leftoverRunnerGroups: await countLiveLeftoverRunnerGroups({
+          dataDir: params.dataDir,
+          bootId,
+          mode: reaperMode
+        })
+      }
+    };
+  });
+
   app.get("/compute/capacity", async () => computeRuntime.capacity());
 
   app.post("/compute/jobs", async (request, reply) => {
@@ -377,6 +547,7 @@ export async function createDaemonServer(params: {
   });
 
   app.addHook("onClose", async () => {
+    eventLoop.stop();
     resourceMonitor.close();
     await advanced.close();
     await statistics.close();
@@ -401,7 +572,27 @@ export async function createDaemonServer(params: {
     };
   });
 
-  app.get("/sessions", async () => ok(await manager.status(statusParamsZod.parse({}))));
+  // Opt-in identity for new response shapes: v1 bodies only gain it when the
+  // request asked for a compact view, so existing parsers see no change.
+  const withIdentity = (result: ToolResult): ToolResult & ReturnType<typeof identityEnvelope> => ({
+    ...result,
+    ...identityEnvelope(identity)
+  });
+
+  app.get("/sessions", async (request) => {
+    const query = statusViewQueryZod.parse(request.query ?? {});
+    if (query.view === "summary") {
+      return withIdentity(
+        await manager.statusSummary(
+          query.transcriptLimit != null ? { transcriptLimit: query.transcriptLimit } : {}
+        )
+      );
+    }
+    const result = await manager.status(statusParamsZod.parse({}));
+    return query.transcriptLimit != null
+      ? withIdentity(limitStatusTranscripts(result, query.transcriptLimit))
+      : ok(result);
+  });
 
   app.post("/sessions/owner/list", async (request) => {
     assertOwnerCleanupAuthentication(authToken);
@@ -480,25 +671,50 @@ export async function createDaemonServer(params: {
 
   app.get("/skills", async () => ok(await manager.listSkills()));
 
-  app.get("/session/:name", async (request) =>
-    ok(
-      await manager.status(
-        statusParamsZod.parse({
-          name: (request.params as { name: string }).name
+  app.get("/session/:name", async (request) => {
+    const name = (request.params as { name: string }).name;
+    const query = statusViewQueryZod.parse(request.query ?? {});
+    if (query.view === "summary") {
+      return withIdentity(
+        await manager.statusSummary({
+          name: statusParamsZod.parse({ name }).name!,
+          ...(query.transcriptLimit != null ? { transcriptLimit: query.transcriptLimit } : {})
         })
-      )
-    )
-  );
+      );
+    }
+    const result = await manager.status(statusParamsZod.parse({ name }));
+    return query.transcriptLimit != null
+      ? withIdentity(limitStatusTranscripts(result, query.transcriptLimit))
+      : ok(result);
+  });
 
-  app.get("/session/:name/output", async (request) =>
-    ok(
-      await manager.output(
-        statusParamsZod.parse({
-          name: (request.params as { name: string }).name
-        })
-      )
-    )
-  );
+  app.get("/session/:name/transcript", async (request) => {
+    const name = statusParamsZod.parse({ name: (request.params as { name: string }).name }).name!;
+    const query = transcriptPageQueryZod.parse(request.query ?? {});
+    const session = store.getSession(name);
+    if (session == null) {
+      throw new PuppenclawError("NO_SESSION", `Unknown session ${name}.`);
+    }
+    const page = transcriptPage(session, store.getTurnGeneration(name), query.after, query.limit);
+    return withIdentity(textToolResult(`Transcript of ${name}`, page));
+  });
+
+  // The same opt-ins as status (capability compactStatus): view=summary drops
+  // the session transcript, transcriptLimit keeps its newest entries.
+  app.get("/session/:name/output", async (request) => {
+    const query = statusViewQueryZod.parse(request.query ?? {});
+    const result = await manager.output(
+      statusParamsZod.parse({
+        name: (request.params as { name: string }).name
+      })
+    );
+    if (query.view === "summary") {
+      return withIdentity(compactOutputView(result, query.transcriptLimit));
+    }
+    return query.transcriptLimit != null
+      ? withIdentity(limitStatusTranscripts(result, query.transcriptLimit))
+      : ok(result);
+  });
 
   app.get("/session/:name/cost", async (request) => {
     const limit = boundedCostHistoryLimit((request.query as { limit?: unknown } | undefined)?.limit);
@@ -588,6 +804,39 @@ export async function createDaemonServer(params: {
     }
   });
 
+  // Usage feed (plan H4): one cursor-paged call replaces one /cost call per session.
+  app.get("/usage/ledger", async (request, reply) => {
+    const query = usageLedgerQueryZod.parse(request.query ?? {});
+    let after = 0;
+    if (query.afterId != null) {
+      if (/^\d{1,15}$/u.test(query.afterId)) {
+        after = Number(query.afterId);
+      } else {
+        const seq = usageLedger.seqForId(query.afterId);
+        if (seq == null) {
+          return reply.code(400).send({
+            ok: false,
+            code: "INVALID_LEDGER_CURSOR",
+            error: "afterId is neither a ledger seq nor the id of a ledger row."
+          });
+        }
+        after = seq;
+      }
+    }
+    const page = usageLedger.page(after, query.limit);
+    // Rows are never deleted, so a seq cursor of this ledger never exceeds its
+    // head. A larger one comes from another copy of the file (a restore keeps
+    // the ledger id) and would silently skip the rows written up to it.
+    if (after > page.head) {
+      return reply.code(400).send({
+        ok: false,
+        code: "INVALID_LEDGER_CURSOR",
+        error: "afterId is beyond the newest ledger row; read the ledger from its start."
+      });
+    }
+    return { ok: true, ...identityEnvelope(identity), ...page };
+  });
+
   app.get("/usage", async (request) =>
     ok(
       await manager.cost(
@@ -599,16 +848,19 @@ export async function createDaemonServer(params: {
     )
   );
 
+  const presentTurnResult = (result: ToolResult, resultView: "session" | "turn" | undefined): ToolResult =>
+    resultView === "turn" ? withIdentity(turnScopedResult(result)) : ok(result);
+
   app.post("/session/start", async (request) => {
-    const parsed = startParamsZod.parse(request.body);
+    const { resultView, keyedStreaming: _keyedStreaming, ...parsed } = daemonStartParamsZod.parse(request.body);
     if (parsed.ownerKey != null) {
       assertOwnerCleanupAuthentication(authToken);
     }
-    return ok(await manager.start(parsed));
+    return presentTurnResult(await manager.start(parsed), resultView);
   });
 
   app.post("/session/start/stream", async (request, reply) => {
-    const parsed = startParamsZod.parse(request.body);
+    const { resultView, keyedStreaming, ...parsed } = daemonStartParamsZod.parse(request.body);
     if (parsed.ownerKey != null) {
       assertOwnerCleanupAuthentication(authToken);
     }
@@ -616,24 +868,24 @@ export async function createDaemonServer(params: {
       reply,
       sessionName: parsed.name,
       outputRouter,
-      subscribeToSessionOutput: parsed.turnKey == null,
-      run: async () => ok(await manager.start(parsed))
+      identity,
+      openStreams,
+      subscription: streamSubscription(parsed.turnKey, keyedStreaming),
+      maxPendingBytes: sseMaxPendingBytes,
+      run: async () => presentTurnResult(await manager.start(parsed), resultView)
     });
   });
 
-  app.post("/session/:name/send", async (request) =>
-    ok(
-      await manager.send(
-        sendParamsZod.parse({
-          ...(request.body as Record<string, unknown>),
-          name: (request.params as { name: string }).name
-        })
-      )
-    )
-  );
+  app.post("/session/:name/send", async (request) => {
+    const { resultView, keyedStreaming: _keyedStreaming, ...parsed } = daemonSendParamsZod.parse({
+      ...(request.body as Record<string, unknown>),
+      name: (request.params as { name: string }).name
+    });
+    return presentTurnResult(await manager.send(parsed), resultView);
+  });
 
   app.post("/session/:name/send/stream", async (request, reply) => {
-    const parsed = sendParamsZod.parse({
+    const { resultView, keyedStreaming, ...parsed } = daemonSendParamsZod.parse({
       ...(request.body as Record<string, unknown>),
       name: (request.params as { name: string }).name
     });
@@ -641,8 +893,11 @@ export async function createDaemonServer(params: {
       reply,
       sessionName: parsed.name,
       outputRouter,
-      subscribeToSessionOutput: parsed.turnKey == null,
-      run: async () => ok(await manager.send(parsed))
+      identity,
+      openStreams,
+      subscription: streamSubscription(parsed.turnKey, keyedStreaming),
+      maxPendingBytes: sseMaxPendingBytes,
+      run: async () => presentTurnResult(await manager.send(parsed), resultView)
     });
   });
 
@@ -1114,48 +1369,52 @@ async function streamToolResult(params: {
   reply: FastifyReply;
   sessionName: string;
   outputRouter: OutputRouter;
-  subscribeToSessionOutput?: boolean;
+  identity: DaemonIdentity;
+  openStreams: Set<OpenStream>;
+  subscription: StreamSubscription;
+  maxPendingBytes: number;
   run: () => Promise<ToolResult>;
 }): Promise<FastifyReply> {
-  let closed = false;
   let emittedProviderFailureCode: string | null = null;
-  params.reply.raw.on("close", () => {
-    closed = true;
-  });
   params.reply.raw.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",
     "cache-control": "no-cache, no-transform",
     connection: "keep-alive",
-    "x-accel-buffering": "no"
+    "x-accel-buffering": "no",
+    ...identityHeaders(params.identity)
+  });
+  // One queue per stream with drain, coalescing and the gap policy (see sse.ts).
+  const stream = new SseEventStream(params.reply.raw, {
+    sessionName: params.sessionName,
+    maxPendingBytes: params.maxPendingBytes
+  });
+  params.openStreams.add(stream);
+  params.reply.raw.on("close", () => {
+    params.openStreams.delete(stream);
   });
 
-  const heartbeat = setInterval(() => {
-    if (closed || params.reply.raw.writableEnded) {
-      return;
-    }
-    params.reply.raw.write(`: heartbeat ${Date.now()}\n\n`);
-  }, 15_000);
+  const heartbeat = setInterval(() => stream.heartbeat(), 15_000);
   heartbeat.unref?.();
 
   const write = (
     event: OutputRouteEvent | { kind: "result"; result: ToolResult } | { kind: "done" }
   ): void => {
-    if (closed || params.reply.raw.writableEnded) {
-      return;
-    }
-    params.reply.raw.write(`event: ${event.kind}\n`);
-    params.reply.raw.write(`data: ${JSON.stringify(event)}\n\n`);
+    stream.send(event as SseEvent);
   };
 
   const subscription =
-    params.subscribeToSessionOutput === false
+    params.subscription.mode === "none"
       ? null
-      : params.outputRouter.attach(params.sessionName, (event) => {
-          if (event.kind === "error" && isProviderFailureCode(event.code)) {
-            emittedProviderFailureCode = event.code;
-          }
-          write(event);
-        });
+      : params.outputRouter.attach(
+          params.sessionName,
+          (event) => {
+            if (event.kind === "error" && isProviderFailureCode(event.code)) {
+              emittedProviderFailureCode = event.code;
+            }
+            write(event);
+          },
+          params.subscription.mode === "turn" ? { turnKey: params.subscription.turnKey } : {}
+        );
 
   try {
     if (subscription != null) {
@@ -1191,6 +1450,7 @@ async function streamToolResult(params: {
     });
     write({ kind: "done" });
   } finally {
+    params.openStreams.delete(stream);
     clearInterval(heartbeat);
     // Identity-guarded: only removes this stream's own subscription, so a
     // racing second stream (e.g. rejected with TURN_ALREADY_RUNNING) can
@@ -1198,9 +1458,7 @@ async function streamToolResult(params: {
     if (subscription != null) {
       params.outputRouter.detach(subscription);
     }
-    if (!params.reply.raw.writableEnded) {
-      params.reply.raw.end();
-    }
+    stream.end();
   }
 
   return params.reply;

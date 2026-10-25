@@ -1,0 +1,67 @@
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "Status summary for running"
+    }
+  ],
+  "details": {
+    "view": "summary",
+    "session": {
+      "name": "running",
+      "agent": "claude",
+      "directory": "/workspace/project",
+      "state": "running",
+      "createdAt": "2026-01-01T10:00:00.000Z",
+      "lastActivity": "2026-01-01T10:02:00.000Z",
+      "permissionMode": "approve-reads",
+      "warnings": [],
+      "activeTurn": {
+        "id": "turn-running-1",
+        "state": "running",
+        "startedAt": "2026-01-01T10:01:00.000Z",
+        "updatedAt": "2026-01-01T10:01:30.000Z",
+        "pid": 431602,
+        "processGroupId": 431602,
+        "processStartIdentity": "431602:8888888",
+        "lastOutputAt": "2026-01-01T10:01:30.000Z",
+        "outputChars": 42
+      },
+      "recoveryFence": {
+        "reason": "restart-survivor",
+        "detectedAt": "2026-01-01T10:02:00.000Z",
+        "pid": 431602,
+        "processGroupId": 431602,
+        "processStartIdentity": "431602:8888888"
+      },
+      "transcriptSummary": {
+        "entries": 2,
+        "lastRole": "assistant",
+        "lastEntryAt": "2026-01-01T10:00:20.000Z",
+        "lastTurnId": null
+      }
+    },
+    "turn": {
+      "classification": "running",
+      "lockHeld": false,
+      "trackedChild": false,
+      "processAlive": true,
+      "identityMatches": true,
+      "pid": 431602,
+      "processGroupId": 431602,
+      "startedAt": "2026-01-01T10:01:00.000Z",
+      "updatedAt": "2026-01-01T10:01:30.000Z",
+      "lastOutputAt": "2026-01-01T10:01:30.000Z",
+      "outputChars": 42,
+      "ageMs": 61000,
+      "outputAgeMs": 32000,
+      "conflict": null
+    }
+  },
+  "protocol": {
+    "major": 2,
+    "minor": 0
+  },
+  "bootId": "00000000-0000-4000-8000-000000000001",
+  "spoolId": "00000000-0000-4000-8000-000000000002"
+}

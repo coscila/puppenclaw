@@ -24,7 +24,11 @@ export class AdvancedStore {
     const { DatabaseSync } = await import(`node${":sqlite"}`);
     const path = join(root, "advanced.sqlite"), db = new DatabaseSync(path);
     await chmod(path, 0o600);
-    db.exec("PRAGMA secure_delete=ON; PRAGMA foreign_keys=ON");
+    // WAL with synchronous=NORMAL: one fsync per checkpoint instead of per commit, and
+    // readers never block the writer. secure_delete=FAST zeroes freed pages only when
+    // that costs no extra I/O. journal_mode=WAL persists in the file; older daemons
+    // open it unchanged.
+    db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA secure_delete=FAST; PRAGMA foreign_keys=ON");
     db.exec(`CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, parent TEXT NOT NULL, attempt TEXT NOT NULL, request_key TEXT NOT NULL, fingerprint TEXT NOT NULL, payload TEXT NOT NULL, UNIQUE(parent,attempt,request_key));
       CREATE TABLE IF NOT EXISTS receipts (id TEXT PRIMARY KEY, parent TEXT NOT NULL, attempt TEXT NOT NULL, payload TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS receipts_attempt ON receipts(parent,attempt);
@@ -109,6 +113,14 @@ export class AdvancedStore {
     return row ? this.job(row.id) : null;
   }
   jobs(parent?: string): WorkerJob[] { return this.jobHeaders(parent).map((job) => this.hydrate(job)); }
+  /** Job counts by state from one scan of the jobs table (ops idle checks). */
+  countJobsByState(): Record<JobState, number> {
+    const counts = Object.fromEntries(states.map((state) => [state, 0])) as Record<JobState, number>;
+    for (const row of this.db.prepare("SELECT json_extract(payload,'$.state') AS state, count(*) AS count FROM jobs GROUP BY 1").all() as { state: string; count: number }[]) {
+      if ((states as string[]).includes(row.state)) counts[row.state as JobState] = row.count;
+    }
+    return counts;
+  }
   progress(id: string): JobProgress {
     const progress = { total: 0, ...Object.fromEntries(states.map((state) => [state, 0])) } as JobProgress;
     for (const row of this.db.prepare("SELECT state,count(*) AS count FROM job_items WHERE job_id=? GROUP BY state").all(id) as { state: JobState; count: number }[]) { progress[row.state] = row.count; progress.total += row.count; }
@@ -172,6 +184,11 @@ export class AdvancedStore {
       for (const receipt of this.receipts()) if (receipt.parentSessionName === name || receipt.sessionName === name || receipt.jobId && ids.has(receipt.jobId)) this.db.prepare("DELETE FROM receipts WHERE id=?").run(receipt.requestId);
       for (const job of jobs) this.db.prepare("DELETE FROM jobs WHERE id=?").run(job.jobId);
     });
+  }
+  /** Connection settings, for diagnostics and tests. */
+  pragmas(): { journalMode: string; synchronous: number; secureDelete: number } {
+    const value = (pragma: string) => Object.values(this.db.prepare(`PRAGMA ${pragma}`).get() as Record<string, unknown>)[0];
+    return { journalMode: String(value("journal_mode")), synchronous: Number(value("synchronous")), secureDelete: Number(value("secure_delete")) };
   }
   close(): void { this.db.close(); }
 }

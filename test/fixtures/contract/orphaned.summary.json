@@ -1,0 +1,65 @@
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "Status summary for orphaned"
+    }
+  ],
+  "details": {
+    "view": "summary",
+    "session": {
+      "name": "orphaned",
+      "agent": "claude",
+      "directory": "/workspace/project",
+      "state": "failed",
+      "createdAt": "2026-01-01T10:00:00.000Z",
+      "lastActivity": "2026-01-01T10:02:00.000Z",
+      "permissionMode": "approve-reads",
+      "warnings": [
+        "Persisted active turn has no matching live process; the turn is orphaned."
+      ],
+      "activeTurn": {
+        "id": "turn-orphaned-1",
+        "state": "orphaned",
+        "startedAt": "2026-01-01T10:01:00.000Z",
+        "updatedAt": "2026-01-01T10:01:30.000Z",
+        "pid": 999999999,
+        "processGroupId": 999999999,
+        "processStartIdentity": "999999999:1",
+        "lastOutputAt": "2026-01-01T10:01:30.000Z",
+        "outputChars": 7,
+        "completedAt": "2026-01-01T10:01:30.000Z"
+      },
+      "lastError": "Persisted active turn has no matching live process; the turn is orphaned.",
+      "lastStopReason": "Interrupted by daemon restart",
+      "transcriptSummary": {
+        "entries": 2,
+        "lastRole": "assistant",
+        "lastEntryAt": "2026-01-01T10:00:20.000Z",
+        "lastTurnId": null
+      }
+    },
+    "turn": {
+      "classification": "orphaned",
+      "lockHeld": false,
+      "trackedChild": false,
+      "processAlive": false,
+      "identityMatches": false,
+      "pid": 999999999,
+      "processGroupId": 999999999,
+      "startedAt": "2026-01-01T10:01:00.000Z",
+      "updatedAt": "2026-01-01T10:01:30.000Z",
+      "lastOutputAt": "2026-01-01T10:01:30.000Z",
+      "outputChars": 7,
+      "ageMs": 61000,
+      "outputAgeMs": 32000,
+      "conflict": null
+    }
+  },
+  "protocol": {
+    "major": 2,
+    "minor": 0
+  },
+  "bootId": "00000000-0000-4000-8000-000000000001",
+  "spoolId": "00000000-0000-4000-8000-000000000002"
+}

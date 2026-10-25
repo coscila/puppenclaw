@@ -1,0 +1,68 @@
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "Status summary for quiesced"
+    }
+  ],
+  "details": {
+    "view": "summary",
+    "session": {
+      "name": "quiesced",
+      "agent": "claude",
+      "directory": "/workspace/project",
+      "state": "stopped",
+      "createdAt": "2026-01-01T10:00:00.000Z",
+      "lastActivity": "2026-01-01T10:02:00.000Z",
+      "permissionMode": "approve-reads",
+      "warnings": [],
+      "handle": {
+        "runtimeSessionName": "quiesced",
+        "cwd": "/workspace/project",
+        "agent": "claude",
+        "mode": "persistent"
+      },
+      "reasoningProfile": "claude",
+      "activeTurn": {
+        "id": "turn-quiesced-1",
+        "state": "completed",
+        "startedAt": "2026-01-01T10:01:00.000Z",
+        "updatedAt": "2026-01-01T10:01:30.000Z",
+        "outputChars": 36,
+        "exitCode": 0,
+        "signal": null,
+        "lastOutputAt": "2026-01-01T10:01:30.000Z",
+        "completedAt": "2026-01-01T10:01:30.000Z"
+      },
+      "tokenUsage": {
+        "used": 27,
+        "size": 4096,
+        "input": 27,
+        "output": 12,
+        "cacheRead": 5,
+        "cacheWrite": 3
+      },
+      "lastStopReason": "quiesced at lifecycle epoch 1",
+      "transcriptSummary": {
+        "entries": 2,
+        "lastRole": "assistant",
+        "lastEntryAt": "2026-01-01T10:00:20.000Z",
+        "lastTurnId": "turn-quiesced-1"
+      }
+    },
+    "runtime": {
+      "exists": false,
+      "status": "quiesced"
+    },
+    "lifecycle": {
+      "quiesced": true,
+      "epoch": 1
+    }
+  },
+  "protocol": {
+    "major": 2,
+    "minor": 0
+  },
+  "bootId": "00000000-0000-4000-8000-000000000001",
+  "spoolId": "00000000-0000-4000-8000-000000000002"
+}

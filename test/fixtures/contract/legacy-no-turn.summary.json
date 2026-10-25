@@ -1,0 +1,56 @@
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "Status summary for legacy-no-turn"
+    }
+  ],
+  "details": {
+    "view": "summary",
+    "session": {
+      "name": "legacy-no-turn",
+      "agent": "claude",
+      "directory": "/workspace/project",
+      "state": "running",
+      "createdAt": "2026-01-01T10:00:00.000Z",
+      "lastActivity": "2026-01-01T10:02:00.000Z",
+      "permissionMode": "approve-reads",
+      "warnings": [],
+      "recoveryFence": {
+        "reason": "missing-turn-metadata",
+        "detectedAt": "2026-01-01T10:02:00.000Z"
+      },
+      "transcriptSummary": {
+        "entries": 2,
+        "lastRole": "assistant",
+        "lastEntryAt": "2026-01-01T10:00:20.000Z",
+        "lastTurnId": null
+      }
+    },
+    "runtime": {
+      "exists": false
+    },
+    "turn": {
+      "classification": "inactive",
+      "lockHeld": false,
+      "trackedChild": false,
+      "processAlive": null,
+      "identityMatches": null,
+      "pid": null,
+      "processGroupId": null,
+      "startedAt": null,
+      "updatedAt": null,
+      "lastOutputAt": null,
+      "outputChars": 0,
+      "ageMs": null,
+      "outputAgeMs": null,
+      "conflict": null
+    }
+  },
+  "protocol": {
+    "major": 2,
+    "minor": 0
+  },
+  "bootId": "00000000-0000-4000-8000-000000000001",
+  "spoolId": "00000000-0000-4000-8000-000000000002"
+}

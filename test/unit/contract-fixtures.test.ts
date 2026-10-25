@@ -22,6 +22,9 @@ describe.runIf(process.platform === "linux")("contract fixtures", () => {
       const committedOutput = JSON.parse(
         await readFile(join(CONTRACT_FIXTURES_DIR, `${scenario}.output.json`), "utf8")
       ) as unknown;
+      const committedSummary = JSON.parse(
+        await readFile(join(CONTRACT_FIXTURES_DIR, `${scenario}.summary.json`), "utf8")
+      ) as unknown;
       expect(
         captures[scenario].status,
         `${scenario}.status.json drifted; ${REGENERATE_HINT}`
@@ -30,14 +33,19 @@ describe.runIf(process.platform === "linux")("contract fixtures", () => {
         captures[scenario].output,
         `${scenario}.output.json drifted; ${REGENERATE_HINT}`
       ).toEqual(committedOutput);
+      expect(
+        captures[scenario].summary,
+        `${scenario}.summary.json drifted; ${REGENERATE_HINT}`
+      ).toEqual(committedSummary);
     }
   }, 30_000);
 
-  it("commits exactly one status and one output fixture per scenario", async () => {
+  it("commits exactly one status, output and summary fixture per scenario", async () => {
     const committed = (await readdir(CONTRACT_FIXTURES_DIR)).sort();
     const expected = CONTRACT_SCENARIOS.flatMap((scenario) => [
       `${scenario}.output.json`,
-      `${scenario}.status.json`
+      `${scenario}.status.json`,
+      `${scenario}.summary.json`
     ]).sort();
     expect(committed).toEqual(expected);
   });

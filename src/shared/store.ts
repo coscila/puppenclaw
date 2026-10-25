@@ -39,6 +39,44 @@ import {
 
 const OWNER_LEASE_VERSION = 1 as const;
 const OWNER_LEASE_FILE = ".state-owner.json";
+/**
+ * Identity of the persisted in-flight state ("spool"). It changes whenever the
+ * state is replaced instead of continued: a fresh data directory, a recovery
+ * reset, or state that could not be loaded. Consumers treat a new spoolId as
+ * the loss of every turn the previous spool held.
+ */
+const SPOOL_FILE = "spool.json";
+/**
+ * Captured at load so tests that fake timers cannot stall the group commit.
+ * One macrotask lets every mutation issued in the same event-loop turn (and its
+ * promise continuations) join the batch.
+ */
+const nextMacrotask: (callback: () => void) => unknown = globalThis.setImmediate;
+
+type PendingMutation = {
+  mutator: (state: StoredState) => unknown;
+  resolve: (value: unknown) => void;
+  reject: (error: unknown) => void;
+};
+
+export type SessionStorePersistenceStats = {
+  /** state.json writes. */
+  writes: number;
+  /** Mutations committed (successfully or not). */
+  mutations: number;
+  /** Commit rounds; a round with more than one mutation is a group commit. */
+  batches: number;
+  /** Group commits that fell back to per-mutation writes. */
+  fallbacks: number;
+  largestBatch: number;
+};
+const spoolRecordZod = z
+  .object({
+    version: z.literal(1),
+    spoolId: z.string().uuid(),
+    createdAt: z.string().min(1)
+  })
+  .strict();
 /** Full terminal outcomes retained per logical session. Older identities become tombstones. */
 export const MAX_TURN_REQUEST_OUTCOMES_PER_SESSION = 64;
 export const MAX_TURN_REQUEST_IDENTITIES_PER_SESSION = 4_096;
@@ -709,12 +747,23 @@ function freshState(): StoredState {
 export class SessionStore {
   private mutationTail: Promise<void> = Promise.resolve();
   private closed = false;
+  private pendingMutations = 0;
+  private readonly mutationQueue: PendingMutation[] = [];
+  private flushScheduled = false;
+  private readonly stats: SessionStorePersistenceStats = {
+    writes: 0,
+    mutations: 0,
+    batches: 0,
+    fallbacks: 0,
+    largestBatch: 0
+  };
 
   private constructor(
     readonly rootDir: string,
     private state: StoredState,
     private recovery: StateRecoveryStatus,
-    private readonly ownerLease: OwnerLease
+    private readonly ownerLease: OwnerLease,
+    private spool: { id: string; persisted: boolean }
   ) {}
 
   static async open(rootDir: string): Promise<SessionStore> {
@@ -728,11 +777,36 @@ export class SessionStore {
           }
         });
       }
-      return new SessionStore(rootDir, loaded.state, loaded.recovery, ownerLease);
+      // Continued state keeps its spool identity. A fresh or unreadable state
+      // starts a new spool; it is written with the first state write (fresh) or
+      // the operator reset (recovery), so opening alone never adds files.
+      let spool: { id: string; persisted: boolean } = { id: randomUUID(), persisted: false };
+      if (loaded.origin === "loaded") {
+        const existing = await readSpoolId(join(rootDir, SPOOL_FILE));
+        spool =
+          existing != null
+            ? { id: existing, persisted: true }
+            : { id: await writeSpoolRecord(join(rootDir, SPOOL_FILE), spool.id), persisted: true };
+      }
+      return new SessionStore(rootDir, loaded.state, loaded.recovery, ownerLease, spool);
     } catch (error) {
       await releaseOwnerLease(rootDir, ownerLease);
       throw error;
     }
+  }
+
+  /** Identity of the persisted in-flight state; see SPOOL_FILE. */
+  get spoolId(): string {
+    return this.spool.id;
+  }
+
+  /** Mutations accepted but not yet durably written (a backlog signal for health). */
+  get pendingMutationCount(): number {
+    return this.pendingMutations;
+  }
+
+  persistenceStats(): SessionStorePersistenceStats {
+    return { ...this.stats };
   }
 
   get statePath(): string {
@@ -753,7 +827,9 @@ export class SessionStore {
     }
     await this.enqueueMutation(async () => {
       const nextState = freshState();
+      const spoolId = await writeSpoolRecord(join(this.rootDir, SPOOL_FILE), randomUUID());
       await writeJsonFileAtomic(this.statePath, nextState, { mode: 0o600 });
+      this.spool = { id: spoolId, persisted: true };
       this.state = nextState;
       this.recovery = { required: false };
     });
@@ -1349,22 +1425,116 @@ export class SessionStore {
     await this.mutate(() => undefined);
   }
 
+  /**
+   * Group commit: mutations queued while a write is pending (or in the same
+   * event-loop turn) run in order on one clone, are validated once and written
+   * once. Each caller resolves only after the write that contains its change.
+   * If anything in a batch fails (a mutator throws, validation fails, or the
+   * write fails), the batch is discarded and every mutation is retried alone,
+   * exactly as before group commit, so one bad mutation never affects another.
+   * Mutators must therefore be pure functions of the state they are given.
+   */
   private async mutate<T>(mutator: (state: StoredState) => T): Promise<T> {
     this.assertWritable();
-    return await this.enqueueMutation(async () => {
+    this.pendingMutations += 1;
+    try {
+      return await new Promise<T>((resolve, reject) => {
+        this.mutationQueue.push({
+          mutator,
+          resolve: resolve as (value: unknown) => void,
+          reject
+        });
+        this.scheduleFlush();
+      });
+    } finally {
+      this.pendingMutations -= 1;
+    }
+  }
+
+  private scheduleFlush(): void {
+    if (this.flushScheduled) {
+      return;
+    }
+    this.flushScheduled = true;
+    void this.enqueueMutation(async () => {
+      await new Promise<void>((resolve) => {
+        nextMacrotask(resolve);
+      });
+      this.flushScheduled = false;
+      await this.commitBatch(this.mutationQueue.splice(0, this.mutationQueue.length));
+    }).catch(() => undefined);
+  }
+
+  private async commitBatch(batch: PendingMutation[]): Promise<void> {
+    if (batch.length === 0) {
+      return;
+    }
+    this.stats.batches += 1;
+    this.stats.mutations += batch.length;
+    this.stats.largestBatch = Math.max(this.stats.largestBatch, batch.length);
+    if (batch.length > 1) {
       const nextState = structuredClone(this.state);
-      const result = mutator(nextState);
-      const validated = storedStateZod.safeParse(nextState);
-      if (!validated.success) {
-        throw new PuppenclawError(
-          "INVALID_STATE_MUTATION",
-          `Refusing to persist invalid session state: ${z.prettifyError(validated.error)}`
-        );
+      let results: unknown[] | null = [];
+      try {
+        for (const entry of batch) {
+          results.push(entry.mutator(nextState));
+        }
+        if (!storedStateZod.safeParse(nextState).success) {
+          results = null;
+        }
+      } catch {
+        results = null;
       }
-      await writeJsonFileAtomic(this.statePath, nextState, { mode: 0o600 });
-      this.state = nextState;
-      return result;
-    });
+      if (results != null) {
+        try {
+          await this.writeState(nextState);
+          for (const [index, entry] of batch.entries()) {
+            entry.resolve(results[index]);
+          }
+          return;
+        } catch {
+          // Fall back to per-mutation writes below.
+        }
+      }
+      this.stats.fallbacks += 1;
+    }
+    for (const entry of batch) {
+      try {
+        entry.resolve(await this.commitOne(entry.mutator));
+      } catch (error) {
+        entry.reject(error);
+      }
+    }
+  }
+
+  private async commitOne<T>(mutator: (state: StoredState) => T): Promise<T> {
+    const nextState = structuredClone(this.state);
+    const result = mutator(nextState);
+    const validated = storedStateZod.safeParse(nextState);
+    if (!validated.success) {
+      throw new PuppenclawError(
+        "INVALID_STATE_MUTATION",
+        `Refusing to persist invalid session state: ${z.prettifyError(validated.error)}`
+      );
+    }
+    await this.writeState(nextState);
+    return result;
+  }
+
+  private async writeState(nextState: StoredState): Promise<void> {
+    await this.persistSpoolIdentity();
+    await writeJsonFileAtomic(this.statePath, nextState, { mode: 0o600 });
+    this.stats.writes += 1;
+    this.state = nextState;
+  }
+
+  /** A fresh spool is written just before its first state write. */
+  private async persistSpoolIdentity(): Promise<void> {
+    if (this.spool.persisted) {
+      return;
+    }
+    await writeSpoolRecord(join(this.rootDir, SPOOL_FILE), this.spool.id);
+    this.spool = { id: this.spool.id, persisted: true };
   }
 
   private async enqueueMutation<T>(run: () => Promise<T>): Promise<T> {
@@ -1394,16 +1564,31 @@ export class SessionStore {
   }
 }
 
+async function readSpoolId(path: string): Promise<string | null> {
+  try {
+    const parsed = spoolRecordZod.safeParse(JSON.parse(await readFile(path, "utf8")) as unknown);
+    return parsed.success ? parsed.data.spoolId : null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeSpoolRecord(path: string, spoolId: string): Promise<string> {
+  await writeJsonFileAtomic(path, { version: 1, spoolId, createdAt: nowIso() }, { mode: 0o600 });
+  return spoolId;
+}
+
 async function loadStoredState(statePath: string): Promise<{
   state: StoredState;
   recovery: StateRecoveryStatus;
+  origin: "fresh" | "loaded" | "recovery";
 }> {
   let raw: string;
   try {
     raw = await readFile(statePath, "utf8");
   } catch (error) {
     if (isNodeError(error, "ENOENT")) {
-      return { state: freshState(), recovery: { required: false } };
+      return { state: freshState(), recovery: { required: false }, origin: "fresh" };
     }
     return await recoveryState({
       statePath,
@@ -1438,7 +1623,8 @@ async function loadStoredState(statePath: string): Promise<{
         sessionOwners: validated.data.sessionOwners,
         ownerCleanup: validated.data.ownerCleanup
       },
-      recovery: { required: false }
+      recovery: { required: false },
+      origin: "loaded"
     };
   }
   const version =
@@ -1509,7 +1695,7 @@ async function recoveryState(params: {
   reason: Extract<StateRecoveryStatus, { required: true }>['reason'];
   message: string;
   quarantine: boolean;
-}): Promise<{ state: StoredState; recovery: StateRecoveryStatus }> {
+}): Promise<{ state: StoredState; recovery: StateRecoveryStatus; origin: "recovery" }> {
   const quarantinePath = params.quarantine ? await quarantineFile(params.statePath) : null;
   const detectedAt = nowIso();
   const recovery: StateRecoveryStatus = {
@@ -1524,7 +1710,7 @@ async function recoveryState(params: {
       quarantinePath != null ? `; previous state was preserved at ${quarantinePath}` : ""
     }.`
   );
-  return { state: freshState(), recovery };
+  return { state: freshState(), recovery, origin: "recovery" };
 }
 
 async function acquireOwnerLease(rootDir: string): Promise<OwnerLease> {

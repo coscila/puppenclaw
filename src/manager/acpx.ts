@@ -77,6 +77,8 @@ import {
   redactSensitiveText
 } from "../shared/utils.js";
 import type { ISessionManager } from "./interface.js";
+import type { RunnerRegistry } from "./runner-registry.js";
+import { compactSessionView } from "../shared/session-views.js";
 import { CodexEventAdapter, isWrapperMetadataType } from "./codex-events.js";
 import { AcpPlanPermissionTracker } from "./acp-plan-permissions.js";
 import { TurnDiagnosticsRecorder, purgeSessionDiagnostics, readCodexFinalMessageFile, unlinkCodexFinalMessageFile } from "./turn-diagnostics.js";
@@ -357,7 +359,20 @@ const QUIESCENCE_RUNTIME_COMMAND_TIMEOUT_MS = 5_000;
 const QUIESCENCE_RUNTIME_TIMEOUT_MS = 15_000;
 const QUIESCENCE_DRAIN_TIMEOUT_MS = 4_000;
 const QUIESCENCE_POLL_MS = 25;
-const ACTIVE_TURN_CHECKPOINT_MS = 5_000;
+const DEFAULT_ACTIVE_TURN_CHECKPOINT_MS = 30_000;
+
+/**
+ * How often live-turn progress (lastOutputAt, outputChars) is persisted. All
+ * live turns share one tick so their checkpoints land in one group commit.
+ * Status reads overlay the in-memory values, so this only bounds how stale the
+ * persisted copy may be. `PUPPENCLAW_ACTIVE_TURN_CHECKPOINT_MS` overrides it.
+ */
+export function activeTurnCheckpointMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.PUPPENCLAW_ACTIVE_TURN_CHECKPOINT_MS?.trim();
+  return raw != null && /^\d{1,9}$/u.test(raw)
+    ? Math.max(250, Number(raw))
+    : DEFAULT_ACTIVE_TURN_CHECKPOINT_MS;
+}
 const RECOVERY_FENCE_TERMINATION_TIMEOUT_MS = 4_000;
 const NO_FINAL_MESSAGE_STOP_REASON = "no_final_message";
 const NO_FINAL_MESSAGE_STATUS_TEXT = "Runner completed without a final assistant message.";
@@ -1414,7 +1429,8 @@ export class AcpxSessionManager implements ISessionManager {
   private readonly capacityReservations = new Map<string, number>();
   private readonly forkTargetClaims = new Set<string>();
   private readonly activeTurnIds = new Map<string, string>();
-  private readonly activeTurnCheckpointAt = new Map<string, number>();
+  private readonly dirtyActiveTurnCheckpoints = new Set<string>();
+  private activeTurnCheckpointTimer: NodeJS.Timeout | null = null;
   private readonly activeTurnPersistence = new Map<string, Promise<void>>();
   private readonly activeTurnCompletion = new Map<
     string,
@@ -1441,8 +1457,51 @@ export class AcpxSessionManager implements ISessionManager {
       ledger?: UsageLedgerStore;
       statistics?: TurnStatisticsRecorder;
       advanced?: AdvancedRuntime;
+      runners?: RunnerRegistry;
     }
-  ) {}
+  ) {
+    // Output events are attributed to the keyed turn executing at dispatch time,
+    // which lets a keyed request stream exactly its own turn (keyedStreaming).
+    deps.outputRouter.setTurnKeyResolver?.(
+      (sessionName) => this.keyedTurnExecutions.get(sessionName)?.turnKey ?? null
+    );
+  }
+
+  /** Turns admitted in this process and not yet settled (counts only, for ops and health). */
+  activeTurnCount(): number {
+    return this.activeTurns.size;
+  }
+
+  /** Turn processes this process spawned that have not closed yet. */
+  activeTurnProcessCount(): number {
+    return this.activeTurnProcesses.size;
+  }
+
+  /**
+   * Sessions fenced after a restart (GET /ops/idle), by what the daemon can
+   * watch. `withProcess`: the fence records a process that is not proven gone,
+   * which is activity a deploy waits for; once that process exits it no
+   * longer counts, and the next dispatch clears the fence. `withoutProcess`:
+   * the fence records no process (missing turn metadata or pid), so there is
+   * nothing to wait for, but the fence keeps refusing the session's next turn
+   * (RECOVERY_FENCE_ACTIVE) until an explicit stop resolves it.
+   */
+  async countRecoveryFences(): Promise<{ withProcess: number; withoutProcess: number }> {
+    let withProcess = 0;
+    let withoutProcess = 0;
+    for (const session of this.deps.store.listSessions()) {
+      const fence = session.recoveryFence;
+      if (fence == null) {
+        continue;
+      }
+      if (fence.pid == null) {
+        withoutProcess += 1;
+      } else if (!(await this.isRecoveredProcessDefinitelyGone(fence))) {
+        withProcess += 1;
+      }
+    }
+    return { withProcess, withoutProcess };
+  }
 
   private recordTurnUsage(session: SessionInfo, turn: TurnResult): void {
     if (this.deps.advanced?.metered(session.name)) return;
@@ -2046,6 +2105,46 @@ export class AcpxSessionManager implements ISessionManager {
     );
   }
 
+  /**
+   * Boot reaper (`PUPPENCLAW_BOOT_REAPER=on`): once a restart has settled a turn
+   * as interrupted, its persistent acpx runtime must not keep executing it.
+   * Asks each named runtime to cancel its in-flight prompt. Best effort, bounded
+   * per command; direct one-shot runtimes have no separate runtime to cancel.
+   */
+  async cancelInterruptedRuntimeTurns(names: readonly string[]): Promise<number> {
+    const targets = names
+      .map((name) => this.deps.store.getSession(name))
+      .filter(
+        (session): session is SessionInfo =>
+          session != null && !this.usesOneShotRuntime(session) && !this.activeTurns.has(session.name)
+      );
+    let cancelled = 0;
+    for (let index = 0; index < targets.length; index += 4) {
+      const settled = await Promise.allSettled(
+        targets.slice(index, index + 4).map(async (session) => {
+          const runtimeEnv = this.modelProviderRuntimeEnv(session.modelProvider, session.name);
+          await this.runControlCommand({
+            args: this.buildVerbArgs(session.agent, session.directory, ["cancel", "--session", session.name]),
+            cwd: session.directory,
+            allowNoSession: true,
+            timeoutMs: QUIESCENCE_RUNTIME_COMMAND_TIMEOUT_MS,
+            ...(runtimeEnv != null ? { env: runtimeEnv } : {})
+          });
+        })
+      );
+      for (const [offset, result] of settled.entries()) {
+        if (result.status === "fulfilled") {
+          cancelled += 1;
+        } else {
+          this.deps.logger.warn(
+            `Boot reaper could not cancel the runtime turn of ${targets[index + offset]?.name}: ${redactSensitiveText(ensureError(result.reason).message)}`
+          );
+        }
+      }
+    }
+    return cancelled;
+  }
+
   async stop(params: StopParams): Promise<ToolResult> {
     return await this.withLifecycleLock(params.name, async () => {
       this.deps.store.assertSessionMutable(params.name);
@@ -2468,6 +2567,59 @@ export class AcpxSessionManager implements ISessionManager {
         : {})
     };
     return jsonToolResult(details, `Status for ${params.name}`);
+  }
+
+  /**
+   * Compact status (`view=summary`): the reconciled session and turn exactly as
+   * status() reports them, minus the transcript (or only its newest entries).
+   * The runtime probe is left out, so no `acpx status` process is spawned,
+   * except where a status reader needs it to classify the session: a quiesced
+   * session reports the same `runtime: {status: "quiesced"}` as status()
+   * (no probe), and a session stored as active without an active turn (a stale
+   * record after a restart) gets the probe for that one session, because only
+   * the runtime can show its turn is over.
+   */
+  async statusSummary(params: { name?: string; transcriptLimit?: number } = {}): Promise<ToolResult> {
+    if (params.name == null) {
+      const sessions = await Promise.all(
+        this.deps.store.listSessions().map(async (session) => {
+          const reconciled = await this.reconcileVisibleSession(session);
+          return { ...compactSessionView(reconciled.session, params.transcriptLimit), turn: reconciled.turn };
+        })
+      );
+      return textToolResult("Tracked Orchestrator sessions (summary)", { view: "summary", sessions });
+    }
+    const stored = this.requireSession(params.name);
+    const activeQuiescence = this.deps.store.getQuiescence(stored.name);
+    const reconciled =
+      activeQuiescence != null
+        ? { session: this.decorateVisibleSession(stored), turn: null }
+        : await this.reconcileVisibleSession(stored);
+    const session = reconciled.session;
+    const staleActive =
+      activeQuiescence == null &&
+      session.state === "running" &&
+      (reconciled.turn == null || reconciled.turn.classification === "inactive");
+    const runtime =
+      activeQuiescence != null
+        ? { exists: false, status: "quiesced" }
+        : staleActive
+          ? await this.getRuntimeStatus({
+              name: session.name,
+              agent: session.agent,
+              directory: session.directory,
+              ...(session.modelProvider != null ? { modelProvider: session.modelProvider } : {})
+            })
+          : undefined;
+    return textToolResult(`Status summary for ${params.name}`, {
+      view: "summary",
+      session: compactSessionView(session, params.transcriptLimit),
+      ...(runtime != null ? { runtime } : {}),
+      ...(reconciled.turn != null ? { turn: reconciled.turn } : {}),
+      ...(activeQuiescence != null
+        ? { lifecycle: { quiesced: true, epoch: activeQuiescence.epoch } }
+        : {})
+    });
   }
 
   async output(params: StatusParams): Promise<ToolResult> {
@@ -3699,8 +3851,17 @@ export class AcpxSessionManager implements ISessionManager {
     }
     const nowMs = Date.now();
     const startedMs = activeTurn?.startedAt != null ? Date.parse(activeTurn.startedAt) : Number.NaN;
-    const outputMs =
-      activeTurn?.lastOutputAt != null ? Date.parse(activeTurn.lastOutputAt) : Number.NaN;
+    // Progress is persisted only on the checkpoint tick; the live turn in this
+    // process has the current values.
+    const liveOutput =
+      activeTurn != null && this.activeTurnIds.get(session.name) === activeTurn.id
+        ? this.activeTurnOutputs.get(session.name)
+        : undefined;
+    const lastOutputAt =
+      liveOutput != null && liveOutput.totalChars > 0
+        ? liveOutput.updatedAt
+        : (activeTurn?.lastOutputAt ?? null);
+    const outputMs = lastOutputAt != null ? Date.parse(lastOutputAt) : Number.NaN;
     return {
       classification,
       lockHeld,
@@ -3712,8 +3873,8 @@ export class AcpxSessionManager implements ISessionManager {
         observedIdentity?.processGroupId ?? activeTurn?.processGroupId ?? null,
       startedAt: activeTurn?.startedAt ?? null,
       updatedAt: activeTurn?.updatedAt ?? null,
-      lastOutputAt: activeTurn?.lastOutputAt ?? null,
-      outputChars: activeTurn?.outputChars ?? 0,
+      lastOutputAt,
+      outputChars: Math.max(activeTurn?.outputChars ?? 0, liveOutput?.totalChars ?? 0),
       ageMs: Number.isFinite(startedMs) ? Math.max(0, nowMs - startedMs) : null,
       outputAgeMs: Number.isFinite(outputMs) ? Math.max(0, nowMs - outputMs) : null,
       conflict
@@ -4795,6 +4956,7 @@ export class AcpxSessionManager implements ISessionManager {
           detached: process.platform !== "win32",
           env
         });
+    this.deps.runners?.track(child, { kind: "turn", sessionName: params.session.name });
     const exit = childExit(child);
     void exit.catch(() => undefined);
     await this.registerActiveTurnProcess(params.session.name, child);
@@ -5293,6 +5455,7 @@ export class AcpxSessionManager implements ISessionManager {
           detached: process.platform !== "win32",
           env
         });
+    this.deps.runners?.track(child, { kind: "turn", sessionName: params.session.name });
     const exit = childExit(child);
     void exit.catch(() => undefined);
     await this.registerActiveTurnProcess(params.session.name, child);
@@ -5561,7 +5724,7 @@ export class AcpxSessionManager implements ISessionManager {
       complete: false,
       totalChars: 0
     });
-    this.activeTurnCheckpointAt.set(sessionName, Date.now());
+    this.dirtyActiveTurnCheckpoints.delete(sessionName);
     const keyedExecution = this.keyedTurnExecutions.get(sessionName);
     const buildSession = (stored: SessionInfo | null): SessionInfo => {
       const current = stored ?? session;
@@ -5710,20 +5873,37 @@ export class AcpxSessionManager implements ISessionManager {
     const output = this.activeTurnOutputs.get(sessionName);
     const turnId = this.activeTurnIds.get(sessionName);
     if (output == null || turnId == null) {
+      this.dirtyActiveTurnCheckpoints.delete(sessionName);
       return;
     }
-    const nowMs = Date.now();
-    const previousMs = this.activeTurnCheckpointAt.get(sessionName) ?? 0;
-    if (!force && nowMs - previousMs < ACTIVE_TURN_CHECKPOINT_MS) {
+    if (!force) {
+      this.dirtyActiveTurnCheckpoints.add(sessionName);
+      this.scheduleActiveTurnCheckpoints();
       return;
     }
-    this.activeTurnCheckpointAt.set(sessionName, nowMs);
+    this.dirtyActiveTurnCheckpoints.delete(sessionName);
     void this.patchActiveTurn(sessionName, turnId, (activeTurn) => ({
       ...activeTurn,
       updatedAt: output.updatedAt,
       lastOutputAt: output.updatedAt,
       outputChars: output.totalChars
     }));
+  }
+
+  /** One daemon-wide tick checkpoints every turn with new output in the same group commit. */
+  private scheduleActiveTurnCheckpoints(): void {
+    if (this.activeTurnCheckpointTimer != null) {
+      return;
+    }
+    this.activeTurnCheckpointTimer = setTimeout(() => {
+      this.activeTurnCheckpointTimer = null;
+      const due = [...this.dirtyActiveTurnCheckpoints];
+      this.dirtyActiveTurnCheckpoints.clear();
+      for (const sessionName of due) {
+        this.checkpointActiveTurnOutput(sessionName, true);
+      }
+    }, activeTurnCheckpointMs());
+    this.activeTurnCheckpointTimer.unref?.();
   }
 
   private patchActiveTurn(
@@ -5835,7 +6015,7 @@ export class AcpxSessionManager implements ISessionManager {
         : await this.deps.store.patchSession(sessionName, patchSession);
     this.stopRequests.delete(sessionName);
     this.activeTurnIds.delete(sessionName);
-    this.activeTurnCheckpointAt.delete(sessionName);
+    this.dirtyActiveTurnCheckpoints.delete(sessionName);
     if (nextSession == null) {
       throw new PuppenclawError("NO_SESSION", `Unknown session ${sessionName}.`);
     }
@@ -5969,6 +6149,13 @@ export class AcpxSessionManager implements ISessionManager {
             detached: process.platform !== "win32",
             env: params.env != null ? { ...process.env, ...params.env } : process.env
           });
+      const sessionIndex = params.args.indexOf("--session");
+      this.deps.runners?.track(child, {
+        kind: "control",
+        ...(sessionIndex >= 0 && params.args[sessionIndex + 1] != null
+          ? { sessionName: params.args[sessionIndex + 1] }
+          : {})
+      });
       let settled = false;
       const timeout =
         params.timeoutMs == null

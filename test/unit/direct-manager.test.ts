@@ -2100,7 +2100,8 @@ describe("AcpxSessionManager", () => {
           text: liveOutput
         });
       }
-      if (liveOutput.includes("Final streamed answer.")) {
+      // The primed turn's reply contains the same text; only the running turn counts.
+      if (liveOutput.includes("Final streamed answer.") && outputDetails?.complete === false) {
         break;
       }
     }
