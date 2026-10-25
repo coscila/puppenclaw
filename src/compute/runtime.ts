@@ -7,6 +7,7 @@ import type { ParsedPluginConfig } from "../shared/types.js";
 import { ensureDir, readJsonFile, writeJsonFileAtomic } from "../shared/utils.js";
 import { computeExecutorCapabilities } from "./capabilities.js";
 import { processIdentityMatches, readProcessStartTicks } from "./process.js";
+import { withPrincipalBinding, type PrincipalSocketBinding } from "./sandbox.js";
 import { ComputeStore } from "./store.js";
 import {
   computeJobRecordZod,
@@ -89,10 +90,14 @@ export class ComputeRuntime {
       : this.store.listActiveBySession(sessionName);
   }
 
-  async submit(input: unknown): Promise<ComputeJobRecord> {
+  /** `principal` is the socket binding of `spec.principalId`, resolved by the caller from the principal registry. */
+  async submit(input: unknown, options: { principal?: PrincipalSocketBinding } = {}): Promise<ComputeJobRecord> {
     const spec = computeJobSpecZod.parse(input);
     const existing = this.store.get(spec.jobId);
     if (existing) return this.reconcile(existing);
+    if (spec.principalId !== options.principal?.principalId) {
+      throw new Error("Compute job principal has no open socket to bind.");
+    }
     const cwd = await realpath(spec.cwd);
     if (!isPathWithinRoots(cwd, this.allowedRoots)) {
       throw new Error("Compute cwd is outside the configured workspace roots.");
@@ -155,7 +160,9 @@ export class ComputeRuntime {
         "--submitted-at",
         submittedAt
       ],
-      { detached: true, stdio: "ignore", windowsHide: true }
+      // The supervisor hands this controller environment to the host-side
+      // launcher; it carries a principal binding only for a job that names one.
+      { detached: true, stdio: "ignore", windowsHide: true, env: withPrincipalBinding(process.env, options.principal) }
     );
     supervisor.unref();
     const starting = computeJobRecordZod.parse({
