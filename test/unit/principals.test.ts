@@ -388,6 +388,11 @@ describe("principal budgets", () => {
     expect(service.calls).toBe(2);
     expect(paused.results.filter((r) => r.state === "completed")).toHaveLength(2);
     expect(registry.detail("run:a")!.usage).toMatchObject({ items: 2, activeItems: 0, inputTokens: 20 });
+    // The paused event came while refused waiters were still in flight; the drained job reports its final counts.
+    const refused = paused.results.filter((r) => r.state === "paused").length;
+    expect(refused).toBeGreaterThan(0);
+    const jobEvents = runtime.store.events(0, 1000).events.filter((event) => event.type === "broker.job" && event.jobId === job.jobId).map((event) => event.payload as { state: string; counts: Record<string, number> });
+    expect(jobEvents.at(-1)).toMatchObject({ state: "paused", counts: { total: 6, running: 0, succeeded: 2, failed: refused, queued: 4 - refused } });
   });
 
   it("cancels items waiting for a slot together with their job", async () => {
@@ -501,6 +506,10 @@ describe("principal revocation", () => {
     expect(final.state).toBe("cancelled");
     expect(final.results.every((r) => r.state === "cancelled")).toBe(true);
     expect(service.calls).toBe(2);
+    // The two calls in flight settled after the cancelled event; a last event carries the final counts.
+    const lastJobEvent = () => runtime.store.events(0, 1000).events.filter((event) => event.type === "broker.job" && event.jobId === job.jobId).at(-1)!.payload as { state: string; counts: Record<string, number> };
+    await until(() => lastJobEvent().counts.running === 0);
+    expect(lastJobEvent()).toMatchObject({ state: "cancelled", counts: { total: 6, running: 0, queued: 0, cancelled: 6 } });
   });
 
   it("completes a revocation a restart interrupted: no socket reopens and paused work ends cancelled", async () => {

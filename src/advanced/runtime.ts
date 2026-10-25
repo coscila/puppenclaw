@@ -355,7 +355,8 @@ export class AdvancedRuntime {
         if (current.kind === "agent") { this.recordAgentReceipts(current); current.results[0]!.errorCode = "AGENT_PROCESS_FAILED"; void this.store.putJob(current, { receipts: [this.agentSettlement(current)] }); }
         else void this.store.putJob(current);
       })
-      .finally(() => { this.executions.delete(job.jobId); this.activeJobs.delete(job.jobId); this.store.clearRunning(job.jobId); });
+      // A paused, cancelled or failed job may have settled items after its last event: report its final counts.
+      .finally(() => { this.executions.delete(job.jobId); this.activeJobs.delete(job.jobId); this.store.clearRunning(job.jobId); void this.store.refreshJobCounts(job.jobId).catch(() => undefined); });
     this.executions.set(job.jobId, execution);
   }
   private async runAgent(job: WorkerJob, parent: RuntimeParticipant): Promise<void> {
@@ -644,6 +645,8 @@ export class AdvancedRuntime {
     // Broker receipts settle while cancellation drains the native harness.
     // Preserve that measured/partial work even though no final answer exists.
     if (job.kind === "agent") { const settled = this.store.job(id); if (settled) { this.recordAgentReceipts(settled); void this.store.putJob(settled, { receipts: [this.agentSettlement(settled)] }); } }
+    // Items that were in flight settled after the cancelled event: report the final counts.
+    void this.store.refreshJobCounts(id).catch(() => undefined);
   }
   async closeTurn(name: string): Promise<void> {
     try { await this.closeTurnNow(name); }

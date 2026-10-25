@@ -13,7 +13,8 @@ import {
   SETTLED_ITEM_STATES,
   type BrokerEvent,
   type BrokerEventType,
-  type BrokerJobCounts
+  type BrokerJobCounts,
+  type BrokerJobPayload
 } from "./outbox.js";
 import { canonicalJson, effectiveSettings, serverFingerprint, settingsSha256, sha256Hex } from "./fingerprint.js";
 import type { WorkerJob, WorkerJobHeader, UsageReceipt, ItemResult, BulkSubmit, JobProgress, JobState, PageOptions, ResultPage } from "./types.js";
@@ -407,6 +408,28 @@ export class AdvancedStore {
       if (previous !== snapshot.state) this.insertJobEvent(snapshot, batch);
     });
     return job;
+  }
+
+  /**
+   * Items in flight when a job paused or was cancelled settle after its broker.job event,
+   * so that event's counts still show them running. Once the job's execution has drained
+   * (no running item left in memory), emit one more broker.job event with the same state
+   * and the final counts, unless they did not change. Active jobs are left alone.
+   */
+  refreshJobCounts(jobId: string): Promise<void> {
+    return this.enqueue((batch) => {
+      if (this.running.has(jobId)) return;
+      const row = this.stmt("SELECT payload FROM jobs WHERE id=?").get(jobId) as { payload: string } | undefined;
+      if (!row) return;
+      const job = JSON.parse(row.payload) as WorkerJobHeader;
+      if (job.state === "queued" || job.state === "running") return;
+      const last = this.stmt("SELECT payload FROM outbox WHERE job_id=? AND type=? ORDER BY seq DESC LIMIT 1").get(jobId, BROKER_JOB_EVENT) as { payload: string } | undefined;
+      if (last) {
+        const previous = JSON.parse(last.payload) as BrokerJobPayload;
+        if (previous.state === job.state && canonicalJson(previous.counts) === canonicalJson(this.counts(jobId))) return;
+      }
+      this.insertJobEvent(job, batch);
+    });
   }
 
   /** Running state stays in memory: no write when an item starts. */

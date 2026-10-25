@@ -523,7 +523,10 @@ appear at or below the acknowledged cursor (retention, erasure).
   instrumentDigest, createdAt, updatedAt}` (absent values are null). Counts
   fold item states into these categories: paused and interrupted items count as
   failed (a resume runs them in a new job), a truncated item counts once, as
-  truncated.
+  truncated. Items in flight when a job pauses or is cancelled settle after
+  that state change; once the job's execution has drained, one more
+  `broker.job` row with the same state carries the final counts (none when they
+  did not change).
 - `broker.receipt` payload: `{jobId, itemId, attempt, status
   (succeeded|failed|truncated|cancelled), finishReason, usage: {input, output,
   cacheRead, cacheWrite}, model, serverFingerprint, settingsSha256,
