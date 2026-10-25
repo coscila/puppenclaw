@@ -61,7 +61,7 @@ import {
 import type { ParsedPluginConfig, StateRecoveryStatus, ToolResult } from "../shared/types.js";
 import { ensureDir, redactSensitiveText } from "../shared/utils.js";
 import { EventLoopMonitor } from "./event-loop.js";
-import { identityHeaders, resolveBuildId, type DaemonIdentity } from "./identity.js";
+import { identityEnvelope, identityHeaders, resolveBuildId, type DaemonIdentity } from "./identity.js";
 import { registerV2Routes, type StreamBacklog } from "./v2.js";
 
 /** Live SSE responses; their queued backlog is reported by /v2/health and /ops/idle. */
@@ -422,8 +422,32 @@ export async function createDaemonServer(params: {
     activeTurns: () => manager.activeTurnCount(),
     pendingStateWrites: () => store.pendingMutationCount,
     streamBacklog,
-    features: () => ({ health: 1 }),
+    features: () => ({ health: 1, opsIdle: 1 }),
     limits: () => ({ turnKeyMax: 128 })
+  });
+
+  // Deploy idle check (plan H2): counts only, no names or identifiers. The ops
+  // CLI decides what blocks a deploy; the daemon only reports.
+  app.get("/ops/idle", async () => {
+    const jobs = advanced.store.countJobsByState();
+    const runnerCounts = runners.counts();
+    return {
+      ok: true,
+      ...identityEnvelope(identity),
+      counts: {
+        activeTurns: manager.activeTurnCount(),
+        turnProcesses: manager.activeTurnProcessCount(),
+        runnerProcesses: runnerCounts.total,
+        runningTurnKeys: store.listRunningTurnRequests().length,
+        recoveryFencedSessions: store.listSessions().filter((session) => session.recoveryFence != null)
+          .length,
+        brokerJobsActive: jobs.queued + jobs.running,
+        brokerJobsPaused: jobs.paused,
+        computeJobsActive: computeRuntime.listActiveJobs().length,
+        streams: openStreams.size,
+        leftoverRunnerGroups: bootReap.survivors + bootReap.unverified
+      }
+    };
   });
 
   app.get("/compute/capacity", async () => computeRuntime.capacity());

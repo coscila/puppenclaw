@@ -109,6 +109,14 @@ export class AdvancedStore {
     return row ? this.job(row.id) : null;
   }
   jobs(parent?: string): WorkerJob[] { return this.jobHeaders(parent).map((job) => this.hydrate(job)); }
+  /** Job counts by state from one scan of the jobs table (ops idle checks). */
+  countJobsByState(): Record<JobState, number> {
+    const counts = Object.fromEntries(states.map((state) => [state, 0])) as Record<JobState, number>;
+    for (const row of this.db.prepare("SELECT json_extract(payload,'$.state') AS state, count(*) AS count FROM jobs GROUP BY 1").all() as { state: string; count: number }[]) {
+      if ((states as string[]).includes(row.state)) counts[row.state as JobState] = row.count;
+    }
+    return counts;
+  }
   progress(id: string): JobProgress {
     const progress = { total: 0, ...Object.fromEntries(states.map((state) => [state, 0])) } as JobProgress;
     for (const row of this.db.prepare("SELECT state,count(*) AS count FROM job_items WHERE job_id=? GROUP BY state").all(id) as { state: JobState; count: number }[]) { progress[row.state] = row.count; progress.total += row.count; }
