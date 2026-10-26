@@ -711,6 +711,13 @@ erasure; the report counts each kind.
 `node --experimental-strip-types scripts/measure-p1.mts` measures bulk
 completions per second and event-loop lag against a mock upstream, with the
 daemon's statistics and usage-ledger hooks.
+`node --experimental-strip-types scripts/measure-verbatim.mts` does the same for
+census-shaped verbatim instrument calls through a run principal socket (40
+entries of about 3 KB per call by default) and checks that every call's bytes, as
+the mock upstream hashed them, equal its receipt's `requestSha256`. A submission
+is parsed, digested and stored on the event loop, so its size bounds the lag it
+causes: keep verbatim jobs to about 1-2 MB of items (10-20 such calls) per
+submission.
 
 ### pcp/2 run principals (`principals:1`)
 
