@@ -592,6 +592,27 @@ describe("principal revocation", () => {
     await registry.revokeOwner(OWNER);
     expect(["run:a", "run:b", "run:c"].map((id) => registry.detail(id)!.state)).toEqual(["revoked", "revoked", "active"]);
   });
+
+  it("erases an owner's revoked principals to tombstones: the ids stay unusable, the owner key, grants, usage and audit go", async () => {
+    const service = await upstream();
+    const { registry, runtime, dataDir } = await harness({ providers: [provider("judge", service.url)] });
+    const socket = (await registry.put("run:a", runBody({}, { maxItems: 5 }))).socketPath!;
+    await registry.put("run:c", runBody({ runId: "c", ownerKey: "another-owner-key-0123456789" }));
+    const job = (await unix(socket, "/bulk/submit?view=summary", { body: { configId: "judge", idempotencyKey: "e", items: items("e", 2) } })).body;
+    await settledJob(runtime, job.jobId);
+    expect(registry.eraseOwner(OWNER)).toBe(0);
+    await registry.revokeOwner(OWNER);
+    expect(registry.eraseOwner(OWNER)).toBe(1);
+    expect(registry.detail("run:a")).toMatchObject({ state: "revoked", kind: "run", runId: null, socketPath: null, grants: { providers: [], instruments: [] }, usage: { items: 0, inputTokens: 0, outputTokens: 0 }, audit: [] });
+    expect(registry.detail("run:c")).toMatchObject({ state: "active", runId: "c" });
+    await expect(registry.put("run:a", runBody())).rejects.toMatchObject({ code: "PRINCIPAL_REVOKED" });
+    const { DatabaseSync } = await import(`node${":sqlite"}`);
+    const db = new DatabaseSync(join(dataDir, "principals", "principals.sqlite"), { readOnly: true });
+    try {
+      const rows = db.prepare("SELECT 'principals' AS t, count(*) AS n FROM principals WHERE owner_key=? UNION ALL SELECT 'usage', count(*) FROM principal_usage WHERE principal_id='run:a' UNION ALL SELECT 'charges', count(*) FROM principal_item_charges WHERE principal_id='run:a' UNION ALL SELECT 'audit', count(*) FROM principal_audit WHERE principal_id='run:a'").all(OWNER) as { t: string; n: number }[];
+      expect(Object.fromEntries(rows.map((row) => [row.t, Number(row.n)]))).toEqual({ principals: 0, usage: 0, charges: 0, audit: 0 });
+    } finally { db.close(); }
+  });
 });
 
 describe("daemon shutdown", () => {

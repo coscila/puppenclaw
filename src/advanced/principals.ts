@@ -314,6 +314,22 @@ export class PrincipalRegistry implements PrincipalHooks {
     await Promise.allSettled(ids.map((id) => this.finishing.get(id)));
   }
 
+  /**
+   * Account erasure, after revokeOwner and the purge of the owner's jobs: each revoked principal of the owner keeps
+   * only a tombstone (its id stays unusable); its owner key, run binding, grants, usage, counted items and audit go.
+   * Returns how many records were erased.
+   */
+  eraseOwner(ownerKey: string): number {
+    let erased = 0;
+    for (const id of this.store.idsByOwner(ownerKey)) {
+      if (!this.store.erase(id)) continue;
+      erased += 1;
+      const entry = this.entries.get(id);
+      if (entry) { entry.waiters.clear(); this.entries.delete(id); }
+    }
+    return erased;
+  }
+
   /** The socket a compute launcher may bind for this principal, while it is live. */
   socketBinding(id: string): PrincipalSocketBinding | null {
     const entry = this.entries.get(id);

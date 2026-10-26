@@ -232,7 +232,9 @@ describe("pcp/2 principals routes", () => {
       expect(unbound.statusCode).toBe(400);
       const purged = await app.inject({ method: "POST", url: "/sessions/owner/purge", headers: auth, payload: { ownerKey: OWNER, operationKey: "delete.account.p3.0001" } });
       expect(purged.statusCode).toBe(200);
-      expect(JSON.parse((await app.inject({ method: "GET", url: "/v2/principals/run:study-1", headers: auth })).body).state).toBe("revoked");
+      // Revoked, then erased to a tombstone: no run binding, grants, usage or audit survive the account.
+      expect(JSON.parse((await app.inject({ method: "GET", url: "/v2/principals/run:study-1", headers: auth })).body))
+        .toMatchObject({ state: "revoked", runId: null, grants: { providers: [] }, usage: { items: 0 }, audit: [] });
     } finally {
       await app.close();
     }

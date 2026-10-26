@@ -715,9 +715,11 @@ export async function createDaemonServer(params: {
       } catch (error) {
         throw ownerCleanupIncomplete("purge", sessions.length, error);
       }
-      // The owner's run principals stop first, so none admits work into a purged account.
+      // The owner's run principals stop first, so none admits work into a purged account; once the owner's jobs are
+      // purged, their records keep only a revocation tombstone.
       await principals.revokeOwner(parsed.ownerKey);
       await advanced.purgeOwner(parsed.ownerKey);
+      principals.eraseOwner(parsed.ownerKey);
       const remaining = store.listSessionsByOwner(parsed.ownerKey);
       if (remaining.length > 0) {
         throw ownerCleanupIncomplete("purge", sessions.length, undefined, remaining.length);

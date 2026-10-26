@@ -16,6 +16,8 @@ type Row = {
 };
 export type PrincipalAuditEntry = { seq: number; at: string; action: "created" | "updated" | "revoked"; before: unknown; after: unknown };
 const SCHEMA_VERSION = "1";
+/** The grants an erased principal record keeps: none. */
+const ERASED_GRANTS: PrincipalGrants = { providers: [], instruments: [], maxConcurrency: 1, maxItems: 0, tokenBudget: null, expiresAt: null };
 
 function record(row: Row): PrincipalRecord {
   return {
@@ -88,6 +90,22 @@ export class PrincipalStore {
     this.transaction(() => {
       this.db.prepare("UPDATE principals SET revoked_at=?, updated_at=? WHERE id=? AND revoked_at IS NULL").run(revokedAt, revokedAt, id);
       this.appendAudit(id, revokedAt, "revoked", before, { revokedAt });
+    });
+  }
+
+  /**
+   * Account erasure of a revoked principal: only a tombstone stays (id, kind, timestamps, revocation), so the id
+   * remains unusable; the owner key, run binding, grants, usage, counted items and audit go.
+   */
+  erase(id: string): boolean {
+    return this.transaction(() => {
+      const erased = Number(this.db.prepare("UPDATE principals SET owner_key='', run_id=NULL, grants=?, socket=0, socket_dir=NULL WHERE id=? AND revoked_at IS NOT NULL")
+        .run(JSON.stringify(ERASED_GRANTS), id).changes) === 1;
+      if (!erased) return false;
+      this.db.prepare("DELETE FROM principal_usage WHERE principal_id=?").run(id);
+      this.db.prepare("DELETE FROM principal_item_charges WHERE principal_id=?").run(id);
+      this.db.prepare("DELETE FROM principal_audit WHERE principal_id=?").run(id);
+      return true;
     });
   }
 

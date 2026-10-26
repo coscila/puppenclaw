@@ -772,7 +772,9 @@ Principal jobs live in `advanced.sqlite` like turn jobs, with
 `principalId` and `runId` fields. Their usage reaches the caller through the
 broker receipts, not the turn usage ledger. An account purge
 (`/sessions/owner/purge`) revokes the owner's principals with `cancel` before
-it erases their jobs. Daemons from before principals never open
+it erases their jobs, and then erases their records to tombstones: the id,
+kind, timestamps and revocation stay (the id remains unusable), the owner key,
+run binding, grants, usage, counted items and audit go. Daemons from before principals never open
 `principals.sqlite` and read the added job fields unchanged.
 
 `PUPPENCLAW_LEGACY_ATTEMPT_AUTHORITY` keeps today's turn authority:
