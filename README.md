@@ -525,7 +525,10 @@ renames them.
   `INVALID_EVENT_CURSOR`.
 - `broker.job` payload: `{jobId, ownerKey, principalId, runId, state, counts:
   {total, queued, running, succeeded, failed, cancelled, truncated},
-  instrumentDigest, createdAt, updatedAt}` (absent values are null). Counts
+  instrumentDigest, createdAt, updatedAt}` (absent values are null), plus two
+  link hints beyond these pcp/2 fields: `parentSessionName` (the chat's daemon
+  session, or `principal:<id>`) and `attemptId`. coscila ties a job to its chat
+  by them and erases a purged chat's jobs by the session. Counts
   fold item states into these categories: paused and interrupted items count as
   failed (a resume runs them in a new job), a truncated item counts once, as
   truncated. Items in flight when a job pauses or is cancelled settle after

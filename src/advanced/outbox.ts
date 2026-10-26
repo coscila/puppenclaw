@@ -38,6 +38,12 @@ export type BrokerJobPayload = {
   instrumentDigest: string | null;
   createdAt: string;
   updatedAt: string;
+  /**
+   * Link hints beyond the pcp/2 fields: the job's parent session (a chat's daemon session, or `principal:<id>`)
+   * and its attempt. coscila ties a job to its chat by them, and erases a purged chat's jobs by its session.
+   */
+  parentSessionName: string;
+  attemptId: string;
 };
 
 export type BrokerReceiptStatus = "succeeded" | "failed" | "truncated" | "cancelled";
@@ -129,7 +135,9 @@ export function brokerJobPayload(job: WorkerJobHeader, counts: BrokerJobCounts):
     counts,
     instrumentDigest: instrumentDigestOf(job),
     createdAt: job.createdAt,
-    updatedAt: job.updatedAt
+    updatedAt: job.updatedAt,
+    parentSessionName: job.parentSessionName,
+    attemptId: job.attemptId
   };
 }
 

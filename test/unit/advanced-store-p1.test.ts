@@ -160,8 +160,9 @@ describe("P1 broker outbox and feed", () => {
       [1, BROKER_JOB_EVENT, null], [2, BROKER_JOB_EVENT, null], [3, BROKER_RECEIPT_EVENT, "one"], [4, BROKER_RECEIPT_EVENT, "two"], [5, BROKER_JOB_EVENT, null]
     ]);
     const last = page.events[4]!.payload as BrokerJobPayload;
-    expect(Object.keys(last).sort()).toEqual(["counts", "createdAt", "instrumentDigest", "jobId", "ownerKey", "principalId", "runId", "state", "updatedAt"]);
-    expect(last).toMatchObject({ jobId: "j", ownerKey: "owner-key-0123456789", principalId: null, runId: null, state: "failed", instrumentDigest: null,
+    // The pcp/2 fields plus two link hints (parentSessionName, attemptId).
+    expect(Object.keys(last).sort()).toEqual(["attemptId", "counts", "createdAt", "instrumentDigest", "jobId", "ownerKey", "parentSessionName", "principalId", "runId", "state", "updatedAt"]);
+    expect(last).toMatchObject({ jobId: "j", ownerKey: "owner-key-0123456789", principalId: null, runId: null, state: "failed", instrumentDigest: null, parentSessionName: "parent", attemptId: "attempt",
       counts: { total: 3, queued: 1, running: 0, succeeded: 0, failed: 1, cancelled: 0, truncated: 1 } });
     const truncated = page.events[2]!.payload as BrokerReceiptPayload;
     expect(Object.keys(truncated).sort()).toEqual(["attempt", "endedAt", "error", "finishReason", "instrumentDigest", "itemId", "jobId", "model", "output", "outputBytes", "outputDigest", "serverFingerprint", "settingsSha256", "startedAt", "status", "usage"]);
