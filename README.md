@@ -824,8 +824,9 @@ How a sandbox gets its principal socket (the lab launcher does this; plan R5/E4)
 
 - Bind the principal's directory read-only, for example
   `--ro-bind <dir> /run/ocsl/principal`, and point the client at
-  `/run/ocsl/principal/broker.sock` (coscila-review reads
-  `PUPPENCLAW_ORCHESTRATION_SOCKET`). Bind the directory, not the socket file, so
+  `/run/ocsl/principal/broker.sock` (coscila-review's census commands read it
+  from `OCSL_BROKER_SOCKET` or `--broker-socket`; `PUPPENCLAW_ORCHESTRATION_SOCKET`
+  stays the chat turn's socket). Bind the directory, not the socket file, so
   the socket a restart re-creates stays reachable. Validate the directory first:
   inside the state root, owned by the daemon user, mode 0700, not a symlink, a
   0600 socket inside.
