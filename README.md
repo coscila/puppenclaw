@@ -648,8 +648,13 @@ daemon rewrote counts as written before this version from then on.
 a day, terminal jobs last updated earlier than that into
 `<data-dir>/advanced/archive/advanced-archive-<time>.sqlite` with inputs
 materialized and a manifest of counts and sha256 per job; the live rows go only
-after both copies agree. Jobs with a study reference (`study_ref`),
-unacknowledged events or a pending erasure stay.
+after both copies agree. Only jobs whose records provably reached Postgres
+qualify: written by this version, with every event acknowledged. Jobs written
+before this version stay (their records reach Postgres only through coscila's
+one-time backfill, and historical rows go only with the author's per-item
+approval), and so do jobs of a run principal (a run is what a study
+references), jobs with a study reference (`study_ref`) and jobs with a pending
+erasure; the report counts each kind.
 
 `node --experimental-strip-types scripts/measure-p1.mts` measures bulk
 completions per second and event-loop lag against a mock upstream, with the

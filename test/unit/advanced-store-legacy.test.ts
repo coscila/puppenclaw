@@ -33,6 +33,42 @@ function receipt(jobId: string, itemId: string): UsageReceipt {
 }
 
 describe("rollback safety of the P1 AdvancedStore", () => {
+  it("keeps a job the older daemon wrote out of the archive, however old: its records reach Postgres only through the backfill", async () => {
+    const dir = await createTempDir("advanced-legacy-archive-");
+    const legacy = await LegacyStore.open(dir);
+    legacy.putJob(job("historical", { state: "completed", updatedAt: "2026-08-25T00:00:00.000Z", results: ["one", "two"].map((item) => ({ id: item, state: "completed" as const, output: `answer ${item}`, providerId: "local", model: "served", promptSha256: item, usage: null })) }));
+    legacy.putReceipt(receipt("historical", "one"));
+    legacy.close();
+    const p1 = await AdvancedStore.open(dir, { now: () => new Date("2026-10-25T00:00:00.000Z") });
+    cleanups.push(() => p1.close());
+    p1.ack(p1.feedId, p1.head());
+    const report = await p1.archive({ before: new Date("2026-09-25T00:00:00.000Z") });
+    expect(report).toMatchObject({ jobs: 0, file: null, skipped: { historical: 1 } });
+    expect(p1.jobHeader("historical")).toMatchObject({ state: "completed" });
+    expect(p1.jobReceipts("historical")).toHaveLength(1);
+  });
+
+  it("lets the cea4c29 store code open a store with a pending erasure, and P1 completes it afterwards", async () => {
+    const dir = await createTempDir("advanced-legacy-erasure-");
+    const p1 = await AdvancedStore.open(dir);
+    p1.createJob(job("purged"));
+    await p1.settleItem("purged", { id: "one", state: "completed", output: "answer", providerId: "local", model: "served", promptSha256: "a".repeat(64), usage: receipt("purged", "one").usage, attempts: 1 },
+      { receipt: receipt("purged", "one"), event: true, persist: true, fallbackFingerprint: "x", fallbackSettingsSha256: "y", instrumentDigest: null });
+    p1.purgeSession("parent");
+    p1.close();
+    const legacy = await LegacyStore.open(dir);
+    expect(legacy.jobHeader("purged")).toBeNull();
+    expect(legacy.receipts("parent").map((row) => row.requestId)).toEqual(["purged-one"]);
+    legacy.close();
+    const again = await AdvancedStore.open(dir);
+    cleanups.push(() => again.close());
+    expect(again.pendingErasures()).toEqual(["purged"]);
+    again.ack(again.feedId, again.head());
+    expect(again.pendingErasures()).toEqual([]);
+    expect(again.receipts("parent")).toEqual([]);
+  });
+
+
   it("lets the cea4c29 store code open, read and write a P1 store, and P1 reads what it wrote", async () => {
     const dir = await createTempDir("advanced-legacy-");
     // P1 writes: blob inputs, a settled item with receipt and outbox rows, an instrument, a deferred erasure.

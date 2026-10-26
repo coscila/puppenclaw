@@ -4,8 +4,10 @@ import type { AdvancedStore, ArchiveReport } from "./store.js";
  * Opt-in maintenance of advanced.sqlite; both tasks are off unless configured.
  * - PUPPENCLAW_ADVANCED_ARCHIVE_DAYS (an integer of at least 30): once a day,
  *   terminal jobs last updated more than that many days ago move to a verified
- *   archive file (counts and sha256 checked before the live rows go). Jobs with
- *   a study reference, unacknowledged outbox rows or a pending erasure stay.
+ *   archive file (counts and sha256 checked before the live rows go). Only jobs
+ *   written by P1 with every event acknowledged qualify; jobs from before P1,
+ *   jobs of a run principal, jobs with a study reference and jobs with a pending
+ *   erasure stay.
  * - PUPPENCLAW_EVENT_RETENTION_DAYS (an integer of at least 7): once an hour,
  *   acknowledged outbox rows older than that are deleted. Rows after the
  *   acknowledged cursor are never deleted.
@@ -55,7 +57,7 @@ export class AdvancedMaintenance {
   async archive(): Promise<ArchiveReport | null> {
     if (this.options.archiveAfterDays === null) return null;
     const report = await this.store.archive({ before: new Date(this.now() - this.options.archiveAfterDays * DAY_MS), maxJobs: 50 });
-    if (report.jobs > 0) this.log(`ADVANCED_ARCHIVED jobs=${report.jobs} items=${report.items} receipts=${report.receipts} file=${report.file}`);
+    if (report.jobs > 0) this.log(`ADVANCED_ARCHIVED jobs=${report.jobs} items=${report.items} receipts=${report.receipts} file=${report.file} kept: historical=${report.skipped.historical} run=${report.skipped.run} study=${report.skipped.studyRef} unacknowledged=${report.skipped.unacknowledged}`);
     return report;
   }
 

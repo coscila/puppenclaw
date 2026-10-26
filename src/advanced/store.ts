@@ -71,7 +71,12 @@ export type AdvancedStoreOptions = {
 export type FeedPage = { feedId: string; events: BrokerEvent[]; next: number; hasMore: boolean; head: number; acked: number };
 export type StoreStats = { batches: number; mutations: number; fallbacks: number; failedMutations: number; duplicateSettlements: number };
 export type InstrumentRecord = { digest: string; bundle: Record<string, unknown>; settingsSha256: string; installedAt: string };
-export type ArchiveReport = { file: string | null; jobs: number; items: number; receipts: number; skipped: { studyRef: number; unacknowledged: number }; manifest: string | null };
+/**
+ * skipped.historical: written before P1 (their records reach Postgres only through the one-time backfill, which the
+ * daemon cannot see; historical rows go only with the author's per-item approval); skipped.run: jobs of a run
+ * principal (a run is what a study references).
+ */
+export type ArchiveReport = { file: string | null; jobs: number; items: number; receipts: number; skipped: { studyRef: number; run: number; historical: number; unacknowledged: number }; manifest: string | null };
 
 type BatchContext = { touched: Set<string>; events: number };
 type Mutation = { apply: (batch: BatchContext) => void; after?: () => void; resolve: () => void; reject: (error: unknown) => void };
@@ -901,17 +906,22 @@ export class AdvancedStore {
    * Opt-in verified archive: terminal jobs last updated before the cutoff move into a
    * new SQLite file under <root>/archive with their items (inputs materialized) and
    * receipts. Each job is copied, then counted and digested (sha256 over its canonical
-   * rows) in both files, and deleted from the live store only when both agree. Jobs
-   * with a study reference, unacknowledged outbox rows or a pending erasure stay.
+   * rows) in both files, and deleted from the live store only when both agree. Only jobs
+   * whose records provably reached Postgres qualify: written by P1 (every change and
+   * receipt went to the outbox) with every event acknowledged. Jobs written before P1,
+   * jobs of a run principal (runs are what studies reference), jobs with a study
+   * reference and jobs with a pending erasure stay.
    */
   async archive(options: { before: Date; maxJobs?: number }): Promise<ArchiveReport> {
     this.flushPending();
-    const report: ArchiveReport = { file: null, jobs: 0, items: 0, receipts: 0, skipped: { studyRef: 0, unacknowledged: 0 }, manifest: null };
+    const report: ArchiveReport = { file: null, jobs: 0, items: 0, receipts: 0, skipped: { studyRef: 0, run: 0, historical: 0, unacknowledged: 0 }, manifest: null };
     const cutoff = options.before.toISOString();
-    const candidates = (this.stmt(`SELECT id, study_ref AS study FROM jobs WHERE json_extract(payload,'$.state') IN (${TERMINAL_JOB_STATES.map((state) => `'${state}'`).join(",")}) AND json_extract(payload,'$.updatedAt')<? AND id NOT IN (SELECT job_id FROM erasure_pending) ORDER BY rowid`).all(cutoff) as { id: string; study: string | null }[]);
+    const candidates = (this.stmt(`SELECT id, study_ref AS study, storage_version AS version, json_extract(payload,'$.runId') AS run FROM jobs WHERE json_extract(payload,'$.state') IN (${TERMINAL_JOB_STATES.map((state) => `'${state}'`).join(",")}) AND json_extract(payload,'$.updatedAt')<? AND id NOT IN (SELECT job_id FROM erasure_pending) ORDER BY rowid`).all(cutoff) as { id: string; study: string | null; version: number; run: unknown }[]);
     const eligible: string[] = [];
     for (const row of candidates) {
+      if (Number(row.version) < P1_STORAGE_VERSION) { report.skipped.historical += 1; continue; }
       if (row.study != null) { report.skipped.studyRef += 1; continue; }
+      if (row.run != null) { report.skipped.run += 1; continue; }
       if (this.hasUnacknowledgedEvents(row.id)) { report.skipped.unacknowledged += 1; continue; }
       eligible.push(row.id);
       if (options.maxJobs !== undefined && eligible.length >= options.maxJobs) break;

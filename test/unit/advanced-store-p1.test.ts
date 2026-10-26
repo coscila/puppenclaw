@@ -327,20 +327,23 @@ describe("P1 broker outbox and feed", () => {
     expect(states).toContainEqual(["kept", "interrupted"]);
   });
 
-  it("archives verified terminal jobs on request and keeps study, unacknowledged and recent ones", async () => {
+  it("archives verified terminal P1 jobs on request and keeps run, study, historical, unacknowledged and recent ones", async () => {
     let now = new Date("2026-08-01T00:00:00.000Z");
     const { store, dir, db } = await open(undefined, { now: () => now });
-    for (const id of ["old", "study", "unacked", "recent"]) store.createJob(job(id, ["one", "two"], { idempotencyKey: id, state: "completed", updatedAt: id === "recent" ? "2026-10-20T00:00:00.000Z" : "2026-08-01T00:00:00.000Z" }));
-    for (const id of ["old", "study", "unacked", "recent"]) await store.settleItem(id, settled("one"), settlement(id, "one"));
+    const ids = ["old", "study", "unacked", "recent", "run", "historical"];
+    for (const id of ids) store.createJob(job(id, ["one", "two"], { idempotencyKey: id, state: "completed", updatedAt: id === "recent" ? "2026-10-20T00:00:00.000Z" : "2026-08-01T00:00:00.000Z", ...(id === "run" ? { parentSessionName: "principal:run:census", principalId: "run:census", runId: "census" } : {}) }));
+    for (const id of ids) await store.settleItem(id, settled("one"), settlement(id, "one"));
     store.ack(store.feedId, store.head());
     store.updateHeader("unacked", { state: "completed", updatedAt: "2026-08-01T00:00:00.000Z" });
     store.updateHeader("unacked", { state: "failed", updatedAt: "2026-08-01T00:00:00.000Z" });
     store.setStudyRef("study", "study:census-reproduction");
+    // A job written before P1: its records reach Postgres only through the backfill, which the daemon cannot see.
+    db().exec("UPDATE jobs SET storage_version=1 WHERE id='historical'");
     now = new Date("2026-10-25T00:00:00.000Z");
     const report = await store.archive({ before: new Date("2026-09-25T00:00:00.000Z") });
-    expect(report).toMatchObject({ jobs: 1, items: 2, receipts: 1, skipped: { studyRef: 1, unacknowledged: 1 } });
+    expect(report).toMatchObject({ jobs: 1, items: 2, receipts: 1, skipped: { studyRef: 1, run: 1, historical: 1, unacknowledged: 1 } });
     expect(store.jobHeader("old")).toBeNull();
-    expect(store.jobHeaders().map((header) => header.jobId).sort()).toEqual(["recent", "study", "unacked"]);
+    expect(store.jobHeaders().map((header) => header.jobId).sort()).toEqual(["historical", "recent", "run", "study", "unacked"]);
     const manifest = JSON.parse(await readFile(report.manifest!, "utf8")) as { jobs: { jobId: string; counts: Record<string, number>; sha256: string }[]; totals: Record<string, number> };
     expect(manifest.totals).toEqual({ jobs: 1, items: 2, receipts: 1 });
     expect(manifest.jobs[0]).toMatchObject({ jobId: "old", counts: { jobs: 1, items: 2, receipts: 1 } });
