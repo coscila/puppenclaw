@@ -421,11 +421,13 @@ set; none of them is added to the open `/health` and `/capabilities`.
 - `GET /v2/health`: constant-cost and under 1 KB: `ok`, `protocol`, `bootId`,
   `spoolId`, `build` (`PUPPENCLAW_BUILD_ID` or version plus bundle digest),
   `activeTurns`, `backlog` (open streams, queued stream events and bytes,
-  pending state writes), `eventLoop` (`monitorEventLoopDelay` p99 and max lag in
+  pending state writes, `brokerErasures`: broker jobs whose erasure waits for
+  the feed acknowledgement), `eventLoop` (`monitorEventLoopDelay` p99 and max lag in
   ms over a 30 s window) and `memory`.
 - `GET /v2/capabilities`: `features` (`health`, `opsIdle`, `usageLedger`,
-  `compactStatus`, `keyedStreaming`, `sseGap`), `limits`, and provider dialect
-  limits, e.g. the structured-output keywords removed for `qwen-3.8`.
+  `compactStatus`, `keyedStreaming`, `sseGap`, and the broker's `eventFeed`,
+  `brokerOutbox` and `instrumentMode` described below), `limits`, and provider
+  dialect limits, e.g. the structured-output keywords removed for `qwen-3.8`.
 - `GET /ops/idle`: counts only, each measured at request time (active turns,
   turn and runner processes, running turn keys, active and paused broker jobs,
   active compute jobs, open streams). Restart survivors count only while their
@@ -485,9 +487,325 @@ kernel boot id; pids and start ticks restart at boot): its record is removed.
 `node --experimental-strip-types scripts/measure-h4.mts` measures health cost,
 state writes, event-loop lag and stalled-stream memory against a built daemon.
 
-Advanced worker jobs store each input and result in its own SQLite row. Existing
-job records migrate transactionally at startup; completed items and idempotency
-keys survive the migration. Back up the daemon state before updating it.
+### pcp/2 broker feed and instrument mode
+
+The advanced broker reports to coscila through an acknowledged event feed and
+runs measurement instruments that coscila installs. `GET /v2/capabilities`
+advertises each part under `features`: `eventFeed: 1`, `brokerOutbox: 1` and
+`instrumentMode: 1` (limits `eventPageMax`, `eventWaitMsMax`,
+`eventInlineOutputMax`). The routes need the bearer token like every v2 route,
+and every body carries `protocol`, `bootId` and `spoolId`; errors add `code`,
+`retryable` and `error`.
+
+**Outbox.** `advanced.sqlite` holds an outbox table (`seq INTEGER PRIMARY KEY
+AUTOINCREMENT, type, jobId, itemId, payload, createdAt`, plus `receiptId`).
+Every job creation and job state change writes a `broker.job` row, and every
+item that settles after a provider call writes one `broker.receipt` row (an item
+whose retry is refused before dispatch settles with the receipt of its last
+call), in the same transaction as the change itself: a crash keeps the change and its row
+together or loses both. An item gets at most one receipt row per job; a
+duplicate completion is refused. Seqs only grow and are never reused, also
+after pruning; gaps can only appear at or below the acknowledged cursor
+(retention, erasure). A store written by a pre-release build of this version
+named the columns `job_id`, `item_id`, `created_at` and `receipt_id`; opening it
+renames them.
+
+- `GET /v2/events?after=SEQ&limit=N&waitMs=MS` (`after` default 0, `limit`
+  1-1000, default 500, `waitMs` 0-25000): `{ok, feedId, events: [{seq, type,
+  at, jobId, itemId?, payload}], next, hasMore, head, acked}` in seq order. With
+  `waitMs` the request returns as soon as an event after `after` commits, or
+  empty when the wait ends. `after` beyond `head` is refused with 400
+  `INVALID_EVENT_CURSOR`: the cursor belongs to another outbox, read from 0.
+  Events are fsynced before they are served, so a served seq survives power
+  loss. `feedId` is stored with the outbox and changes only when
+  `advanced.sqlite` is replaced; then restart from 0 (ids make that idempotent).
+- `POST /v2/events/ack {feedId, through}`: `{ok, acked}`, durable, never moves
+  backwards (an older `through` returns the current value). Another `feedId` is
+  refused with 409 `FEED_REPLACED`; a `through` beyond `head` with 400
+  `INVALID_EVENT_CURSOR`.
+- `broker.job` payload: `{jobId, ownerKey, principalId, runId, state, counts:
+  {total, queued, running, succeeded, failed, cancelled, truncated},
+  instrumentDigest, createdAt, updatedAt}` (absent values are null), plus two
+  link hints beyond these pcp/2 fields: `parentSessionName` (the chat's daemon
+  session, or `principal:<id>`) and `attemptId`. coscila ties a job to its chat
+  by them and erases a purged chat's jobs by the session. Counts
+  fold item states into these categories: paused and interrupted items count as
+  failed (a resume runs them in a new job), a truncated item counts once, as
+  truncated. Items in flight when a job pauses or is cancelled settle after
+  that state change; once the job's execution has drained, one more
+  `broker.job` row with the same state carries the final counts (none when they
+  did not change).
+- `broker.receipt` payload: `{jobId, itemId, attempt, status
+  (succeeded|failed|truncated|cancelled), finishReason, usage: {input, output,
+  cacheRead, cacheWrite}, model, serverFingerprint, settingsSha256,
+  instrumentDigest, outputDigest, outputBytes, output, startedAt, endedAt,
+  error: {code, retryable} | null}`. `output` is inline only up to 16384 UTF-8
+  bytes; larger outputs stay in the job's result pages. `outputDigest` is the
+  sha256 of the output as a string, or of its compact JSON when it is
+  structured. Agent jobs report their single item over all its native calls.
+- Erasure never runs ahead of the feed, and contents never wait for it: purging
+  a session (or an owner) erases a job whose events are all acknowledged at
+  once. A job with unacknowledged events loses its header, items, inputs and
+  acknowledged events at once, and its unacknowledged receipt events lose their
+  inline `output` (`outputDigest` and `outputBytes` stay); only its receipt rows
+  and those events wait, and go when the acknowledgement covers them. A store
+  of a pre-release build that kept such jobs whole is converted when it opens.
+  `GET /v2/health` reports how many jobs wait (`backlog.brokerErasures`), and
+  `POST /sessions/owner/purge` answers `brokerErasuresPending` for its owner:
+  the owner's data is erased only once that is 0, so a caller proving an
+  account erasure retries the purge until then (it reaches 0 once the feed has
+  acknowledged the owner's events).
+- Retention is opt-in: `PUPPENCLAW_EVENT_RETENTION_DAYS` (at least 7) prunes
+  acknowledged rows older than that, hourly. Unacknowledged rows are never
+  pruned.
+
+**Receipt provenance.** Every broker receipt (bulk, retried attempt, native
+controller or agent call) carries `serverFingerprint`: the upstream's
+`system_fingerprint` when it sends one, otherwise `<served model>@<16 hex>`
+where the hex starts the sha256 of the canonical JSON of the server identity
+headers present (`server`, `via`, `x-powered-by`, `openai-version`); it is never
+empty. `settingsSha256` is the sha256 of the canonical JSON (keys sorted by code
+point, no whitespace, numbers as JSON.stringify writes them) of exactly
+`{model, temperature, seed, reasoning, max_tokens, response_format_sha256,
+system_prompt_sha256}` as sent, missing values null.
+
+**Instruments.** `PUT /v2/instruments/{digest}` with `{instrumentId, version,
+systemPrompt, responseSchema|null, maxOutputTokens: {perItem, minimum},
+temperature, seed|null, reasoning, itemsPerCall, requiredModelFingerprint|null}`
+installs a bundle and answers `{ok, digest, settingsSha256}`; the same body again
+returns the same answer, a different body under an installed digest is refused
+with 409 `INSTRUMENT_DIGEST_CONFLICT`, an invalid one with 400
+`INVALID_INSTRUMENT`. A response schema may carry `$id` and `$schema` (draft-07
+or 2020-12); each distinct schema is compiled once, on its own validator, and
+reused by every job that names it. The digest is opaque (1-128 characters of
+`[A-Za-z0-9._:-]`): coscila's instrument registry computes it
+(ocsl-instrument-digest-v1) and the daemon only allow-lists what was
+installed. `GET /v2/instruments` lists `digests` and `instruments`. The
+allow-list lives in `advanced.sqlite` and survives restarts. The PUT's
+`settingsSha256` digests the installed settings (system prompt as sent,
+response schema, sampling, the output-token rule, items per call, required
+fingerprint); each receipt's `settingsSha256` digests one call.
+
+A bulk job naming `instrumentDigest` (socket `POST /bulk/submit`) runs in
+instrument mode; a digest that is not installed is refused with 400
+`INSTRUMENT_NOT_ALLOWED`, and a job `schema` next to it with 400
+`INSTRUMENT_REQUEST_CONFLICT`. Each item is a string or `{messages, itemCount}`:
+messages (user and assistant roles) are sent verbatim after the system prompt,
+which is the broker's worker policy, a blank line and the instrument's
+`systemPrompt`. Per call, `max_output_tokens = max(minimum, perItem ×
+itemCount)` (`itemCount` defaults to `itemsPerCall`, 1 for a string), and
+temperature, seed, reasoning effort and the response schema come from the
+bundle; an item that tries to set any of them fails with `INVALID_REQUEST`.
+`finish_reason=length` (Responses `status: incomplete` with
+`max_output_tokens`) marks the item `truncated: true`: a text output is kept, a
+cut structured output fails `STRUCTURED_OUTPUT_INVALID`, and the receipt's
+status is `truncated` either way. With `requiredModelFingerprint`, an answer
+whose fingerprint and served model both differ pauses the job (`MODEL_DRIFT`)
+and keeps no output; this check comes before parsing and validation, so it also
+catches a drifted answer that is malformed, fails the schema or was cut. The
+socket's `GET /configs` lists installed instruments.
+
+**Provider pauses and retries.** HTTP 429 and authentication failures (401,
+403) pause the provider for the attempt at once; a 503 does so only after the
+last retry. The paused job carries `resumeAfter` (ISO time) from `Retry-After`
+or, without it, the latest provider reset header (`x-ratelimit-reset-*`,
+`anthropic-ratelimit-*-reset`, `ratelimit-reset`); job listings and summaries
+show it. Retries use exponential backoff from `PUPPENCLAW_BULK_RETRY_BASE_MS`
+(default 1000, ±20 % jitter, at most 30 s).
+
+**Direct upstreams.** Tool-free bulk calls can bypass a local compatibility
+proxy: `PUPPENCLAW_BULK_DIRECT_UPSTREAMS` maps a registered provider base URL to
+the upstream behind it, for example
+`{"http://127.0.0.1:18160/v1":"http://upstream:18000/v1"}`. Those calls share
+one keep-alive connection pool per upstream and capacity group, sized to the
+group's concurrency limit, and are shaped exactly as the namespace proxy
+forwards a tool-free Responses request (its turn-policy markers, agent-message
+conversion, replayed-call repair and four-image limit); the model and all other
+fields pass unchanged. Agents keep using the registered URL. The mapped
+upstreams join the sandbox egress deny list.
+
+**Store.** Writes are group-committed: a batch commits as one transaction
+within `PUPPENCLAW_ADVANCED_COMMIT_WINDOW_MS` (0-50, default 50), and a batch
+that fails is replayed write by write so only the failing write is lost. Every
+read first commits pending writes. A running item lives in memory only; a job
+header changes with the job state, and item progress only moves its revision
+(at most once per batch) and its `updatedAt` (at most once a second). Owner,
+child-session and state lookups use expression indexes instead of full scans.
+Statistics and the usage ledger receive bulk receipt updates in batches (newest
+state per call, at most once a second, always before a parent turn's statistics
+settle). On restart, bulk jobs written by this version are requeued: their
+unsettled items return to `queued` and the job waits for an explicit resume
+(`interrupted`) unless its authority survives the restart, which only a run
+principal's does (see "pcp/2 run principals"): such a job relaunches under its
+own job id. Jobs written before this version and agent jobs are interrupted as
+before.
+
+Rollback: an older daemon (c36cfa2, cea4c29) opens a store written by this
+version and reads and writes it; it ignores the new tables. It cannot resume
+jobs whose inputs live only in blobs, and it writes no outbox rows: when this
+version reopens the store it emits the current state of every job, and the
+receipt of every item, that the older daemon changed. A job header the older
+daemon rewrote counts as written before this version from then on.
+
+`PUPPENCLAW_ADVANCED_ARCHIVE_DAYS` (at least 30; off by default) archives, once
+a day, terminal jobs last updated earlier than that into
+`<data-dir>/advanced/archive/advanced-archive-<time>.sqlite` with inputs
+materialized and a manifest of counts and sha256 per job; the live rows go only
+after both copies agree. Only jobs whose records provably reached Postgres
+qualify: written by this version, with every event acknowledged. Jobs written
+before this version stay (their records reach Postgres only through coscila's
+one-time backfill, and historical rows go only with the author's per-item
+approval), and so do jobs of a run principal (a run is what a study
+references), jobs with a study reference (`study_ref`) and jobs with a pending
+erasure; the report counts each kind.
+
+`node --experimental-strip-types scripts/measure-p1.mts` measures bulk
+completions per second and event-loop lag against a mock upstream, with the
+daemon's statistics and usage-ledger hooks.
+
+### pcp/2 run principals (`principals:1`)
+
+A principal is bulk authority that the caller grants and the daemon enforces:
+a study run (`kind: "run"`, bound to its `runId`) or, later, a person
+(`kind: "human"`, stored now, no credential logic yet). `/v2/capabilities`
+advertises `features.principals: 1` only when `daemonAuthToken` is set; without
+it the routes answer 503 `DAEMON_AUTH_REQUIRED`. Every response, errors included,
+carries `protocol`, `bootId` and `spoolId`. Ids are 1–128 characters of
+`A-Za-z0-9._:-`.
+
+- `PUT /v2/principals/{id}` with `{kind, runId, ownerKey, grants: {providers,
+  instruments, maxConcurrency, maxItems, tokenBudget: {input, output},
+  expiresAt}, socket}` returns `{ok, protocol, bootId, spoolId, principalId,
+  kind, runId, grants, socketPath, createdAt, updatedAt}`. The same body returns
+  the same result. Changed grants or a changed `socket` take effect at once and
+  are audited. `kind`, `runId` and `ownerKey` never change (409
+  `PRINCIPAL_CONFLICT`), and a revoked id stays revoked (409 `PRINCIPAL_REVOKED`).
+  No response ever contains `ownerKey`.
+- `GET /v2/principals/{id}` adds `state` (`active`, `expired`, `revoked`),
+  `revokedAt`, `revision`, `usage` (admitted `items`, settled `inputTokens` and
+  `outputTokens`, `activeItems`, `remaining`), `providersUnavailable` and the last
+  50 audit entries.
+- `DELETE /v2/principals/{id}[?cancel=1]` returns `{ok, principalId, revokedAt}`
+  and is idempotent. Before it returns, the principal's socket is gone and no
+  further item is admitted (the contract allows 5 s; the test measures a few
+  ms). Items already dispatching finish, or abort with `cancel=1`. Every item
+  the principal had not admitted ends `cancelled`. A revocation that a restart
+  interrupted completes at the next start. Revocation stays possible while
+  session state awaits an operator reset; PUT does not.
+
+Grants:
+
+- `providers` name entries of `PUPPENCLAW_MODEL_PROVIDERS`, a JSON array of
+  model provider configurations (the shape of a turn's `modelProvider`). It is
+  the only source of a principal provider's endpoint, model and credential
+  variable; `authTokenEnv` names a variable of the daemon environment, never a
+  secret. A socket client can never choose one. Unset means no provider for
+  principals; an invalid value fails startup.
+- `instruments` are opaque digests. A principal with instrument grants may submit
+  only jobs that name one of them (403 `INSTRUMENT_REQUIRED`, 403
+  `INSTRUMENT_NOT_GRANTED`), and a granted digest must also be installed through
+  `PUT /v2/instruments/{digest}` (400 `INSTRUMENT_NOT_ALLOWED`): grants restrict
+  which installed instruments a principal's jobs may run, never widen the
+  allow-list.
+- `maxConcurrency` bounds the dispatching items of all the principal's jobs
+  together. The principal's slot is taken before provider capacity, so a
+  principal at its limit holds no provider permit.
+- `maxItems` caps the items the principal admits over its lifetime, exactly. An
+  item counts once per job lineage (a job and the jobs resumed from it), at its
+  first admission: a broker retry, a relaunch after a restart and a resume admit
+  it again without counting it again, and an admission that dispatched no call
+  (cancelled, provider paused, missing credential) gives its count back. The
+  counted items persist in `principals.sqlite`. `tokenBudget` caps the settled input tokens (every prompt token the provider
+  reports, cached ones included) and output tokens. Calls already dispatching,
+  at most `maxConcurrency` of them, can overshoot a token budget. Reaching either
+  pauses the job with `error: "budget_exhausted"`. The budget refills only when
+  the caller raises it with a PUT; until then `POST /jobs/{id}/resume` on the
+  socket answers 409 `BUDGET_EXHAUSTED`, afterwards it continues the remaining
+  items as a new job.
+- Expiry pauses jobs with `principal_expired` and a withdrawn provider or
+  instrument grant with `grant_withdrawn`; each resumes explicitly once its cause
+  is gone. An item refused at admission was never dispatched: it settles
+  `paused` with the refusal's code (for example `BUDGET_EXHAUSTED`) and no receipt.
+- A daemon shutdown or crash pauses nothing. Admission stops, calls in flight are
+  aborted and their items return to the queue unsettled (each aborted call keeps
+  its transport receipt, but no `broker.receipt` event), and the job keeps its
+  state. The next start requeues it and relaunches it under the same job id while
+  its principal is live and still admits it (grants, budget, expiry, unchanged
+  worker configuration); otherwise it waits as `interrupted` for an explicit
+  resume. Every item therefore settles, and is reported, exactly once per job.
+
+The socket is the identity:
+
+- `socket: true` opens `<data-dir>/principals/<random>/broker.sock`: the
+  directory is 0700, the socket 0600, and `principals.sqlite` (records, usage,
+  counted items, audit) lies next to them. The data directory is inside the daemon state root
+  (`PUPPENCLAW_STATE_ROOT`), which the lab sandbox policy hides from every
+  sandbox and never binds. All lab and daemon processes share one user, so this
+  separates sandboxes, not unsandboxed processes.
+- The socket serves the turn socket's worker routes for the principal's own jobs
+  only: `GET /configs`, `POST /bulk/submit`, `GET /jobs`, `GET /jobs/{id}`,
+  `GET /jobs/{id}/results` and `POST /jobs/{id}/cancel|resume`, all with
+  `?view=summary` where the turn socket has it. `GET /configs` returns
+  `authorization.principalId` (also as `attemptId`), `runId`, `state`,
+  `instruments` and `publicLiteratureAllowed` (true for an active run principal),
+  the principal's grants and usage, `instrumentMode: 1` with `instruments` (the
+  installed instruments it is granted, in the turn socket's shape), and one bulk
+  worker per granted, configured provider, whose `id` is the provider id. Its
+  `revision` changes only when that worker list changes, never on budget changes.
+  Agent workers, native model routes, proxying and CONNECT are refused. No
+  header, body field or environment variable names a principal.
+- Principals and sockets persist: a restart reopens each socket at the same path
+  in the same directory; only the socket file is replaced.
+
+How a sandbox gets its principal socket (the lab launcher does this; plan R5/E4):
+
+- Bind the principal's directory read-only, for example
+  `--ro-bind <dir> /run/ocsl/principal`, and point the client at
+  `/run/ocsl/principal/broker.sock` (coscila-review reads
+  `PUPPENCLAW_ORCHESTRATION_SOCKET`). Bind the directory, not the socket file, so
+  the socket a restart re-creates stays reachable. Validate the directory first:
+  inside the state root, owned by the daemon user, mode 0700, not a symlink, a
+  0600 socket inside.
+- `POST /compute/jobs` accepts `principalId`. The daemon refuses it unless that
+  principal is live with an open socket, and passes the binding only to the
+  host-side launcher, in its controller environment: `PUPPENCLAW_PRINCIPAL_ID`,
+  `PUPPENCLAW_PRINCIPAL_SOCKET_DIR` and `PUPPENCLAW_PRINCIPAL_SOCKET`. The job's
+  own environment never carries it, and a job without `principalId` never gets
+  one.
+- Revocation, or a PUT with `socket: false`, removes the socket and its
+  directory, so a bound sandbox then reaches nothing.
+
+Principal jobs live in `advanced.sqlite` like turn jobs, with
+`parentSessionName` `principal:<id>`, the principal id as `attemptId`, and
+`principalId` and `runId` fields. Their usage reaches the caller through the
+broker receipts, not the turn usage ledger. An account purge
+(`/sessions/owner/purge`) revokes the owner's principals with `cancel` before
+it erases their jobs, and then erases their records to tombstones: the id,
+kind, timestamps and revocation stay (the id remains unusable), the owner key,
+run binding, grants, usage, counted items and audit go. Daemons from before principals never open
+`principals.sqlite` and read the added job fields unchanged.
+
+`PUPPENCLAW_LEGACY_ATTEMPT_AUTHORITY` keeps today's turn authority:
+
+- `on` (the default, `features.legacyAttemptAuthority: 1`): a turn in execute and
+  approve-all mode may submit bulk work over its turn socket and reports
+  `publicLiteratureAllowed: true`, as before.
+- `off`: only principal sockets carry bulk authority. A turn socket answers bulk
+  submissions with 409 `PRINCIPAL_REQUIRED` and reports
+  `publicLiteratureAllowed: false` and `bulkAvailable: false`. Turn processes
+  still receive `PUPPENCLAW_ORCHESTRATION_ATTEMPT_ID` as an identifier, because
+  the deployed sandbox wrappers validate it, but it grants nothing. The egress
+  deny list built from endpoint-like variable names stays active in both modes:
+  it only denies, never grants.
+- Any other value fails startup.
+
+
+Advanced worker jobs store each result in its own SQLite row and each distinct
+input once, as a blob keyed by the sha256 of its JSON (a resumed job reuses the
+inputs of its predecessor). Existing job records migrate transactionally at
+startup; completed items and idempotency keys survive the migration. Back up the
+daemon state before updating it. See "pcp/2 broker feed and instrument mode"
+above for the store's group commit, recovery and rollback behaviour.
 
 For large runs, use `GET /orchestration/jobs?session=NAME&view=summary&after=0&limit=100`
 and `GET /orchestration/jobs/JOB/results?session=NAME&after=0&limit=100`. The scoped
@@ -545,8 +863,10 @@ deadline after admission, covering both headers and body. Set
 `PUPPENCLAW_BULK_RESPONSE_TIMEOUT_MS` to a positive integer up to 86400000
 (24 hours) to tune that deadline. Expiry records `BULK_RESPONSE_TIMEOUT`;
 cancellation remains immediate and native controller transport is unchanged.
-This removes the default five-minute header timeout without automatically
-replaying a costly request or masking upstream connection resets.
+This removes the default five-minute header timeout. A bulk call that times out,
+meets a connection reset or gets HTTP 502/503/504 is retried with backoff
+(`PUPPENCLAW_BULK_RETRY_ATTEMPTS`, default 3); every attempt keeps its own
+receipt and the item settles once.
 
 Worker configurations and submitted job counts have no fixed numeric ceiling;
 reuse a configuration across as many tasks as required. Requested bulk concurrency
@@ -610,7 +930,9 @@ already bound to that owner), rejects conflicting ownership, and fails closed
 when absence cannot be proved by a durable prior binding. Owner claims survive
 purge so retries can prove that a named legacy session was already removed. The
 first cleanup call installs a durable account-wide creation fence; successful
-purge is reported only after no owned session remains. Ambiguous survivors
+purge is reported only after no owned session remains, and the purge answer's
+`brokerErasuresPending` counts the owner's broker jobs whose erasure still waits
+for the event feed acknowledgement (see "pcp/2 broker feed"). Ambiguous survivors
 return `OWNER_CLEANUP_INCOMPLETE` with
 `recoveryRequired: true` while retaining the fence. Sessions created by legacy
 callers without an owner selector remain unowned and must still be reconciled

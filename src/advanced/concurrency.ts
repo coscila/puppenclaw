@@ -50,6 +50,8 @@ export class BulkConcurrencyLimiter {
     }
   }
   group(provider: string): string | undefined { return this.providerGroups.get(provider); }
+  /** The capacity pool a provider draws from (its group, or the provider itself). */
+  poolKey(provider: string): string { return this.key(provider); }
   private key(provider: string): string {
     const group = this.group(provider);
     // A group name must not accidentally alias an ungrouped provider with the same name.

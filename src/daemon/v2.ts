@@ -25,6 +25,8 @@ export type V2RouteDeps = {
   activeTurns: () => number;
   pendingStateWrites: () => number;
   streamBacklog: () => StreamBacklog;
+  /** Broker jobs whose erasure waits for the feed acknowledgement (a cached count). */
+  pendingErasures: () => number;
   /** Feature flags advertised in /v2/capabilities; each is opt-in per request. */
   features: () => Record<string, number>;
   limits: () => Record<string, number>;
@@ -48,7 +50,8 @@ export function registerV2Routes(app: FastifyInstance, deps: V2RouteDeps): void 
         streams: backlog.streams,
         streamEvents: backlog.events,
         streamBytes: backlog.bytes,
-        stateWrites: deps.pendingStateWrites()
+        stateWrites: deps.pendingStateWrites(),
+        brokerErasures: deps.pendingErasures()
       },
       eventLoop: deps.eventLoop.snapshot(),
       memory: { rssBytes: memory.rss, heapUsedBytes: memory.heapUsed, heapLimitBytes }

@@ -48,7 +48,11 @@ describe("incremental worker persistence", () => {
     const dir = await root(); let store = await AdvancedStore.open(dir); store.putJob(job()); const cursor = store.summaries().nextCursor; store.close();
     store = await AdvancedStore.open(dir); cleanups.push(() => store.close()); store.updateItem("job", "one", { state: "completed" });
     expect(store.summaries("parent", { after: cursor }).nextCursor).toBeGreaterThan(cursor);
-    store.purgeSession("parent"); expect(store.resultPage("job").results).toEqual([]); expect(store.jobHeaders()).toEqual([]);
+    // The job's broker.job event is not acknowledged: its contents go at once, the rest of its erasure waits for the feed.
+    store.purgeSession("parent"); expect(store.pendingErasures()).toEqual(["job"]);
+    expect(store.resultPage("job").results).toEqual([]); expect(store.jobHeaders()).toEqual([]);
+    store.ack(store.feedId, store.head());
+    expect(store.pendingErasures()).toEqual([]);
   });
 });
 
