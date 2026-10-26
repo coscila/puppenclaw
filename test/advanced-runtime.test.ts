@@ -577,10 +577,10 @@ describe("scoped worker broker", () => {
     runtime.attach({ start: async () => { entered(); await held; return { content: [{ type: "text", text: "secret" }], details: {} }; }, quiesce: async (name) => { quiesced.push(name); finish(); }, getSession: () => session, contribution: () => {} });
     const agent = (await unix(socket, "/agent/submit", { configId: "refs", idempotencyKey: "held", task: "secret-task" })).body; await started; await runtime.closeTurn("main"); expect(runtime.store.job(agent.jobId)!.state).toBe("cancelled"); expect(quiesced).toHaveLength(1);
     await runtime.purge("main"); expect(runtime.socket("main")).toBeUndefined();
-    // Its outbox rows are not acknowledged yet, so the job waits for the feed before it is erased.
-    expect(runtime.store.deferredPurges()).toEqual([agent.jobId]);
+    // Its outbox rows are not acknowledged yet: the job and its contents go at once, its receipts wait for the feed.
+    expect(runtime.store.pendingErasures()).toEqual([agent.jobId]); expect(runtime.jobs("main")).toEqual([]);
     runtime.store.ack(runtime.store.feedId, runtime.store.head());
-    expect(runtime.jobs("main")).toEqual([]); expect(runtime.store.receipts("main")).toEqual([]); expect(runtime.store.deferredPurges()).toEqual([]);
+    expect(runtime.store.receipts("main")).toEqual([]); expect(runtime.store.pendingErasures()).toEqual([]);
   });
   it("rejects old child sockets after a new parent attempt starts", async () => {
     const { url } = await upstream((_req, res) => res.end('{}')); const { runtime, socket, params, session } = await setup(url); let child!: string;

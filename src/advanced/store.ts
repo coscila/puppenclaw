@@ -122,6 +122,7 @@ export class AdvancedStore {
   private readonly indexes: { owner: boolean; child: boolean; state: boolean; running: boolean };
   readonly stats: StoreStats = { batches: 0, mutations: 0, fallbacks: 0, failedMutations: 0, duplicateSettlements: 0 };
   private recovery: { requeued: string[]; relaunch: string[] } = { requeued: [], relaunch: [] };
+  private erasuresPending = 0;
 
   private constructor(private readonly db: Database, private readonly root: string, options: AdvancedStoreOptions, indexes: AdvancedStore["indexes"]) {
     this.commitWindowMs = options.commitWindowMs ?? DEFAULT_COMMIT_WINDOW_MS;
@@ -176,7 +177,9 @@ export class AdvancedStore {
       CREATE INDEX IF NOT EXISTS outbox_job ON outbox(jobId,seq);
       CREATE UNIQUE INDEX IF NOT EXISTS outbox_receipt_item ON outbox(jobId,itemId) WHERE type='broker.receipt';
       CREATE TABLE IF NOT EXISTS outbox_meta (id INTEGER PRIMARY KEY CHECK(id=1), feed_id TEXT NOT NULL, acked INTEGER NOT NULL DEFAULT 0, acked_at TEXT, synced_revision INTEGER NOT NULL DEFAULT 0, durable_seq INTEGER NOT NULL DEFAULT 0);
-      CREATE TABLE IF NOT EXISTS purge_deferred (job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE, requested_at TEXT NOT NULL) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS erasure_pending (job_id TEXT PRIMARY KEY, session TEXT NOT NULL, owner_key TEXT, requested_at TEXT NOT NULL) WITHOUT ROWID;
+      CREATE INDEX IF NOT EXISTS erasure_pending_session ON erasure_pending(session);
+      CREATE INDEX IF NOT EXISTS erasure_pending_owner ON erasure_pending(owner_key);
       CREATE TABLE IF NOT EXISTS instruments (digest TEXT PRIMARY KEY, bundle TEXT NOT NULL, settings_sha256 TEXT NOT NULL, installed_at TEXT NOT NULL) WITHOUT ROWID;`);
     // Expression indexes replace the full scans of owner, child and state lookups. SQLite
     // maintains them for writes by older daemons too. A row that is not JSON would make
@@ -198,6 +201,13 @@ export class AdvancedStore {
     store.catchUp();
     // Each migration is atomic. Old idempotency keys and completed results are retained.
     for (const row of db.prepare("SELECT payload FROM jobs WHERE storage_version=0").all() as { payload: string }[]) store.applyNow((batch) => store.writeJob(JSON.parse(row.payload) as WorkerJob, batch, {}));
+    // A pre-release store deferred whole jobs (purge_deferred): erase their content now and track them like any other.
+    if (db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='purge_deferred'").get() !== undefined) {
+      store.applyNow(() => {
+        for (const row of db.prepare("SELECT job_id FROM purge_deferred").all() as { job_id: string }[]) store.deferErasure(row.job_id);
+        db.exec("DROP TABLE purge_deferred");
+      });
+    }
     store.applyNow(() => store.completeDeferredPurgesIn());
     store.collectOrphanBlobs();
     return store;
@@ -686,25 +696,27 @@ export class AdvancedStore {
   }
 
   /**
-   * Permanent session erasure: jobs, items, inputs and receipts. A job whose outbox
-   * rows are not acknowledged yet keeps its rows (receipts are never deleted before
-   * they reached Postgres); its erasure completes once the feed acknowledges them.
+   * Permanent session erasure. A job the feed has fully acknowledged goes at once with everything it holds. A job
+   * with unacknowledged events loses its content at once (deferErasure); only its receipt rows and unacknowledged
+   * events wait for the feed, since a receipt is never deleted before it reached Postgres.
    */
   purgeSession(name: string): void {
     this.applyNow(() => {
       const ids = this.jobsOfSession(name), deferred = new Set(ids.filter((id) => this.hasUnacknowledgedEvents(id)));
       for (const row of this.stmt("SELECT id, job_id FROM receipts WHERE parent=?").all(name) as { id: string; job_id: string | null }[]) {
-        if (row.job_id && deferred.has(row.job_id)) continue;
+        if (row.job_id && (deferred.has(row.job_id) || this.erasurePending(row.job_id))) continue;
         this.stmt("DELETE FROM receipts WHERE id=?").run(row.id);
       }
       for (const id of ids) {
-        if (deferred.has(id)) { this.stmt("INSERT OR IGNORE INTO purge_deferred (job_id, requested_at) VALUES (?,?)").run(id, this.timestamp()); continue; }
-        this.eraseJob(id);
+        if (deferred.has(id)) this.deferErasure(id);
+        else this.eraseJob(id);
       }
+      this.countErasuresPending();
     });
     for (const id of [...this.running.keys()]) if (!this.jobExists(id)) this.running.delete(id);
   }
   private jobExists(id: string): boolean { return this.stmt("SELECT 1 FROM jobs WHERE id=?").get(id) !== undefined; }
+  private erasurePending(id: string): boolean { return this.stmt("SELECT 1 FROM erasure_pending WHERE job_id=?").get(id) !== undefined; }
 
   private eraseJob(id: string): void {
     const digests = (this.stmt("SELECT DISTINCT digest FROM item_inputs WHERE job_id=?").all(id) as { digest: string }[]).map((row) => row.digest);
@@ -715,17 +727,55 @@ export class AdvancedStore {
     this.running.delete(id); this.headerTouches.delete(id);
   }
 
-  private completeDeferredPurgesIn(): number {
-    let erased = 0;
-    for (const row of this.stmt("SELECT job_id FROM purge_deferred").all() as { job_id: string }[]) {
-      if (this.hasUnacknowledgedEvents(row.job_id)) continue;
-      this.eraseJob(row.job_id); erased += 1;
+  /**
+   * The erasure of a job whose events the feed has not acknowledged: its header, items, inputs, blobs and
+   * acknowledged events go now, and its unacknowledged receipt events lose their inline output (outputDigest and
+   * outputBytes stay). Its receipt rows (provenance, no content) and unacknowledged events stay until the
+   * acknowledgement covers them; erasure_pending tracks the job by session and owner until then.
+   */
+  private deferErasure(id: string): void {
+    const header = this.stmt("SELECT parent, json_extract(payload,'$.ownerKey') AS owner FROM jobs WHERE id=?").get(id) as { parent: string; owner: unknown } | undefined;
+    if (!header) return;
+    this.stmt("INSERT OR IGNORE INTO erasure_pending (job_id, session, owner_key, requested_at) VALUES (?,?,?,?)").run(id, header.parent, typeof header.owner === "string" ? header.owner : null, this.timestamp());
+    for (const event of this.stmt("SELECT seq, payload FROM outbox WHERE jobId=? AND seq>? AND type=?").all(id, this.ackedSeq, BROKER_RECEIPT_EVENT) as { seq: number; payload: string }[]) {
+      const payload = JSON.parse(event.payload) as Record<string, unknown>;
+      if (!("output" in payload)) continue;
+      delete payload.output;
+      this.stmt("UPDATE outbox SET payload=? WHERE seq=?").run(JSON.stringify(payload), event.seq);
     }
-    return erased;
+    const digests = (this.stmt("SELECT DISTINCT digest FROM item_inputs WHERE job_id=?").all(id) as { digest: string }[]).map((row) => row.digest);
+    this.stmt("DELETE FROM outbox WHERE jobId=? AND seq<=?").run(id, this.ackedSeq);
+    this.stmt("DELETE FROM jobs WHERE id=?").run(id);
+    for (const digest of digests) this.stmt("DELETE FROM blobs WHERE digest=? AND NOT EXISTS (SELECT 1 FROM item_inputs WHERE digest=?)").run(digest, digest);
+    this.running.delete(id); this.headerTouches.delete(id);
   }
 
-  /** Erasure requests waiting for the feed acknowledgement. */
-  deferredPurges(): string[] { this.flushPending(); return (this.stmt("SELECT job_id FROM purge_deferred ORDER BY job_id").all() as { job_id: string }[]).map((row) => row.job_id); }
+  /** Completes the erasures whose events the feed has now acknowledged: their receipt rows and remaining events go. */
+  private completeDeferredPurgesIn(): number {
+    let erased = 0;
+    for (const row of this.stmt("SELECT job_id FROM erasure_pending").all() as { job_id: string }[]) {
+      if (this.hasUnacknowledgedEvents(row.job_id)) continue;
+      if (this.jobExists(row.job_id)) this.eraseJob(row.job_id);
+      this.stmt("DELETE FROM receipts WHERE job_id=?").run(row.job_id);
+      this.stmt("DELETE FROM outbox WHERE jobId=? AND seq<=?").run(row.job_id, this.ackedSeq);
+      this.stmt("DELETE FROM erasure_pending WHERE job_id=?").run(row.job_id);
+      erased += 1;
+    }
+    this.countErasuresPending();
+    return erased;
+  }
+  private countErasuresPending(): void { this.erasuresPending = Number((this.stmt("SELECT count(*) AS n FROM erasure_pending").get() as { n: number }).n); }
+
+  /** Jobs whose erasure waits for the feed acknowledgement, optionally of one owner or session. */
+  pendingErasures(filter: { owner?: string; session?: string } = {}): string[] {
+    this.flushPending();
+    const rows = filter.owner !== undefined ? this.stmt("SELECT job_id FROM erasure_pending WHERE owner_key=? ORDER BY job_id").all(filter.owner)
+      : filter.session !== undefined ? this.stmt("SELECT job_id FROM erasure_pending WHERE session=? ORDER BY job_id").all(filter.session)
+        : this.stmt("SELECT job_id FROM erasure_pending ORDER BY job_id").all();
+    return (rows as { job_id: string }[]).map((row) => row.job_id);
+  }
+  /** How many jobs wait for the feed acknowledgement to complete their erasure (kept in memory, O(1)). */
+  get pendingErasureCount(): number { return this.erasuresPending; }
 
   /** Blobs no item references any more (left by an older daemon's erasure). */
   private collectOrphanBlobs(): void {
@@ -858,7 +908,7 @@ export class AdvancedStore {
     this.flushPending();
     const report: ArchiveReport = { file: null, jobs: 0, items: 0, receipts: 0, skipped: { studyRef: 0, unacknowledged: 0 }, manifest: null };
     const cutoff = options.before.toISOString();
-    const candidates = (this.stmt(`SELECT id, study_ref AS study FROM jobs WHERE json_extract(payload,'$.state') IN (${TERMINAL_JOB_STATES.map((state) => `'${state}'`).join(",")}) AND json_extract(payload,'$.updatedAt')<? AND id NOT IN (SELECT job_id FROM purge_deferred) ORDER BY rowid`).all(cutoff) as { id: string; study: string | null }[]);
+    const candidates = (this.stmt(`SELECT id, study_ref AS study FROM jobs WHERE json_extract(payload,'$.state') IN (${TERMINAL_JOB_STATES.map((state) => `'${state}'`).join(",")}) AND json_extract(payload,'$.updatedAt')<? AND id NOT IN (SELECT job_id FROM erasure_pending) ORDER BY rowid`).all(cutoff) as { id: string; study: string | null }[]);
     const eligible: string[] = [];
     for (const row of candidates) {
       if (row.study != null) { report.skipped.studyRef += 1; continue; }

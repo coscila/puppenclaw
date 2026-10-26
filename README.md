@@ -539,10 +539,13 @@ renames them.
   bytes; larger outputs stay in the job's result pages. `outputDigest` is the
   sha256 of the output as a string, or of its compact JSON when it is
   structured. Agent jobs report their single item over all its native calls.
-- Erasure never runs ahead of the feed: purging a session (or an owner) keeps
-  the rows of every job that still has unacknowledged events and completes
-  their erasure when the acknowledgement covers them. Acknowledged rows of an
-  erased job go with it.
+- Erasure never runs ahead of the feed, and contents never wait for it: purging
+  a session (or an owner) erases a job whose events are all acknowledged at
+  once. A job with unacknowledged events loses its header, items, inputs and
+  acknowledged events at once, and its unacknowledged receipt events lose their
+  inline `output` (`outputDigest` and `outputBytes` stay); only its receipt rows
+  and those events wait, and go when the acknowledgement covers them. A store
+  of a pre-release build that kept such jobs whole is converted when it opens.
 - Retention is opt-in: `PUPPENCLAW_EVENT_RETENTION_DAYS` (at least 7) prunes
   acknowledged rows older than that, hourly. Unacknowledged rows are never
   pruned.

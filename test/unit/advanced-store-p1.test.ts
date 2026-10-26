@@ -246,20 +246,69 @@ describe("P1 broker outbox and feed", () => {
     expect(store.head()).toBe(5);
   });
 
-  it("defers the erasure of jobs with unacknowledged events and completes it on the acknowledgement", async () => {
+  it("erases the contents of a purged job with unacknowledged events at once and its receipts on the acknowledgement", async () => {
     const { store, db } = await open();
-    store.createJob(job("j", ["one"]));
-    await store.settleItem("j", settled("one"), settlement("j", "one"));
+    store.createJob(job("j", ["one", "two"], {}, (index) => `CONFIDENTIAL INPUT ${index}`));
+    await store.settleItem("j", settled("one", "CONFIDENTIAL OUTPUT"), settlement("j", "one"));
+    store.ack(store.feedId, 1);
     store.putReceipt({ ...receipt("controller", "none", "controller-call"), jobId: undefined as never, itemId: undefined as never });
     store.purgeSession("parent");
-    expect(store.deferredPurges()).toEqual(["j"]);
-    expect(store.jobReceipts("j")).toHaveLength(1);
-    expect(store.receipts("parent").map((row) => row.requestId)).toEqual(["j-one"]);
-    store.ack(store.feedId, store.head());
-    expect(store.deferredPurges()).toEqual([]);
+    expect(store.pendingErasures()).toEqual(["j"]);
+    expect(store.pendingErasures({ owner: "owner-key-0123456789" })).toEqual(["j"]);
+    expect(store.pendingErasures({ session: "parent" })).toEqual(["j"]);
+    expect(store.pendingErasureCount).toBe(1);
+    // Contents are gone now: the job row, its items, inputs and blobs, and its acknowledged events.
     expect(store.jobHeader("j")).toBeNull();
+    for (const table of ["jobs", "job_items", "item_inputs", "blobs"]) expect(count(db(), `SELECT count(*) AS n FROM ${table}`)).toBe(0);
+    expect(store.ownedParents("owner-key-0123456789")).toEqual(["parent"]);
+    // What the feed still needs stays: the receipt row and the unacknowledged receipt event, without its inline output.
+    expect(store.receipts("parent").map((row) => row.requestId)).toEqual(["j-one"]);
+    const pending = store.events(0, 10).events;
+    expect(pending.map((event) => [event.seq, event.type])).toEqual([[2, BROKER_RECEIPT_EVENT]]);
+    expect(pending[0]!.payload).not.toHaveProperty("output");
+    expect(pending[0]!.payload).toMatchObject({ itemId: "one", outputBytes: Buffer.byteLength("CONFIDENTIAL OUTPUT") });
+    expect(JSON.stringify(db().prepare("SELECT * FROM outbox").all())).not.toContain("CONFIDENTIAL");
+    // Purging again changes nothing; the acknowledgement completes the erasure.
+    store.purgeSession("parent");
+    expect(store.receipts("parent")).toHaveLength(1);
+    store.ack(store.feedId, store.head());
+    expect(store.pendingErasures()).toEqual([]);
+    expect(store.pendingErasureCount).toBe(0);
     expect(count(db(), "SELECT count(*) AS n FROM receipts")).toBe(0);
     expect(count(db(), "SELECT count(*) AS n FROM outbox")).toBe(0);
+    expect(store.ownedParents("owner-key-0123456789")).toEqual([]);
+  });
+
+  it("keeps a pending erasure across a reopen and completes it when the acknowledgement arrives later", async () => {
+    const first = await open();
+    first.store.createJob(job("j", ["one"]));
+    await first.store.settleItem("j", settled("one"), settlement("j", "one"));
+    first.store.purgeSession("parent");
+    first.store.close();
+    const { store, db } = await open(first.dir);
+    expect(store.pendingErasures()).toEqual(["j"]);
+    expect(store.pendingErasureCount).toBe(1);
+    expect(store.jobHeader("j")).toBeNull();
+    store.ack(store.feedId, store.head());
+    expect(store.pendingErasures()).toEqual([]);
+    expect(count(db(), "SELECT count(*) AS n FROM receipts")).toBe(0);
+  });
+
+  it("converts the deferred whole jobs of a pre-release store into pending erasures without their contents", async () => {
+    const first = await open();
+    first.store.createJob(job("j", ["one"], {}, () => "CONFIDENTIAL INPUT"));
+    await first.store.settleItem("j", settled("one", "CONFIDENTIAL OUTPUT"), settlement("j", "one"));
+    first.store.flush();
+    // A pre-release build kept a purged job whole in purge_deferred until the acknowledgement.
+    first.db().exec("CREATE TABLE purge_deferred (job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE, requested_at TEXT NOT NULL) WITHOUT ROWID; INSERT INTO purge_deferred VALUES ('j', '2026-10-25T00:00:00.000Z')");
+    first.store.close();
+    const { store, db } = await open(first.dir);
+    expect(store.pendingErasures({ owner: "owner-key-0123456789" })).toEqual(["j"]);
+    expect(store.jobHeader("j")).toBeNull();
+    expect(count(db(), "SELECT count(*) AS n FROM sqlite_master WHERE name='purge_deferred'")).toBe(0);
+    expect(JSON.stringify([...db().prepare("SELECT * FROM outbox").all(), ...db().prepare("SELECT * FROM blobs").all()])).not.toContain("CONFIDENTIAL");
+    store.ack(store.feedId, store.head());
+    expect(store.pendingErasures()).toEqual([]);
   });
 
   it("requeues the unsettled items of P1 bulk jobs and relaunches only jobs whose authority survives", async () => {
