@@ -1,6 +1,6 @@
 import { chmod, mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import type { DatabaseSync as Database } from "node:sqlite";
+import type { DatabaseSync as Database, StatementSync } from "node:sqlite";
 
 import type { PrincipalGrants, PrincipalKind, PrincipalRecord, PrincipalUsage } from "./principals-schema.js";
 
@@ -27,6 +27,7 @@ function record(row: Row): PrincipalRecord {
 }
 
 export class PrincipalStore {
+  private readonly statements = new Map<string, StatementSync>();
   private constructor(private readonly db: Database) {}
 
   static async open(root: string): Promise<PrincipalStore> {
@@ -109,33 +110,36 @@ export class PrincipalStore {
     });
   }
 
+  /** Usage against the budgets; admitted items are the counted rows plus items counted without an item key. */
   usage(id: string): PrincipalUsage {
     const row = this.db.prepare("SELECT items, input_tokens, output_tokens FROM principal_usage WHERE principal_id=?").get(id) as
       { items: number; input_tokens: number; output_tokens: number } | undefined;
-    return row ? { items: row.items, inputTokens: row.input_tokens, outputTokens: row.output_tokens } : { items: 0, inputTokens: 0, outputTokens: 0 };
+    const counted = Number((this.db.prepare("SELECT count(*) AS n FROM principal_item_charges WHERE principal_id=?").get(id) as { n: number }).n);
+    return row ? { items: row.items + counted, inputTokens: row.input_tokens, outputTokens: row.output_tokens } : { items: counted, inputTokens: 0, outputTokens: 0 };
   }
 
   /** Whether maxItems already counted this item of the job lineage. */
   charged(id: string, lineage: string, itemId: string): boolean {
-    return this.db.prepare("SELECT 1 FROM principal_item_charges WHERE principal_id=? AND lineage=? AND item_id=?").get(id, lineage, itemId) !== undefined;
+    return this.statement("SELECT 1 FROM principal_item_charges WHERE principal_id=? AND lineage=? AND item_id=?").get(id, lineage, itemId) !== undefined;
   }
 
-  /** Counts one item of a job lineage against maxItems, once; false when it was counted before. */
+  /**
+   * Counts one item of a job lineage against maxItems, once; false when it was counted before. One row, one
+   * statement: the admitted item count is principal_usage.items plus these rows (see usage()).
+   */
   charge(id: string, lineage: string, itemId: string, at: string): boolean {
-    return this.transaction(() => {
-      const inserted = Number(this.db.prepare("INSERT OR IGNORE INTO principal_item_charges (principal_id, lineage, item_id, charged_at) VALUES (?,?,?,?)").run(id, lineage, itemId, at).changes) === 1;
-      if (inserted) this.db.prepare("UPDATE principal_usage SET items=items+1 WHERE principal_id=?").run(id);
-      return inserted;
-    });
+    return Number(this.statement("INSERT OR IGNORE INTO principal_item_charges (principal_id, lineage, item_id, charged_at) VALUES (?,?,?,?)").run(id, lineage, itemId, at).changes) === 1;
   }
 
   /** Returns an item charge (its admission never dispatched a call); false when there was none. */
   refund(id: string, lineage: string, itemId: string): boolean {
-    return this.transaction(() => {
-      const deleted = Number(this.db.prepare("DELETE FROM principal_item_charges WHERE principal_id=? AND lineage=? AND item_id=?").run(id, lineage, itemId).changes) === 1;
-      if (deleted) this.db.prepare("UPDATE principal_usage SET items=MAX(items-1,0) WHERE principal_id=?").run(id);
-      return deleted;
-    });
+    return Number(this.statement("DELETE FROM principal_item_charges WHERE principal_id=? AND lineage=? AND item_id=?").run(id, lineage, itemId).changes) === 1;
+  }
+
+  private statement(sql: string): StatementSync {
+    let statement = this.statements.get(sql);
+    if (!statement) { statement = this.db.prepare(sql); this.statements.set(sql, statement); }
+    return statement;
   }
 
   addUsage(id: string, items: number, inputTokens: number, outputTokens: number): void {
