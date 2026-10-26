@@ -721,8 +721,9 @@ census-shaped verbatim instrument calls through a run principal socket (40
 entries of about 3 KB per call by default) and checks that every call's bytes, as
 the mock upstream hashed them, equal its receipt's `requestSha256`. A submission
 is parsed, digested and stored on the event loop, so its size bounds the lag it
-causes: keep verbatim jobs to about 1-2 MB of items (10-20 such calls) per
-submission.
+causes: about 23 ms for ten such calls (1.2 MB) against about 220 ms for a
+hundred, so keep verbatim submissions to about ten calls; one call per job also
+works (`--calls 1 --submitters 60`).
 
 ### pcp/2 run principals (`principals:1`)
 

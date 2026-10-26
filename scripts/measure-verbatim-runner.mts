@@ -20,7 +20,7 @@ import type { UsageReceipt } from "../src/advanced/types.js";
 import { TurnStatisticsRecorder } from "../src/statistics/recorder.js";
 import { TurnStatisticsStore } from "../src/statistics/store.js";
 
-const config = JSON.parse(process.argv[2] ?? "{}") as { calls: number; jobs: number; streams: number; entries: number; entryBytes: number; systemBytes: number; outputBytes: number; latencyMs: number };
+const config = JSON.parse(process.argv[2] ?? "{}") as { calls: number; jobs: number; submitters: number; streams: number; entries: number; entryBytes: number; systemBytes: number; outputBytes: number; latencyMs: number };
 
 const UPSTREAM = `
 const { createHash } = require("node:crypto");
@@ -98,13 +98,22 @@ const userMessage = (call: number, entries: number) => {
 };
 const item = (id: string, call: number, entries: number) => ({ id, input: { model: provider.model, messages: [{ role: "system", content: SYSTEM }, { role: "user", content: userMessage(call, entries) }],
   max_tokens: Math.max(3000, 700 * entries), temperature: 0.0, stream: false, reasoning_effort: "none", itemCount: entries } });
+/**
+ * Waits until every given job has settled, reading the principal's job summaries page by page every 250 ms
+ * (as an executor does; one connection at a time); returns the duration of each poll round.
+ */
 const settle = async (ids: string[]) => {
   const polls: number[] = [];
   for (;;) {
-    const t = performance.now();
-    const states = await Promise.all(ids.map(async (id) => (await unix(socket, `/jobs/${id}?view=summary`)).body));
+    const t = performance.now(), states = new Map<string, string>();
+    for (let after = 0; ;) {
+      const page = (await unix(socket, `/jobs?view=summary&after=${after}&limit=1000`)).body as { jobs: { jobId: string; state: string }[]; nextCursor: number; hasMore: boolean };
+      for (const job of page.jobs) states.set(job.jobId, job.state);
+      if (!page.hasMore) break;
+      after = page.nextCursor;
+    }
     polls.push(performance.now() - t);
-    if (states.every((job) => !["queued", "running"].includes(job.state))) return polls;
+    if (ids.every((id) => { const state = states.get(id); return state !== undefined && !["queued", "running"].includes(state); })) return polls;
     await new Promise((r) => setTimeout(r, 250));
   }
 };
@@ -116,14 +125,19 @@ await settle([warm.jobId]);
 const histogram = monitorEventLoopDelay({ resolution: 10 });
 histogram.enable();
 const startedAt = performance.now(), submitMs: number[] = [], jobs: string[] = [];
-for (let job = 0; job < config.jobs; job += 1) {
-  const items = Array.from({ length: config.calls }, (_, index) => item(`j${job}-c${index}`, job * config.calls + index, config.entries));
-  const t = performance.now();
-  const submitted = (await unix(socket, "/bulk/submit?view=summary", { configId: provider.id, idempotencyKey: `measure-${job}`, instrumentDigest: DIGEST, concurrency: config.streams, items })).body;
-  submitMs.push(performance.now() - t);
-  if (!submitted.jobId) throw new Error(`submit failed: ${JSON.stringify(submitted)}`);
-  jobs.push(submitted.jobId);
-}
+// Submitters run side by side, as an executor's call threads do (one call per job when --calls is 1).
+let nextJob = 0;
+await Promise.all(Array.from({ length: Math.max(1, config.submitters) }, async () => {
+  while (nextJob < config.jobs) {
+    const job = nextJob++;
+    const items = Array.from({ length: config.calls }, (_, index) => item(`j${job}-c${index}`, job * config.calls + index, config.entries));
+    const t = performance.now();
+    const submitted = (await unix(socket, "/bulk/submit?view=summary", { configId: provider.id, idempotencyKey: `measure-${job}`, instrumentDigest: DIGEST, concurrency: config.streams, items })).body;
+    submitMs.push(performance.now() - t);
+    if (!submitted.jobId) throw new Error(`submit failed: ${JSON.stringify(submitted)}`);
+    jobs.push(submitted.jobId);
+  }
+}));
 const steady = monitorEventLoopDelay({ resolution: 10 }); steady.enable();
 const polls = await settle(jobs);
 const elapsedMs = performance.now() - startedAt;

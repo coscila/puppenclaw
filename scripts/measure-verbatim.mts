@@ -5,8 +5,11 @@
  * chat-completions upstream.
  *
  *   node --experimental-strip-types scripts/measure-verbatim.mts [--calls N] [--jobs N]
- *     [--streams N] [--entries N] [--entry-bytes N] [--system-bytes N] [--latency-ms N]
- *     [--output-bytes N] [--only paced|max]
+ *     [--submitters N] [--streams N] [--entries N] [--entry-bytes N] [--system-bytes N]
+ *     [--latency-ms N] [--output-bytes N] [--only paced|max]
+ *
+ * `--calls 1 --jobs 800 --submitters 60` follows an executor that submits each
+ * call as its own one-item job from 60 threads.
  *
  * Each scenario runs in a fresh process (scripts/measure-verbatim-runner.mts,
  * bundled with esbuild) with the daemon's receipt hooks wired as in
@@ -53,7 +56,7 @@ async function scenario(name: string, config: Record<string, unknown>): Promise<
 
 // Census geometry: 40 entries per call, about 3 KB of evidence per entry, a few KB of instructions.
 const base = {
-  calls: option("--calls", 100), jobs: option("--jobs", 8), streams: option("--streams", 60), entries: option("--entries", 40),
+  calls: option("--calls", 100), jobs: option("--jobs", 8), submitters: option("--submitters", 1), streams: option("--streams", 60), entries: option("--entries", 40),
   entryBytes: option("--entry-bytes", 3_000), systemBytes: option("--system-bytes", 6_000), outputBytes: option("--output-bytes", 2_400)
 };
 const scenarios: [string, Record<string, unknown>][] = [
