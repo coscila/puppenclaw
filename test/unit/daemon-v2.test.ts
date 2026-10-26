@@ -56,7 +56,7 @@ describe("pcp/2 health and identity", () => {
         protocol: { major: 2, minor: 0 },
         stateRecovery: { required: false },
         activeTurns: 0,
-        backlog: { streams: 0, streamEvents: 0, streamBytes: 0, stateWrites: 0 },
+        backlog: { streams: 0, streamEvents: 0, streamBytes: 0, stateWrites: 0, brokerErasures: 0 },
         eventLoop: { windowMs: 30_000 }
       });
       expect(body.bootId).toMatch(UUID);

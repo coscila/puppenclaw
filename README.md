@@ -421,7 +421,8 @@ set; none of them is added to the open `/health` and `/capabilities`.
 - `GET /v2/health`: constant-cost and under 1 KB: `ok`, `protocol`, `bootId`,
   `spoolId`, `build` (`PUPPENCLAW_BUILD_ID` or version plus bundle digest),
   `activeTurns`, `backlog` (open streams, queued stream events and bytes,
-  pending state writes), `eventLoop` (`monitorEventLoopDelay` p99 and max lag in
+  pending state writes, `brokerErasures`: broker jobs whose erasure waits for
+  the feed acknowledgement), `eventLoop` (`monitorEventLoopDelay` p99 and max lag in
   ms over a 30 s window) and `memory`.
 - `GET /v2/capabilities`: `features` (`health`, `opsIdle`, `usageLedger`,
   `compactStatus`, `keyedStreaming`, `sseGap`, and the broker's `eventFeed`,
@@ -546,6 +547,11 @@ renames them.
   inline `output` (`outputDigest` and `outputBytes` stay); only its receipt rows
   and those events wait, and go when the acknowledgement covers them. A store
   of a pre-release build that kept such jobs whole is converted when it opens.
+  `GET /v2/health` reports how many jobs wait (`backlog.brokerErasures`), and
+  `POST /sessions/owner/purge` answers `brokerErasuresPending` for its owner:
+  the owner's data is erased only once that is 0, so a caller proving an
+  account erasure retries the purge until then (it reaches 0 once the feed has
+  acknowledged the owner's events).
 - Retention is opt-in: `PUPPENCLAW_EVENT_RETENTION_DAYS` (at least 7) prunes
   acknowledged rows older than that, hourly. Unacknowledged rows are never
   pruned.
@@ -914,7 +920,9 @@ already bound to that owner), rejects conflicting ownership, and fails closed
 when absence cannot be proved by a durable prior binding. Owner claims survive
 purge so retries can prove that a named legacy session was already removed. The
 first cleanup call installs a durable account-wide creation fence; successful
-purge is reported only after no owned session remains. Ambiguous survivors
+purge is reported only after no owned session remains, and the purge answer's
+`brokerErasuresPending` counts the owner's broker jobs whose erasure still waits
+for the event feed acknowledgement (see "pcp/2 broker feed"). Ambiguous survivors
 return `OWNER_CLEANUP_INCOMPLETE` with
 `recoveryRequired: true` while retaining the fence. Sessions created by legacy
 callers without an owner selector remain unowned and must still be reconciled

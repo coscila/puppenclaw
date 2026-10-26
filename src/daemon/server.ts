@@ -507,6 +507,7 @@ export async function createDaemonServer(params: {
     activeTurns: () => manager.activeTurnCount(),
     pendingStateWrites: () => store.pendingMutationCount,
     streamBacklog,
+    pendingErasures: () => advanced.store.pendingErasureCount,
     // compactStatus: status view=summary and transcriptLimit, GET /session/:name/transcript,
     // and start/send resultView=turn; every one is opt-in per request.
     // eventFeed/brokerOutbox: GET /v2/events and POST /v2/events/ack over the broker
@@ -731,7 +732,10 @@ export async function createDaemonServer(params: {
         adopted: parsed.sessionNames.length,
         purged: sessions.length,
         sessions: [],
-        cleanup: publicOwnerCleanup(reservation)
+        cleanup: publicOwnerCleanup(reservation),
+        // The owner's broker jobs whose erasure waits for the feed acknowledgement: their contents are gone, their
+        // receipt rows and unacknowledged events are not. The owner's data is erased only once this is 0.
+        brokerErasuresPending: advanced.store.pendingErasures({ owner: parsed.ownerKey }).length
       };
     });
   });

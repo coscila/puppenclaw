@@ -1,4 +1,4 @@
-import { request } from "node:http";
+import { createServer, request } from "node:http";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -36,6 +36,18 @@ function unixGet(socketPath: string, path: string): Promise<{ status: number; bo
     });
     req.once("error", reject);
     req.end();
+  });
+}
+
+function unixPost(socketPath: string, path: string, value: unknown): Promise<{ status: number; body: any }> {
+  return new Promise((resolve, reject) => {
+    const req = request({ socketPath, path, agent: false, method: "POST", headers: { "content-type": "application/json" } }, (res) => {
+      let text = "";
+      res.on("data", (chunk) => { text += chunk; });
+      res.once("end", () => resolve({ status: res.statusCode!, body: JSON.parse(text) }));
+    });
+    req.once("error", reject);
+    req.end(JSON.stringify(value));
   });
 }
 
@@ -172,6 +184,40 @@ describe("pcp/2 principals routes", () => {
     } finally {
       await app.close();
       vi.restoreAllMocks();
+    }
+  });
+
+  it("report the owner's broker erasures that wait for the feed in the owner purge answer and in health until the acknowledgement", async () => {
+    const upstream = createServer((req, res) => {
+      req.resume();
+      req.once("end", () => { res.setHeader("content-type", "application/json"); res.end(JSON.stringify({ model: "test-model", output_text: "CONFIDENTIAL OUTPUT", usage: { input_tokens: 3, output_tokens: 1 } })); });
+    });
+    await new Promise<void>((done) => upstream.listen(0, "127.0.0.1", done));
+    const port = (upstream.address() as { port: number }).port;
+    vi.stubEnv("PUPPENCLAW_MODEL_PROVIDERS", JSON.stringify([{ id: "judge", model: "test-model", kind: "codex-openai-compatible", baseUrl: `http://127.0.0.1:${port}/v1`, authTokenEnv: "PRINCIPAL_TEST_KEY" }]));
+    vi.stubEnv("PRINCIPAL_TEST_KEY", "test-secret");
+    const { app } = await daemon(await dataRoot());
+    try {
+      const socketPath = JSON.parse((await app.inject({ method: "PUT", url: "/v2/principals/run:study-1", headers: auth, payload: body() })).body).socketPath as string;
+      const job = await unixPost(socketPath, "/bulk/submit?view=summary", { configId: "judge", idempotencyKey: "erasure", items: [{ id: "a", input: "CONFIDENTIAL INPUT" }] });
+      expect(job.status).toBe(200);
+      for (let i = 0; i < 400 && (await unixGet(socketPath, `/jobs/${job.body.jobId}?view=summary`)).body.state !== "completed"; i++) await new Promise((done) => setTimeout(done, 5));
+      const health = async () => JSON.parse((await app.inject({ method: "GET", url: "/v2/health", headers: auth })).body).backlog.brokerErasures as number;
+      expect(await health()).toBe(0);
+      const purge = async () => JSON.parse((await app.inject({ method: "POST", url: "/sessions/owner/purge", headers: auth, payload: { ownerKey: OWNER, operationKey: "delete.account.erasure.0001" } })).body);
+      const first = await purge();
+      expect(first).toMatchObject({ ok: true, cleanup: { state: "purged" }, brokerErasuresPending: 1 });
+      expect(await health()).toBe(1);
+      // The feed reads the job's events, then acknowledges them: the erasure completes.
+      const page = JSON.parse((await app.inject({ method: "GET", url: "/v2/events?after=0&limit=1000", headers: auth })).body);
+      expect(JSON.stringify(page.events)).not.toContain("CONFIDENTIAL");
+      expect((await app.inject({ method: "POST", url: "/v2/events/ack", headers: auth, payload: { feedId: page.feedId, through: page.head } })).statusCode).toBe(200);
+      expect(await health()).toBe(0);
+      expect(await purge()).toMatchObject({ ok: true, cleanup: { state: "purged" }, brokerErasuresPending: 0 });
+    } finally {
+      await app.close();
+      upstream.closeAllConnections();
+      await new Promise<void>((done) => upstream.close(() => done()));
     }
   });
 
