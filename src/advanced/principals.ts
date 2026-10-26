@@ -497,7 +497,8 @@ export class PrincipalRegistry implements PrincipalHooks {
 
   /** Whether any of these items is not counted yet in its lineage; without a list, every admission is a new item. */
   private anyUncounted(entry: Entry, items: readonly PrincipalItemKey[] | undefined): boolean {
-    return items === undefined || items.some((item) => !this.store.charged(entry.record.id, item.lineage, item.itemId));
+    if (items === undefined || this.storeClosed) return true;
+    return items.some((item) => !this.store.charged(entry.record.id, item.lineage, item.itemId));
   }
 
   /** Counts a newly admitted item against maxItems, durably and once per job lineage; an unkeyed admission always counts. */
