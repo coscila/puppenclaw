@@ -17,3 +17,10 @@ export function responseOutputText(payload: unknown): string {
     });
   }).join("");
 }
+
+/** The final answer of a chat completion: the first choice's message content, without reasoning or refusals. */
+export function chatCompletionOutputText(payload: unknown): string {
+  const choices = object(payload)?.choices;
+  const message = Array.isArray(choices) ? object(object(choices[0])?.message) : null;
+  return typeof message?.content === "string" ? message.content : "";
+}

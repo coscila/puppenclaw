@@ -426,8 +426,9 @@ set; none of them is added to the open `/health` and `/capabilities`.
   ms over a 30 s window) and `memory`.
 - `GET /v2/capabilities`: `features` (`health`, `opsIdle`, `usageLedger`,
   `compactStatus`, `keyedStreaming`, `sseGap`, and the broker's `eventFeed`,
-  `brokerOutbox` and `instrumentMode` described below), `limits`, and provider
-  dialect limits, e.g. the structured-output keywords removed for `qwen-3.8`.
+  `brokerOutbox`, `instrumentMode` and `instrumentVerbatim` described below),
+  `limits`, and provider dialect limits, e.g. the structured-output keywords
+  removed for `qwen-3.8`.
 - `GET /ops/idle`: counts only, each measured at request time (active turns,
   turn and runner processes, running turn keys, active and paused broker jobs,
   active compute jobs, open streams). Restart survivors count only while their
@@ -491,11 +492,11 @@ state writes, event-loop lag and stalled-stream memory against a built daemon.
 
 The advanced broker reports to coscila through an acknowledged event feed and
 runs measurement instruments that coscila installs. `GET /v2/capabilities`
-advertises each part under `features`: `eventFeed: 1`, `brokerOutbox: 1` and
-`instrumentMode: 1` (limits `eventPageMax`, `eventWaitMsMax`,
-`eventInlineOutputMax`). The routes need the bearer token like every v2 route,
-and every body carries `protocol`, `bootId` and `spoolId`; errors add `code`,
-`retryable` and `error`.
+advertises each part under `features`: `eventFeed: 1`, `brokerOutbox: 1`,
+`instrumentMode: 1` and `instrumentVerbatim: 1` (limits `eventPageMax`,
+`eventWaitMsMax`, `eventInlineOutputMax`). The routes need the bearer token
+like every v2 route, and every body carries `protocol`, `bootId` and `spoolId`;
+errors add `code`, `retryable` and `error`.
 
 **Outbox.** `advanced.sqlite` holds an outbox table (`seq INTEGER PRIMARY KEY
 AUTOINCREMENT, type, jobId, itemId, payload, createdAt`, plus `receiptId`).
@@ -538,11 +539,13 @@ renames them.
 - `broker.receipt` payload: `{jobId, itemId, attempt, status
   (succeeded|failed|truncated|cancelled), finishReason, usage: {input, output,
   cacheRead, cacheWrite}, model, serverFingerprint, settingsSha256,
-  instrumentDigest, outputDigest, outputBytes, output, startedAt, endedAt,
-  error: {code, retryable} | null}`. `output` is inline only up to 16384 UTF-8
-  bytes; larger outputs stay in the job's result pages. `outputDigest` is the
-  sha256 of the output as a string, or of its compact JSON when it is
-  structured. Agent jobs report their single item over all its native calls.
+  requestSha256, instrumentDigest, outputDigest, outputBytes, output, startedAt,
+  endedAt, error: {code, retryable} | null}` (`requestSha256` is null for agent
+  jobs and for receipts written before it existed). `output` is inline only up
+  to 16384 UTF-8 bytes; larger outputs stay in the job's result pages.
+  `outputDigest` is the sha256 of the output as a string, or of its compact JSON
+  when it is structured. Agent jobs report their single item over all its native
+  calls.
 - Erasure never runs ahead of the feed, and contents never wait for it: purging
   a session (or an owner) erases a job whose events are all acknowledged at
   once. A job with unacknowledged events loses its header, items, inputs and
@@ -567,12 +570,17 @@ headers present (`server`, `via`, `x-powered-by`, `openai-version`); it is never
 empty. `settingsSha256` is the sha256 of the canonical JSON (keys sorted by code
 point, no whitespace, numbers as JSON.stringify writes them) of exactly
 `{model, temperature, seed, reasoning, max_tokens, response_format_sha256,
-system_prompt_sha256}` as sent, missing values null.
+system_prompt_sha256}` as sent, missing values null. Every bulk call's receipt,
+its item result and its `broker.receipt` event also carry `requestSha256`: the
+sha256 of the same canonical JSON of the whole request body sent upstream. A
+verbatim instrument call sends exactly those canonical bytes, so there it is also
+the digest of the bytes on the wire (and equals `promptSha256`).
 
 **Instruments.** `PUT /v2/instruments/{digest}` with `{instrumentId, version,
 systemPrompt, responseSchema|null, maxOutputTokens: {perItem, minimum},
-temperature, seed|null, reasoning, itemsPerCall, requiredModelFingerprint|null}`
-installs a bundle and answers `{ok, digest, settingsSha256}`; the same body again
+temperature, seed|null, reasoning, itemsPerCall, requiredModelFingerprint|null,
+transport?: {messages: "policy-wrapped"|"verbatim"}}` installs a bundle and
+answers `{ok, digest, settingsSha256, transport}`; the same body again
 returns the same answer, a different body under an installed digest is refused
 with 409 `INSTRUMENT_DIGEST_CONFLICT`, an invalid one with 400
 `INVALID_INSTRUMENT`. A response schema may carry `$id` and `$schema` (draft-07
@@ -580,11 +588,15 @@ or 2020-12); each distinct schema is compiled once, on its own validator, and
 reused by every job that names it. The digest is opaque (1-128 characters of
 `[A-Za-z0-9._:-]`): coscila's instrument registry computes it
 (ocsl-instrument-digest-v1) and the daemon only allow-lists what was
-installed. `GET /v2/instruments` lists `digests` and `instruments`. The
-allow-list lives in `advanced.sqlite` and survives restarts. The PUT's
-`settingsSha256` digests the installed settings (system prompt as sent,
-response schema, sampling, the output-token rule, items per call, required
-fingerprint); each receipt's `settingsSha256` digests one call.
+installed. `GET /v2/instruments` lists `digests` and `instruments` (each with
+its `transport`). The allow-list lives in `advanced.sqlite` and survives
+restarts. The PUT's `settingsSha256` digests the installed settings (system
+prompt as sent, response schema, sampling, the output-token rule, items per
+call, required fingerprint, and `messages: "verbatim"` for a verbatim bundle);
+each receipt's `settingsSha256` digests one call. A bundle without `transport` is
+policy-wrapped, and a policy-wrapped bundle is stored without the field whether
+the PUT spells the default out or not: both PUTs install the same instrument, and
+a daemon from before transport modes reads it unchanged.
 
 A bulk job naming `instrumentDigest` (socket `POST /bulk/submit`) runs in
 instrument mode; a digest that is not installed is refused with 400
@@ -596,6 +608,7 @@ which is the broker's worker policy, a blank line and the instrument's
 itemCount)` (`itemCount` defaults to `itemsPerCall`, 1 for a string), and
 temperature, seed, reasoning effort and the response schema come from the
 bundle; an item that tries to set any of them fails with `INVALID_REQUEST`.
+This is the `policy-wrapped` transport.
 `finish_reason=length` (Responses `status: incomplete` with
 `max_output_tokens`) marks the item `truncated: true`: a text output is kept, a
 cut structured output fails `STRUCTURED_OUTPUT_INVALID`, and the receipt's
@@ -603,7 +616,43 @@ status is `truncated` either way. With `requiredModelFingerprint`, an answer
 whose fingerprint and served model both differ pauses the job (`MODEL_DRIFT`)
 and keeps no output; this check comes before parsing and validation, so it also
 catches a drifted answer that is malformed, fails the schema or was cut. The
-socket's `GET /configs` lists installed instruments.
+turn socket's `GET /configs` lists the installed policy-wrapped instruments.
+
+**Verbatim instruments** (`instrumentVerbatim: 1`). A bundle with
+`transport: {messages: "verbatim"}` is sent upstream exactly as the executor
+built it, so prompts stay byte-identical to the instrument's own builders: no
+worker policy, no assignment, no added instructions. Each item is the
+executor's complete chat-completions request plus the number of instrument
+entries it carries: `{model, messages, max_tokens, temperature, seed?,
+reasoning_effort, stream?, itemCount}`. Before any call, any principal admission
+or charge, the daemon checks it against the installed bundle and refuses it
+unless the first message is a system message equal to `systemPrompt` byte for
+byte and no other message is a system message; every message is exactly `{role,
+content}` with a string content and the role system, user or assistant, at least
+one of them a user message; `model` is the worker's model; `temperature`,
+`seed` (absent or null when the bundle has none) and `reasoning_effort`
+(= `reasoning`) equal the bundle's; `stream` is absent or false;
+`max_tokens = max(minimum, perItem × itemCount)` with `1 ≤ itemCount ≤
+itemsPerCall`; and no tools and no other field are present. A refused item
+settles `failed` with errorCode `INSTRUMENT_MESSAGE_MISMATCH` (a 400-class code,
+never retried) and an error naming the check (for the system prompt, the sha256
+prefixes of both prompts, never their text); it makes no upstream call and has
+no receipt; the job's other items run. An accepted item goes to
+`/v1/chat/completions` (through the direct pool when its upstream is mapped,
+never shaped like a Responses call) as the canonical JSON (keys sorted by code
+point, no whitespace, numbers as JSON.stringify writes them) of the request
+without `itemCount`, plus `response_format: {type: "json_schema", json_schema:
+{name: "worker_result", strict: true, schema}}` when the bundle has a response
+schema (the provider's dialect-safe schema; validation stays local). Its receipt
+carries `requestSha256` (the sha256 of those bytes), `settingsSha256` over that
+request, `serverFingerprint` and `instrumentDigest`, so the executor proves byte
+identity per call by recomputing the digest of the request it built. The output
+is the first choice's message content; `finish_reason=length`, the response
+schema and `requiredModelFingerprint` apply as above. Only a run principal whose
+`grants.instruments` include the digest runs a verbatim instrument; chat-turn
+attempt authority never does (409 `PRINCIPAL_REQUIRED`, and the turn socket does
+not list it). A daemon from before transport modes refuses a verbatim bundle,
+both at the PUT and for jobs naming one, rather than running it policy-wrapped.
 
 **Provider pauses and retries.** HTTP 429 and authentication failures (401,
 403) pause the provider for the attempt at once; a 503 does so only after the
@@ -748,8 +797,9 @@ The socket is the identity:
   `?view=summary` where the turn socket has it. `GET /configs` returns
   `authorization.principalId` (also as `attemptId`), `runId`, `state`,
   `instruments` and `publicLiteratureAllowed` (true for an active run principal),
-  the principal's grants and usage, `instrumentMode: 1` with `instruments` (the
-  installed instruments it is granted, in the turn socket's shape), and one bulk
+  the principal's grants and usage, `instrumentMode: 1` and
+  `instrumentVerbatim: 1` with `instruments` (the installed instruments it is
+  granted, verbatim ones included, each with its `transport`), and one bulk
   worker per granted, configured provider, whose `id` is the provider id. Its
   `revision` changes only when that worker list changes, never on budget changes.
   Agent workers, native model routes, proxying and CONNECT are refused. No

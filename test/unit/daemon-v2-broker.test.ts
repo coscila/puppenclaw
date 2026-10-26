@@ -1,6 +1,7 @@
 import Fastify from "fastify";
 import { afterEach, describe, expect, it } from "vitest";
 
+import { installedSettingsSha256 } from "../../src/advanced/instruments.js";
 import { AdvancedRuntime } from "../../src/advanced/runtime.js";
 import type { WorkerJob } from "../../src/advanced/types.js";
 import { createDaemonServer } from "../../src/daemon/server.js";
@@ -58,7 +59,7 @@ describe("pcp/2 broker routes on the daemon", () => {
       expect(empty).toEqual({ ok: true, ...envelope, feedId: expect.any(String), events: [], next: 0, hasMore: false, head: 0, acked: 0 });
       const installed = await app.inject({ method: "PUT", url: "/v2/instruments/digest-abc", headers: auth, payload: instrument });
       expect(installed.statusCode).toBe(200);
-      expect(JSON.parse(installed.body)).toEqual({ ok: true, ...envelope, digest: "digest-abc", settingsSha256: expect.stringMatching(/^[0-9a-f]{64}$/u) });
+      expect(JSON.parse(installed.body)).toEqual({ ok: true, ...envelope, digest: "digest-abc", settingsSha256: expect.stringMatching(/^[0-9a-f]{64}$/u), transport: { messages: "policy-wrapped" } });
       const again = await app.inject({ method: "PUT", url: "/v2/instruments/digest-abc", headers: auth, payload: instrument });
       expect(JSON.parse(again.body).settingsSha256).toBe(JSON.parse(installed.body).settingsSha256);
       const conflict = await app.inject({ method: "PUT", url: "/v2/instruments/digest-abc", headers: auth, payload: { ...instrument, temperature: 1 } });
@@ -73,6 +74,38 @@ describe("pcp/2 broker routes on the daemon", () => {
     try {
       const listed = JSON.parse((await app.inject({ method: "GET", url: "/v2/instruments", headers: auth })).body) as Record<string, unknown>;
       expect(listed).toMatchObject({ ok: true, ...envelope, digests: ["digest-abc"], instruments: [{ digest: "digest-abc", instrumentId: "citation-census@1", version: 1, itemsPerCall: 40 }] });
+    } finally { await app.close(); }
+  });
+});
+
+describe("pcp/2 verbatim instruments on the daemon", () => {
+  it("advertises instrumentVerbatim, installs verbatim bundles with their transport and keeps the policy-wrapped default idempotent", async () => {
+    const app = await daemon(await createTempDir("v2-broker-verbatim-"));
+    try {
+      const capabilities = JSON.parse((await app.inject({ method: "GET", url: "/v2/capabilities", headers: auth })).body) as { features: Record<string, number> };
+      expect(capabilities.features).toMatchObject({ instrumentMode: 1, instrumentVerbatim: 1 });
+      const verbatim = { ...instrument, responseSchema: null, transport: { messages: "verbatim" } };
+      const put = (digest: string, payload: unknown) => app.inject({ method: "PUT", url: `/v2/instruments/${digest}`, headers: auth, payload: payload as Record<string, unknown> });
+      const installed = await put("digest-verbatim", verbatim);
+      expect(installed.statusCode).toBe(200);
+      // The verbatim settings digest covers the instrument prompt alone, so it does not depend on the broker's worker policy.
+      expect(JSON.parse(installed.body)).toEqual({ ok: true, ...envelope, digest: "digest-verbatim", settingsSha256: installedSettingsSha256("any policy", verbatim as never), transport: { messages: "verbatim" } });
+      expect(JSON.parse((await put("digest-verbatim", verbatim)).body).settingsSha256).toBe(JSON.parse(installed.body).settingsSha256);
+      // The same digest as another mode is another instrument.
+      expect(JSON.parse((await put("digest-verbatim", { ...verbatim, transport: { messages: "policy-wrapped" } })).body)).toMatchObject({ ok: false, code: "INSTRUMENT_DIGEST_CONFLICT" });
+      expect(JSON.parse((await put("digest-verbatim", { ...verbatim, transport: undefined })).body)).toMatchObject({ ok: false, code: "INSTRUMENT_DIGEST_CONFLICT" });
+      for (const transport of [{ messages: "raw" }, { messages: "verbatim", sentBytesRecorded: true }]) {
+        const invalid = await put("digest-invalid", { ...instrument, transport });
+        expect(invalid.statusCode, JSON.stringify(transport)).toBe(400);
+        expect(JSON.parse(invalid.body)).toMatchObject({ code: "INVALID_INSTRUMENT" });
+      }
+      // Spelling out the default installs the instrument a bundle without transport is.
+      const plain = await put("digest-plain", instrument);
+      const explicit = await put("digest-plain", { ...instrument, transport: { messages: "policy-wrapped" } });
+      expect(explicit.statusCode).toBe(200);
+      expect(JSON.parse(explicit.body)).toMatchObject({ settingsSha256: JSON.parse(plain.body).settingsSha256, transport: { messages: "policy-wrapped" } });
+      const listed = JSON.parse((await app.inject({ method: "GET", url: "/v2/instruments", headers: auth })).body) as { instruments: { digest: string; transport: unknown }[] };
+      expect(listed.instruments.map((entry) => [entry.digest, entry.transport]).sort()).toEqual([["digest-plain", { messages: "policy-wrapped" }], ["digest-verbatim", { messages: "verbatim" }]]);
     } finally { await app.close(); }
   });
 });

@@ -15,10 +15,10 @@ import { BulkResponseTransport, shapeLikeNamespaceProxy, type BulkRequestScope, 
 import { EgressPolicy, proxyConnect, proxyHttp } from "./egress.js";
 import { ClaudeOAuthRelay } from "./claude-oauth-relay.js";
 import { noUsage, UsageParser } from "./usage.js";
-import { responseOutputText } from "./responses-output.js";
+import { chatCompletionOutputText, responseOutputText } from "./responses-output.js";
 import { responseSchemaForProvider } from "./response-schema.js";
-import { effectiveSettings, finishReasonOf, serverFingerprint, settingsSha256 } from "./fingerprint.js";
-import { instrumentBundleZod, instrumentCall, instrumentMaxTokens, instrumentSystemPrompt, installedSettingsSha256, type InstrumentBundle } from "./instruments.js";
+import { canonicalJson, effectiveSettings, finishReasonOf, serverFingerprint, settingsSha256, sha256Hex } from "./fingerprint.js";
+import { INSTRUMENT_MESSAGE_MISMATCH, instrumentBundleZod, instrumentCall, instrumentMaxTokens, instrumentMessageMode, instrumentSystemPrompt, installedSettingsSha256, storedInstrumentBundle, storedMessageMode, verbatimInstrumentCall, type InstrumentBundle } from "./instruments.js";
 import { instrumentDigestOf, outputDigest } from "./outbox.js";
 import { bulkRetryFromEnvironment, failureCodeForStatus, PAUSE_HTTP_STATUS, resumeAfterFromHeaders, retryDelayMs, RETRYABLE_HTTP_STATUS, RETRYABLE_TRANSPORT_CODES, sleep, type BulkRetryOptions } from "./retry.js";
 import { PRINCIPAL_PAUSE_REASONS, principalPauseCode, principalPauseOf, type PrincipalAdmission, type PrincipalHooks, type PrincipalItemKey, type PrincipalPauseReason } from "./principals-schema.js";
@@ -101,14 +101,23 @@ function publicSummary({ job, revision, progress }: { job: WorkerJobHeader; revi
 }
 function queryPage(url: URL): Required<PageOptions> { return pageOptions({ after: Number(url.searchParams.get("after") ?? 0), limit: Number(url.searchParams.get("limit") ?? 100) }); }
 /** Status codes of socket errors that are the caller's fault rather than a conflict. */
-const BAD_REQUEST_CODES = new Set(["INSTRUMENT_NOT_ALLOWED", "INSTRUMENT_REQUEST_CONFLICT"]);
+const BAD_REQUEST_CODES = new Set(["INSTRUMENT_NOT_ALLOWED", "INSTRUMENT_REQUEST_CONFLICT", INSTRUMENT_MESSAGE_MISMATCH]);
+/** Codes a bulk item records when its request is refused before any provider call (receipt-less); anything else is INVALID_REQUEST. */
+const ITEM_REFUSAL_CODES = new Set([INSTRUMENT_MESSAGE_MISMATCH, "PRINCIPAL_REQUIRED"]);
+const VERBATIM_PRINCIPAL_REQUIRED = "A verbatim instrument runs only over a run principal socket granted its digest; chat-turn attempt authority cannot bypass the worker policy.";
 export type AdvancedRuntimeOptions = { store?: AdvancedStoreOptions; transport?: BulkResponseTransport; retry?: BulkRetryOptions };
 /**
  * A running job. `stopping`: the daemon is shutting down a principal job; what is in flight
  * returns to the queue unsettled and the job keeps its state, so restart recovery requeues it.
  */
 type ActiveJob = { cancelled: boolean; stopping: boolean; principal: boolean; abort: AbortController; reason?: string };
-type BuiltBulkRequest = { body: Buffer; model: string; settingsSha256: string };
+/**
+ * One item's provider request. `bodySha256` digests the bytes sent; `requestSha256` the canonical JSON of the
+ * body (equal for verbatim calls, whose body is that canonical JSON). `api` names the upstream route: verbatim
+ * instruments are chat-completions requests, everything else goes to the Responses API.
+ */
+type BuiltBulkRequest = { body: Buffer; model: string; settingsSha256: string; bodySha256: string; requestSha256: string; api: "responses" | "chat" };
+const BULK_PATHS: Record<BuiltBulkRequest["api"], string> = { responses: "/v1/responses", chat: "/v1/chat/completions" };
 /** One bulk call: either never dispatched (no receipt) or dispatched with its transport receipt. */
 type BulkOutcome =
   | { dispatched: false; code: "CANCELLED" | "PROVIDER_PAUSED" | "PROVIDER_AUTH_REQUIRED"; message: string }
@@ -118,7 +127,7 @@ type DispatchedBulkOutcome = Extract<BulkOutcome, { dispatched: true }>;
 /** What an item records of the call that settles it; `attempts` counts the provider calls made for the item. */
 function measuredFields(call: DispatchedBulkOutcome, attempts: number): Partial<ItemResult> {
   const { receipt } = call;
-  return { usage: receipt.usage, model: receipt.model, promptSha256: receipt.promptSha256, attempts, finishReason: call.finishReason, ...(receipt.serverFingerprint ? { serverFingerprint: receipt.serverFingerprint } : {}), ...(receipt.settingsSha256 ? { settingsSha256: receipt.settingsSha256 } : {}) };
+  return { usage: receipt.usage, model: receipt.model, promptSha256: receipt.promptSha256, attempts, finishReason: call.finishReason, ...(receipt.serverFingerprint ? { serverFingerprint: receipt.serverFingerprint } : {}), ...(receipt.settingsSha256 ? { settingsSha256: receipt.settingsSha256 } : {}), ...(receipt.requestSha256 ? { requestSha256: receipt.requestSha256 } : {}) };
 }
 export class AdvancedRuntime {
   private driver: RuntimeDriver | null = null;
@@ -216,9 +225,13 @@ export class AdvancedRuntime {
 
   // ------------------------------------------------------------------ instruments (pcp/2 instrumentMode)
 
-  /** Allow-lists an instrument bundle under its opaque digest; the digest is never recomputed here. */
+  /**
+   * Allow-lists an instrument bundle under its opaque digest; the digest is never recomputed here. A
+   * policy-wrapped bundle is stored without `transport` (storedInstrumentBundle), so spelling out the default
+   * installs the same instrument and daemons from before transport modes still read it.
+   */
   installInstrument(digest: string, body: unknown): InstrumentRecord {
-    const bundle = instrumentBundleZod.parse(body);
+    const bundle = storedInstrumentBundle(instrumentBundleZod.parse(body));
     if (bundle.responseSchema) { try { compileSchema(bundle.responseSchema); } catch (error) { throw new PuppenclawError("INVALID_INSTRUMENT", `responseSchema is not a valid JSON Schema: ${message(error)}`); } }
     return this.store.putInstrument(digest, bundle, installedSettingsSha256(WORKER_POLICY, bundle));
   }
@@ -325,7 +338,7 @@ export class AdvancedRuntime {
     const json = (value: unknown) => { res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" }); res.end(JSON.stringify(value)); };
     if (/^http:\/\//u.test(req.url ?? "")) { await proxyHttp(this.policy, req, res); return; }
     if (path.startsWith("/native/")) { await this.native(p, req, res); return; }
-    if (req.method === "GET" && ["/configs", "/configs/list"].includes(path)) { json({ version: 1, revision: p.config.revision, capacity: { scope: "provider", providers: [...new Set(p.config.workers.map((w) => w.modelProvider.id))].map((providerId) => ({ providerId, ...(this.bulkConcurrency.group(providerId) ? { capacityGroup: this.bulkConcurrency.group(providerId) } : {}), ...this.bulkConcurrency.snapshot(providerId) })) }, authorization: { publicLiteratureAllowed: this.principals?.legacyAttemptAuthority !== false && !p.jobId && p.permissionMode === "approve-all" && p.interactionMode === "execute", attemptId: p.attemptId, workspace: p.directory }, workers: p.config.workers.map((w) => ({ id: w.id, assignment: w.assignment, providerId: w.modelProvider.id, model: w.modelProvider.model, modelProvider: { id: w.modelProvider.id, model: w.modelProvider.model, kind: w.modelProvider.kind, label: w.modelProvider.label, reasoningProfile: w.modelProvider.reasoningProfile }, agent: w.agent, effort: w.effort, ...(w.evidencePolicy ? { evidencePolicy: w.evidencePolicy } : {}), bulkConcurrencyLimit: this.bulkConcurrency.limit(w.modelProvider.id), bulkAvailable: this.principals?.legacyAttemptAuthority !== false && w.modelProvider.kind === "codex-openai-compatible" })), instrumentMode: 1, instruments: this.store.instruments().map((record) => ({ digest: record.digest, instrumentId: record.bundle.instrumentId, version: record.bundle.version, itemsPerCall: record.bundle.itemsPerCall })) }); return; }
+    if (req.method === "GET" && ["/configs", "/configs/list"].includes(path)) { json({ version: 1, revision: p.config.revision, capacity: { scope: "provider", providers: [...new Set(p.config.workers.map((w) => w.modelProvider.id))].map((providerId) => ({ providerId, ...(this.bulkConcurrency.group(providerId) ? { capacityGroup: this.bulkConcurrency.group(providerId) } : {}), ...this.bulkConcurrency.snapshot(providerId) })) }, authorization: { publicLiteratureAllowed: this.principals?.legacyAttemptAuthority !== false && !p.jobId && p.permissionMode === "approve-all" && p.interactionMode === "execute", attemptId: p.attemptId, workspace: p.directory }, workers: p.config.workers.map((w) => ({ id: w.id, assignment: w.assignment, providerId: w.modelProvider.id, model: w.modelProvider.model, modelProvider: { id: w.modelProvider.id, model: w.modelProvider.model, kind: w.modelProvider.kind, label: w.modelProvider.label, reasoningProfile: w.modelProvider.reasoningProfile }, agent: w.agent, effort: w.effort, ...(w.evidencePolicy ? { evidencePolicy: w.evidencePolicy } : {}), bulkConcurrencyLimit: this.bulkConcurrency.limit(w.modelProvider.id), bulkAvailable: this.principals?.legacyAttemptAuthority !== false && w.modelProvider.kind === "codex-openai-compatible" })), instrumentMode: 1, instruments: this.store.instruments().filter((record) => storedMessageMode(record.bundle) === "policy-wrapped").map((record) => ({ digest: record.digest, instrumentId: record.bundle.instrumentId, version: record.bundle.version, itemsPerCall: record.bundle.itemsPerCall, transport: { messages: "policy-wrapped" } })) }); return; }
     if (req.method === "GET" && path === "/jobs") {
       if (summary) json(this.jobSummaries(p.parentSessionName, queryPage(url)));
       else { const jobs = this.store.jobs(p.parentSessionName); json({ jobs: jobs.map(publicJob) }); this.observeJobs(p, jobs); } return;
@@ -371,8 +384,10 @@ export class AdvancedRuntime {
     if (p.permissionMode === "deny-all") throw new PuppenclawError("WORKER_PERMISSION_DENIED", "This parent turn cannot launch worker tools.");
     if (kind === "bulk" && (request as BulkSubmit).schema) compileSchema((request as BulkSubmit).schema!);
     if (kind === "bulk" && (request as BulkSubmit).instrumentDigest) {
-      this.installedInstrument((request as BulkSubmit).instrumentDigest!);
+      const instrument = this.installedInstrument((request as BulkSubmit).instrumentDigest!);
       if ((request as BulkSubmit).schema) throw new PuppenclawError("INSTRUMENT_REQUEST_CONFLICT", "An instrument job takes its response schema from the installed instrument.");
+      // A verbatim instrument bypasses the worker policy: only a principal granted its digest (admitJob above) runs it.
+      if (instrumentMessageMode(instrument) === "verbatim" && p.principalId === undefined) throw new PuppenclawError("PRINCIPAL_REQUIRED", VERBATIM_PRINCIPAL_REQUIRED);
     }
     const job: WorkerJob = { jobId: randomUUID(), kind, state: "queued", parentSessionName: p.parentSessionName, attemptId: p.attemptId,
       configRevision: p.config.revision, config, idempotencyKey: request.idempotencyKey, fingerprint, createdAt: timestamp(), updatedAt: timestamp(), request, results: [], ...(p.ownerKey ? { ownerKey: p.ownerKey } : {}), ...(resumedFromJobId ? { resumedFromJobId } : {}),
@@ -490,9 +505,23 @@ export class AdvancedRuntime {
     const current = this.store.jobHeader(job.jobId)!;
     if (!["cancelled", "paused"].includes(current.state)) { const counts = this.store.progress(job.jobId); this.store.updateHeader(job.jobId, { state: counts.completed === counts.total ? "completed" : "failed", updatedAt: timestamp() }); }
   }
-  /** The request body of one item call, shaped like the namespace proxy when it goes to the upstream directly. */
+  /**
+   * The request body of one item call. Policy-wrapped calls are Responses requests, shaped like the namespace
+   * proxy when they go to the upstream directly. A verbatim instrument call is the executor's own chat-completions
+   * request, checked against the installed bundle (verbatimInstrumentCall) and sent as its canonical JSON with
+   * nothing added but the bundle's response format: no worker policy, no assignment, no proxy shaping (the
+   * namespace proxy forwards chat completions unchanged as well). Throws when the item may not be sent.
+   */
   private buildBulkRequest(job: WorkerJob, item: BulkSubmit["items"][number], instrument: InstrumentBundle | undefined, route: BulkRoute): BuiltBulkRequest {
     const provider = job.config.modelProvider, request = job.request as BulkSubmit;
+    if (instrument && instrumentMessageMode(instrument) === "verbatim") {
+      // submit() refuses attempt authority; a stored job reaching dispatch some other way is held to the same rule.
+      if (job.principalId === undefined) throw new PuppenclawError("PRINCIPAL_REQUIRED", VERBATIM_PRINCIPAL_REQUIRED);
+      const call = verbatimInstrumentCall(instrument, item.input, provider.model);
+      const verbatim = { ...call.request, ...(instrument.responseSchema ? { response_format: { type: "json_schema", json_schema: { name: "worker_result", strict: true, schema: responseSchemaForProvider(instrument.responseSchema, provider) } } } : {}) };
+      const text = canonicalJson(verbatim), digest = sha256Hex(text);
+      return { body: Buffer.from(text), model: provider.model, settingsSha256: settingsSha256(effectiveSettings(verbatim)), bodySha256: digest, requestSha256: digest, api: "chat" };
+    }
     let payload: Record<string, unknown>;
     if (instrument) {
       const call = instrumentCall(instrument, item.input);
@@ -513,7 +542,8 @@ export class AdvancedRuntime {
         ...(request.schema ? { text: { format: { type: "json_schema", name: "worker_result", strict: true, schema: responseSchemaForProvider(request.schema, provider) } } } : {}) };
     }
     if (route.direct) shapeLikeNamespaceProxy(payload);
-    return { body: Buffer.from(JSON.stringify(payload)), model: provider.model, settingsSha256: settingsSha256(effectiveSettings(payload)) };
+    const text = JSON.stringify(payload);
+    return { body: Buffer.from(text), model: provider.model, settingsSha256: settingsSha256(effectiveSettings(payload)), bodySha256: sha256Hex(text), requestSha256: sha256Hex(canonicalJson(payload)), api: "responses" };
   }
   /** One item: its calls (retried on transient failures) and its single settlement; false when it did not settle. */
   private async runItem(job: WorkerJob, p: RuntimeParticipant, item: BulkSubmit["items"][number], base: ItemResult, instrument: InstrumentBundle | undefined, validate: ValidateFunction | undefined, active: ActiveJob, lineage: string): Promise<boolean> {
@@ -522,7 +552,11 @@ export class AdvancedRuntime {
     const route = this.bulkTransport.route(provider, this.bulkConcurrency.poolKey(provider.id), this.bulkConcurrency.limit(provider.id));
     let request: BuiltBulkRequest;
     try { request = this.buildBulkRequest(job, item, instrument, route); }
-    catch (error) { this.settleBulkItem(job, base, { state: "failed", error: message(error), errorCode: "INVALID_REQUEST" }); return true; }
+    catch (error) {
+      // Refused before any provider call or principal admission: the item settles failed without a receipt.
+      const errorCode = error instanceof PuppenclawError && ITEM_REFUSAL_CODES.has(error.code) ? error.code : "INVALID_REQUEST";
+      this.settleBulkItem(job, base, { state: "failed", error: message(error), errorCode }); return true;
+    }
     let outcome: BulkOutcome, attempt = 0, lastCall: DispatchedBulkOutcome | undefined;
     for (;;) {
       attempt += 1;
@@ -583,7 +617,7 @@ export class AdvancedRuntime {
       return true;
     }
     const truncated = outcome.finishReason === "length";
-    let output: unknown = responseOutputText(outcome.payload), failure: { error: string; errorCode: string } | undefined;
+    let output: unknown = request.api === "chat" ? chatCompletionOutputText(outcome.payload) : responseOutputText(outcome.payload), failure: { error: string; errorCode: string } | undefined;
     if (validate) {
       try { output = JSON.parse(String(output)); } catch { failure = { error: truncated ? "Provider output was cut at the output-token limit and is not valid structured JSON." : "Provider returned malformed structured JSON.", errorCode: "STRUCTURED_OUTPUT_INVALID" }; }
       if (!failure && !validate(output)) failure = { error: `Provider output failed schema validation: ${ajv.errorsText(validate.errors)}`, errorCode: "STRUCTURED_OUTPUT_INVALID" };
@@ -632,11 +666,11 @@ export class AdvancedRuntime {
       const key = provider.authTokenEnv && process.env[provider.authTokenEnv];
       if (!key) return { dispatched: false, code: "PROVIDER_AUTH_REQUIRED", message: "Provider API credential is unavailable." };
       receipt = { version: 1, requestId, parentSessionName: p.parentSessionName, sessionName: p.sessionName, attemptId: p.attemptId, jobId: job.jobId, ...(p.ownerKey ? { ownerKey: p.ownerKey } : {}), itemId,
-        providerId: provider.id, model: request.model, role: "subagent", promptSha256: hash(request.body.toString()), state: "running", authTransport: "authorization", usage: noUsage(), createdAt: timestamp(), updatedAt: timestamp(),
-        attempt, settingsSha256: request.settingsSha256, serverFingerprint: serverFingerprint({ model: request.model }), ...(instrumentDigest ? { instrumentDigest } : {}) };
+        providerId: provider.id, model: request.model, role: "subagent", promptSha256: request.bodySha256, state: "running", authTransport: "authorization", usage: noUsage(), createdAt: timestamp(), updatedAt: timestamp(),
+        attempt, settingsSha256: request.settingsSha256, requestSha256: request.requestSha256, serverFingerprint: serverFingerprint({ model: request.model }), ...(instrumentDigest ? { instrumentDigest } : {}) };
       this.publish(receipt, false);
       scope = this.bulkTransport.start(abort.signal, route.dispatcher);
-      const response = await scope.fetch(upstreamUrl(route.provider, "/v1/responses"), { method: "POST", headers: { authorization: `Bearer ${key}`, "content-type": "application/json" }, body: request.body, redirect: "manual" });
+      const response = await scope.fetch(upstreamUrl(route.provider, BULK_PATHS[request.api]), { method: "POST", headers: { authorization: `Bearer ${key}`, "content-type": "application/json" }, body: request.body, redirect: "manual" });
       receipt.httpStatus = response.status;
       const chunks: Buffer[] = []; let length = 0;
       if (response.body) for await (const chunk of response.body) { const data = Buffer.from(chunk); length += data.length; if (length > 16 * 1024 * 1024) throw new Error("Provider JSON exceeded 16 MiB."); chunks.push(data); }

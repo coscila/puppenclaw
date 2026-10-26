@@ -27,6 +27,7 @@ import {
   type PrincipalState,
   type PrincipalUsage
 } from "./principals-schema.js";
+import { INSTRUMENT_MESSAGE_MISMATCH, storedMessageMode } from "./instruments.js";
 import { PrincipalStore, type PrincipalAuditEntry } from "./principals-store.js";
 import { publicJob, type AdvancedRuntime } from "./runtime.js";
 import { pageOptions } from "./store.js";
@@ -161,6 +162,7 @@ function socketStatus(error: unknown): [number, string] {
       return [403, error.code];
     case "INSTRUMENT_NOT_ALLOWED":
     case "INSTRUMENT_REQUEST_CONFLICT":
+    case INSTRUMENT_MESSAGE_MISMATCH:
       return [400, error.code];
     case "WORKER_NOT_FOUND":
     case "WORKER_CONFIG_NOT_FOUND":
@@ -710,10 +712,12 @@ export class PrincipalRegistry implements PrincipalHooks {
         publicLiteratureAllowed: record.kind === "run" && state === "active", instruments: grants.instruments
       },
       principal: { id: record.id, kind: record.kind, runId: record.runId, state, grants, revision: record.revision, usage: this.usageView(record, entry.usage, entry.active) },
-      // Instrument mode, like the turn socket, but only the installed instruments this principal is granted.
+      // Instrument mode, like the turn socket, but only the installed instruments this principal is granted,
+      // verbatim ones included (instrumentVerbatim: their items are the executor's complete requests).
       instrumentMode: 1,
+      instrumentVerbatim: 1,
       instruments: this.runtime.instruments().filter((installed) => grants.instruments.includes(installed.digest))
-        .map((installed) => ({ digest: installed.digest, instrumentId: installed.bundle.instrumentId, version: installed.bundle.version, itemsPerCall: installed.bundle.itemsPerCall })),
+        .map((installed) => ({ digest: installed.digest, instrumentId: installed.bundle.instrumentId, version: installed.bundle.version, itemsPerCall: installed.bundle.itemsPerCall, transport: { messages: storedMessageMode(installed.bundle) } })),
       workers: participant.config.workers.map((worker) => ({
         id: worker.id, assignment: worker.assignment, providerId: worker.modelProvider.id, model: worker.modelProvider.model,
         modelProvider: { id: worker.modelProvider.id, model: worker.modelProvider.model, kind: worker.modelProvider.kind, label: worker.modelProvider.label, reasoningProfile: worker.modelProvider.reasoningProfile },

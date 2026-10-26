@@ -165,9 +165,9 @@ describe("P1 broker outbox and feed", () => {
     expect(last).toMatchObject({ jobId: "j", ownerKey: "owner-key-0123456789", principalId: null, runId: null, state: "failed", instrumentDigest: null, parentSessionName: "parent", attemptId: "attempt",
       counts: { total: 3, queued: 1, running: 0, succeeded: 0, failed: 1, cancelled: 0, truncated: 1 } });
     const truncated = page.events[2]!.payload as BrokerReceiptPayload;
-    expect(Object.keys(truncated).sort()).toEqual(["attempt", "endedAt", "error", "finishReason", "instrumentDigest", "itemId", "jobId", "model", "output", "outputBytes", "outputDigest", "serverFingerprint", "settingsSha256", "startedAt", "status", "usage"]);
+    expect(Object.keys(truncated).sort()).toEqual(["attempt", "endedAt", "error", "finishReason", "instrumentDigest", "itemId", "jobId", "model", "output", "outputBytes", "outputDigest", "requestSha256", "serverFingerprint", "settingsSha256", "startedAt", "status", "usage"]);
     expect(truncated).toMatchObject({ jobId: "j", itemId: "one", attempt: 1, status: "truncated", finishReason: "length", model: "served-model", serverFingerprint: "fp_test",
-      settingsSha256: "b".repeat(64), usage: { input: 10, output: 2, cacheRead: 0, cacheWrite: 0 }, output: "answer one", outputBytes: 10, error: null,
+      settingsSha256: "b".repeat(64), requestSha256: null, usage: { input: 10, output: 2, cacheRead: 0, cacheWrite: 0 }, output: "answer one", outputBytes: 10, error: null,
       startedAt: "2026-10-25T00:00:01.000Z", endedAt: "2026-10-25T00:00:02.000Z" });
     expect(truncated.outputDigest).toMatch(/^[0-9a-f]{64}$/u);
     expect((page.events[3]!.payload as BrokerReceiptPayload)).toMatchObject({ status: "failed", error: { code: "PROVIDER_UNREACHABLE", retryable: true } });

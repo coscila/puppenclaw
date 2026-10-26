@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyReply } from "fastify";
 import { z, ZodError } from "zod";
 
+import { storedMessageMode } from "../advanced/instruments.js";
 import type { AdvancedRuntime } from "../advanced/runtime.js";
 import { EVENT_PAGE_DEFAULT, EVENT_PAGE_MAX, EVENT_WAIT_MAX_MS } from "../advanced/outbox.js";
 import { FeedCursorError, InstrumentConflictError } from "../advanced/store.js";
@@ -20,7 +21,8 @@ import { identityEnvelope, type DaemonIdentity } from "./identity.js";
  * - POST /v2/events/ack {feedId, through}: durable, never moves backwards;
  *   another feedId is refused (FEED_REPLACED).
  * - PUT  /v2/instruments/{digest} and GET /v2/instruments: the instrument
- *   allow-list (see src/advanced/instruments.ts).
+ *   allow-list (see src/advanced/instruments.ts). Both answer each instrument's
+ *   `transport: {messages: "policy-wrapped" | "verbatim"}` (instrumentVerbatim:1).
  */
 export type V2BrokerRouteDeps = { identity: DaemonIdentity; advanced: AdvancedRuntime };
 
@@ -84,7 +86,7 @@ export function registerV2BrokerRoutes(app: FastifyInstance, deps: V2BrokerRoute
     if (!digest.success) return refuse(reply, 400, "INVALID_INSTRUMENT_DIGEST", issues(digest.error));
     try {
       const record = deps.advanced.installInstrument(digest.data, request.body);
-      return { ok: true, ...envelope(), digest: record.digest, settingsSha256: record.settingsSha256 };
+      return { ok: true, ...envelope(), digest: record.digest, settingsSha256: record.settingsSha256, transport: { messages: storedMessageMode(record.bundle) } };
     } catch (error) {
       if (error instanceof InstrumentConflictError) return refuse(reply, 409, error.code, error.message);
       if (error instanceof ZodError) return refuse(reply, 400, "INVALID_INSTRUMENT", issues(error));
@@ -99,6 +101,7 @@ export function registerV2BrokerRoutes(app: FastifyInstance, deps: V2BrokerRoute
       instrumentId: record.bundle.instrumentId,
       version: record.bundle.version,
       itemsPerCall: record.bundle.itemsPerCall,
+      transport: { messages: storedMessageMode(record.bundle) },
       settingsSha256: record.settingsSha256,
       installedAt: record.installedAt
     }));

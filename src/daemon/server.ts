@@ -511,7 +511,9 @@ export async function createDaemonServer(params: {
     // compactStatus: status view=summary and transcriptLimit, GET /session/:name/transcript,
     // and start/send resultView=turn; every one is opt-in per request.
     // eventFeed/brokerOutbox: GET /v2/events and POST /v2/events/ack over the broker
-    // outbox; instrumentMode: PUT|GET /v2/instruments and bulk jobs naming a digest.
+    // outbox; instrumentMode: PUT|GET /v2/instruments and bulk jobs naming a digest;
+    // instrumentVerbatim: bundles with transport.messages "verbatim", whose items are the
+    // executor's complete requests, sent unchanged and receipted with requestSha256.
     features: () => ({
       health: 1,
       opsIdle: 1,
@@ -522,6 +524,7 @@ export async function createDaemonServer(params: {
       eventFeed: 1,
       brokerOutbox: 1,
       instrumentMode: 1,
+      instrumentVerbatim: 1,
       // Run principals need the bearer token; legacyAttemptAuthority says chat turns still carry bulk authority.
       ...(authToken.length > 0 ? { principals: 1 } : {}),
       ...(principals.legacyAttemptAuthority ? { legacyAttemptAuthority: 1 } : {})

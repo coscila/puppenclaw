@@ -9,7 +9,10 @@ export const bulkSubmitZod = z.object({
   configId: z.string().min(1), idempotencyKey: z.string().min(1).max(128),
   items: z.array(z.object({ id: z.string().min(1).max(200), input: z.union([z.string(), z.record(z.string(), z.unknown())]) }).strict()).min(1),
   schema: z.record(z.string(), z.unknown()).optional(), concurrency: z.number().int().positive().safe().default(60),
-  /** Instrument mode (capability instrumentMode): request settings come from the installed bundle. */
+  /**
+   * Instrument mode (capability instrumentMode): request settings come from the installed bundle. A verbatim
+   * bundle (capability instrumentVerbatim) takes each item as the executor's complete request instead.
+   */
   instrumentDigest: instrumentDigestZod.optional(),
 }).strict().refine((r) => new Set(r.items.map((x) => x.id)).size === r.items.length, "Item ids must be unique.");
 export type AgentSubmit = z.infer<typeof agentSubmitZod>;
@@ -22,6 +25,8 @@ export type ItemResult = { id: string; state: JobState; output?: unknown; provid
   /** The provider stopped at the output-token limit (finish_reason=length). */
   truncated?: boolean; finishReason?: string | null;
   serverFingerprint?: string; settingsSha256?: string; outputDigest?: string; outputBytes?: number;
+  /** sha256 of the canonical JSON of the request body the settling call sent upstream (see UsageReceipt). */
+  requestSha256?: string;
   /** Closed failure code of a settled item, e.g. PROVIDER_RATE_LIMITED or STRUCTURED_OUTPUT_INVALID. */
   errorCode?: string };
 export type WorkerJob = {
@@ -51,6 +56,12 @@ export type UsageReceipt = {
   serverFingerprint?: string;
   /** sha256 of the canonical JSON of the effective request settings. */
   settingsSha256?: string;
+  /**
+   * Bulk calls: sha256 of the canonical JSON (fingerprint.ts canonicalJson) of the request body sent
+   * upstream. A verbatim instrument call sends exactly those canonical bytes, so this is also the sha256
+   * of the bytes on the wire and the executor can recompute it from the request it built.
+   */
+  requestSha256?: string;
   finishReason?: string | null; instrumentDigest?: string;
 };
 export type RuntimeParticipant = {
