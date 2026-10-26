@@ -78,7 +78,9 @@ const bundle = (overrides: Partial<InstrumentBundle> = {}): InstrumentBundle => 
 function executorRequest(user: string, entries: number, overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return { model: "judge-model", messages: [{ role: "system", content: SYSTEM }, { role: "user", content: user }], max_tokens: Math.max(3000, 700 * entries), temperature: 0, stream: false, reasoning_effort: "none", ...overrides };
 }
+/** An item repeating the executor's whole request; `minimal` carries only what the executor must send. */
 const item = (id: string, user: string, entries: number, overrides: Record<string, unknown> = {}) => ({ id, input: { ...executorRequest(user, entries, overrides), itemCount: entries } });
+const minimal = (id: string, user: string, entries: number) => ({ id, input: { messages: executorRequest(user, entries).messages, itemCount: entries } });
 
 type Harness = { runtime: AdvancedRuntime; registry: PrincipalRegistry };
 async function harness(options: { providers: ModelProviderConfig[]; direct?: Map<string, string>; legacy?: boolean; retryAttempts?: number }): Promise<Harness> {
@@ -164,17 +166,18 @@ describe("verbatim instruments: byte identity", () => {
     expect(event).toMatchObject({ itemId: "call-1", status: "succeeded", requestSha256: digest, settingsSha256: result.settingsSha256, serverFingerprint: "fp_verbatim", instrumentDigest: DIGEST, error: null });
   });
 
-  it("sends the same bytes whatever JSON escaping the executor used, and through the pooled direct upstream unshaped", async () => {
+  it("sends the same bytes whether the item repeats the settings or not, whatever JSON escaping the executor used, through the pooled direct upstream unshaped", async () => {
     const proxy = await upstream();
     const direct = await upstream();
     const registered = provider(proxy.url);
     const { runtime, registry } = await harness({ providers: [registered], direct: new Map([[proxy.url, direct.url]]) });
     runtime.installInstrument(DIGEST, bundle());
     const socket = await principal(registry, "run:census", [DIGEST]);
-    const submission = (key: string) => ({ configId: "judge", idempotencyKey: key, instrumentDigest: DIGEST, items: [item("call-1", TRICKY, 2), item("call-2", "OCSL_INITIAL_PLAN_NO_TOOLS\nShort call", 1)] });
-    const utf8 = (await unix(socket, "/bulk/submit", submission("utf8"))).body;
-    // A Python executor escapes every non-ASCII character by default; the daemon parses it back to the same strings.
-    const escaped = (await unix(socket, "/bulk/submit", undefined, asciiJson(submission("ascii")))).body;
+    const submission = (key: string, form: typeof item | typeof minimal) => ({ configId: "judge", idempotencyKey: key, instrumentDigest: DIGEST, items: [form("call-1", TRICKY, 2), form("call-2", "OCSL_INITIAL_PLAN_NO_TOOLS\nShort call", 1)] });
+    const utf8 = (await unix(socket, "/bulk/submit", submission("utf8", item))).body;
+    // A Python executor escapes every non-ASCII character by default and may send only its messages and entry
+    // count; the daemon parses the same strings back and builds the same request from the bundle.
+    const escaped = (await unix(socket, "/bulk/submit", undefined, asciiJson(submission("ascii", minimal)))).body;
     for (const id of [utf8.jobId, escaped.jobId]) expect((await settledJob(runtime, id)).state).toBe("completed");
     expect(proxy.calls).toHaveLength(0);
     expect(direct.calls).toHaveLength(4);
@@ -214,10 +217,8 @@ describe("verbatim instruments: refusals", () => {
       ["content-parts", { messages: [system, { role: "user", content: [{ type: "text", text: "x" }] }] }, /content must be a string/u],
       ["model", { model: "other-model" }, /is not the worker's model/u],
       ["temperature", { temperature: 0.7 }, /temperature 0.7 differs/u],
-      ["temperature-missing", { temperature: undefined }, /temperature absent/u],
       ["seed", { seed: 1234 }, /seed 1234 differs/u],
       ["reasoning", { reasoning_effort: "high" }, /reasoning_effort "high" differs/u],
-      ["reasoning-missing", { reasoning_effort: undefined }, /reasoning_effort absent/u],
       ["max-tokens", { max_tokens: 2999 }, /max_tokens 2999 differs from max\(3000, 700 × 1\) = 3000/u],
       ["item-count-missing", { itemCount: undefined }, /itemCount absent/u],
       ["item-count-above", { itemCount: 41, max_tokens: 28_700 }, /itemCount 41/u],
@@ -226,16 +227,21 @@ describe("verbatim instruments: refusals", () => {
       ["extra-field", { top_p: 0.9 }, /fields outside the instrument request: top_p/u],
       ["response-format", { response_format: { type: "json_object" } }, /fields outside the instrument request: response_format/u],
       ["stream", { stream: true }, /not streamed/u],
-      ["string-input", "ITEMS (1):\n### id=1", /chat request object/u]
+      ["string-input", "ITEMS (1):\n### id=1", /an object \{messages, itemCount\}/u]
     ];
-    const items = [item("valid", "ITEMS (1):\n### id=1", 1), ...cases.map(([id, change]) => typeof change === "string" ? { id, input: change } : { id, input: { ...executorRequest("ITEMS (1):\n### id=1", 1), itemCount: 1, ...change } })];
+    // Valid: the whole request repeated, only messages and entry count, or some settings left out.
+    const { temperature: _temperature, reasoning_effort: _effort, ...partial } = executorRequest("ITEMS (1):\n### id=1", 1);
+    const valid = [item("valid", "ITEMS (1):\n### id=1", 1), minimal("minimal", "ITEMS (1):\n### id=1", 1), { id: "partial", input: { ...partial, itemCount: 1 } }];
+    const items = [...valid, ...cases.map(([id, change]) => typeof change === "string" ? { id, input: change } : { id, input: { ...executorRequest("ITEMS (1):\n### id=1", 1), itemCount: 1, ...change } })];
     const job = (await unix(socket, "/bulk/submit", { configId: "judge", idempotencyKey: "refusals", instrumentDigest: DIGEST, concurrency: 4, items })).body;
     const done = await settledJob(runtime, job.jobId);
-    // Only the valid item reached the upstream.
-    expect(up.calls).toHaveLength(1);
+    // Only the valid items reached the upstream, each as the executor's own request.
+    expect(up.calls).toHaveLength(3);
+    const expectedBody = Buffer.from(canonicalJson(executorRequest("ITEMS (1):\n### id=1", 1)));
+    expect(up.calls.every((call) => call.raw.equals(expectedBody))).toBe(true);
     expect(JSON.parse(up.calls[0]!.raw.toString()).messages).toEqual([system, user]);
     const byId = new Map(done.results.map((result) => [result.id, result]));
-    expect(byId.get("valid")).toMatchObject({ state: "completed" });
+    for (const id of ["valid", "minimal", "partial"]) expect(byId.get(id), id).toMatchObject({ state: "completed", requestSha256: sha256(expectedBody) });
     for (const [id, , pattern] of cases) {
       const result = byId.get(id)!;
       expect(result, id).toMatchObject({ state: "failed", errorCode: INSTRUMENT_MESSAGE_MISMATCH });
@@ -245,16 +251,16 @@ describe("verbatim instruments: refusals", () => {
       expect(result.usage, id).toBeNull();
     }
     expect(done.state).toBe("failed");
-    // One receipt row and one receipt event: the valid item's.
-    expect(runtime.store.jobReceipts(job.jobId).map((receipt) => receipt.itemId)).toEqual(["valid"]);
-    expect(receiptEvents(runtime, job.jobId).map((payload) => payload.itemId)).toEqual(["valid"]);
+    // Receipt rows and receipt events only for the items that were sent.
+    expect(runtime.store.jobReceipts(job.jobId).map((receipt) => receipt.itemId).sort()).toEqual(["minimal", "partial", "valid"]);
+    expect(receiptEvents(runtime, job.jobId).map((payload) => payload.itemId).sort()).toEqual(["minimal", "partial", "valid"]);
     const jobEvents = runtime.store.events(0, 1000).events.filter((event) => event.type === "broker.job" && event.jobId === job.jobId).map((event) => event.payload as BrokerJobPayload);
-    expect(jobEvents.at(-1)).toMatchObject({ state: "failed", instrumentDigest: DIGEST, counts: { total: cases.length + 1, succeeded: 1, failed: cases.length } });
-    // The principal was charged for the one item that was sent.
-    expect(registry.detail("run:census")!.usage).toMatchObject({ items: 1, inputTokens: 120, outputTokens: 30 });
+    expect(jobEvents.at(-1)).toMatchObject({ state: "failed", instrumentDigest: DIGEST, counts: { total: cases.length + 3, succeeded: 3, failed: cases.length } });
+    // The principal was charged for the three items that were sent.
+    expect(registry.detail("run:census")!.usage).toMatchObject({ items: 3, inputTokens: 360, outputTokens: 90 });
   });
 
-  it("holds seed and the item budget to the bundle: a seeded instrument needs that seed, a full call the full budget", async () => {
+  it("holds seed and the item budget to the bundle: a seeded instrument sends its seed, refuses another, and a full call needs the full budget", async () => {
     const up = await upstream();
     const { runtime, registry } = await harness({ providers: [provider(up.url)] });
     runtime.installInstrument(DIGEST, bundle({ seed: 4242, maxOutputTokens: { perItem: 64, minimum: 100 }, itemsPerCall: 4, temperature: 0.25, reasoning: "low" }));
@@ -269,9 +275,10 @@ describe("verbatim instruments: refusals", () => {
     ] })).body;
     const done = await settledJob(runtime, job.jobId);
     expect(done.results.map((result) => [result.id, result.state, result.errorCode ?? null])).toEqual([
-      ["seeded", "completed", null], ["one-entry", "completed", null], ["unseeded", "failed", INSTRUMENT_MESSAGE_MISMATCH], ["null-seed", "failed", INSTRUMENT_MESSAGE_MISMATCH], ["small-budget", "failed", INSTRUMENT_MESSAGE_MISMATCH]
+      ["seeded", "completed", null], ["one-entry", "completed", null], ["unseeded", "completed", null], ["null-seed", "failed", INSTRUMENT_MESSAGE_MISMATCH], ["small-budget", "failed", INSTRUMENT_MESSAGE_MISMATCH]
     ]);
-    expect(up.calls.map((call) => JSON.parse(call.raw.toString()) as Record<string, unknown>).map((body) => [body.seed, body.max_tokens, body.temperature, body.reasoning_effort])).toEqual([[4242, 256, 0.25, "low"], [4242, 100, 0.25, "low"]]);
+    // The item that left the seed out was sent with the bundle's seed.
+    expect(up.calls.map((call) => JSON.parse(call.raw.toString()) as Record<string, unknown>).map((body) => [body.seed, body.max_tokens, body.temperature, body.reasoning_effort])).toEqual([[4242, 256, 0.25, "low"], [4242, 100, 0.25, "low"], [4242, 100, 0.25, "low"]]);
   });
 });
 

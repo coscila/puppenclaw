@@ -507,10 +507,11 @@ export class AdvancedRuntime {
   }
   /**
    * The request body of one item call. Policy-wrapped calls are Responses requests, shaped like the namespace
-   * proxy when they go to the upstream directly. A verbatim instrument call is the executor's own chat-completions
-   * request, checked against the installed bundle (verbatimInstrumentCall) and sent as its canonical JSON with
-   * nothing added but the bundle's response format: no worker policy, no assignment, no proxy shaping (the
-   * namespace proxy forwards chat completions unchanged as well). Throws when the item may not be sent.
+   * proxy when they go to the upstream directly. A verbatim instrument call carries the executor's messages,
+   * checked against the installed bundle (verbatimInstrumentCall): they are sent unchanged in the chat-completions
+   * request of the worker's model and the bundle's settings, as its canonical JSON, with nothing added but the
+   * bundle's response format: no worker policy, no assignment, no proxy shaping (the namespace proxy forwards
+   * chat completions unchanged as well). Throws when the item may not be sent.
    */
   private buildBulkRequest(job: WorkerJob, item: BulkSubmit["items"][number], instrument: InstrumentBundle | undefined, route: BulkRoute): BuiltBulkRequest {
     const provider = job.config.modelProvider, request = job.request as BulkSubmit;

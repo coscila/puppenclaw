@@ -87,10 +87,10 @@ describe("instrument transport modes", () => {
 
 describe("verbatim instrument calls", () => {
   const verbatim: InstrumentBundle = { ...bundle, systemPrompt: "Judge each entry.\nOne line per entry.\n", transport: { messages: "verbatim" } };
-  const request = (overrides: Record<string, unknown> = {}) => ({
-    model: "judge-model", messages: [{ role: "system", content: verbatim.systemPrompt }, { role: "user", content: "ITEMS (2):\n### id=1\n### id=2" }],
-    max_tokens: 3000, temperature: 0, stream: false, reasoning_effort: "none", itemCount: 2, ...overrides
-  });
+  const messages = () => [{ role: "system", content: verbatim.systemPrompt }, { role: "user", content: "ITEMS (2):\n### id=1\n### id=2" }];
+  /** The census executor's request: chat completions with these keys (seed only when the instrument sets one). */
+  const executor = (overrides: Record<string, unknown> = {}) => ({ model: "judge-model", messages: messages(), max_tokens: 3000, temperature: 0, stream: false, reasoning_effort: "none", ...overrides });
+  const item = (overrides: Record<string, unknown> = {}) => ({ messages: messages(), itemCount: 2, ...overrides });
   const refused = (input: unknown, pattern: RegExp, target: InstrumentBundle = verbatim) => {
     let error: unknown;
     try { verbatimInstrumentCall(target, input, "judge-model"); } catch (caught) { error = caught; }
@@ -98,81 +98,81 @@ describe("verbatim instrument calls", () => {
     expect((error as Error).message).toMatch(pattern);
   };
 
-  it("returns the executor's request untouched, without itemCount", () => {
-    const input = request({ itemCount: 40, max_tokens: 28_000 });
+  it("sends the item's messages in the request of the worker's model and the bundle's settings, which is the executor's own request", () => {
+    const input = item();
     const call = verbatimInstrumentCall(verbatim, input, "judge-model");
-    expect(call.itemCount).toBe(40);
-    const { itemCount: _itemCount, ...expected } = input;
-    expect(call.request).toEqual(expected);
-    // Same values, not copies: the messages go upstream exactly as submitted.
+    expect(call).toEqual({ request: executor(), itemCount: 2 });
+    // The messages go upstream as submitted: the same array, not a copy.
     expect(call.request.messages).toBe(input.messages);
-    expect(input.itemCount).toBe(40);
-    // stream may be absent; a seed may be null while the instrument sets none; assistant turns may follow the user message.
-    const { stream: _stream, ...noStream } = request();
-    expect(verbatimInstrumentCall(verbatim, noStream, "judge-model").request).not.toHaveProperty("stream");
-    expect(verbatimInstrumentCall(verbatim, request({ seed: null }), "judge-model").request).toMatchObject({ seed: null });
-    expect(() => verbatimInstrumentCall(verbatim, request({ messages: [...request().messages, { role: "assistant", content: "{" }] }), "judge-model")).not.toThrow();
+    expect(Object.keys(call.request).sort()).toEqual(["max_tokens", "messages", "model", "reasoning_effort", "stream", "temperature"]);
+    // The executor may repeat its settings; equal ones change nothing, itemCount never goes upstream.
+    const { messages: _messages, ...settings } = executor({ max_tokens: 28_000 });
+    expect(verbatimInstrumentCall(verbatim, { ...item({ itemCount: 40 }), ...settings }, "judge-model")).toEqual({ request: executor({ max_tokens: 28_000 }), itemCount: 40 });
+    expect(verbatimInstrumentCall(verbatim, item({ seed: null, stream: false }), "judge-model").request).toEqual(executor());
+    // A seeded instrument sends its seed whether or not the item repeats it; assistant turns may follow the user message.
+    const seeded = { ...verbatim, seed: 7 };
+    expect(verbatimInstrumentCall(seeded, item(), "judge-model").request).toEqual(executor({ seed: 7 }));
+    expect(verbatimInstrumentCall(seeded, item({ seed: 7 }), "judge-model").request).toEqual(executor({ seed: 7 }));
+    expect(() => verbatimInstrumentCall(verbatim, item({ messages: [...messages(), { role: "assistant", content: "{" }] }), "judge-model")).not.toThrow();
   });
 
   it("refuses every departure from the installed bundle with INSTRUMENT_MESSAGE_MISMATCH", () => {
-    const [system, user] = request().messages as { role: string; content: string }[];
-    refused("one entry", /chat request object/u);
-    refused([request()], /chat request object/u);
-    refused(request({ messages: [{ ...system, content: `${system!.content} ` }, user] }), /system message differs from the installed instrument prompt/u);
+    const [system, user] = messages();
+    refused("one entry", /an object \{messages, itemCount\}/u);
+    refused([item()], /an object/u);
+    refused(item({ messages: [{ ...system, content: `${system!.content} ` }, user] }), /system message differs from the installed instrument prompt/u);
     // Byte for byte: the same text in another Unicode normalization form is another prompt.
-    const composed = { ...verbatim, systemPrompt: "\u00c9valuer chaque entr\u00e9e." };
+    const composed = { ...verbatim, systemPrompt: "Évaluer chaque entrée." };
     expect(composed.systemPrompt.normalize("NFD")).not.toBe(composed.systemPrompt);
-    refused(request({ messages: [{ ...system, content: composed.systemPrompt.normalize("NFD") }, user] }), /system message differs/u, composed);
-    expect(() => verbatimInstrumentCall(composed, request({ messages: [{ ...system, content: composed.systemPrompt }, user] }), "judge-model")).not.toThrow();
-    refused(request({ messages: [user] }), /first message must be the instrument's system message/u);
-    refused(request({ messages: [user, system] }), /first message must be the instrument's system message/u);
-    refused(request({ messages: [system, user, system] }), /only the first message may be a system message/u);
-    refused(request({ messages: [system, { role: "developer", content: "x" }, user] }), /role "developer"/u);
-    refused(request({ messages: [system, { role: "tool", content: "x" }, user] }), /role "tool"/u);
-    refused(request({ messages: [system, { role: "assistant", content: "x" }] }), /at least one user message/u);
-    refused(request({ messages: [system, { ...user, name: "reviewer" }] }), /exactly role and content/u);
-    refused(request({ messages: [system, { role: "user", content: [{ type: "text", text: "x" }] }] }), /content must be a string/u);
-    refused(request({ messages: [] }), /non-empty array/u);
-    refused(request({ messages: "x" }), /non-empty array/u);
-    refused(request({ model: "other-model" }), /model "other-model" is not the worker's model "judge-model"/u);
-    refused(request({ model: undefined }), /model absent/u);
-    refused(request({ temperature: 0.2 }), /temperature 0.2 differs/u);
-    refused(request({ temperature: "0" }), /temperature "0" differs/u);
-    refused(request({ temperature: undefined }), /temperature absent differs/u);
-    refused(request({ seed: 7 }), /seed 7 differs from the instrument's absent seed/u);
-    refused(request(), /seed absent differs from the instrument's 7/u, { ...verbatim, seed: 7 });
-    refused(request({ seed: 8 }), /seed 8 differs/u, { ...verbatim, seed: 7 });
-    refused(request({ reasoning_effort: "low" }), /reasoning_effort "low" differs/u);
-    refused(request({ reasoning_effort: undefined }), /reasoning_effort absent differs/u);
-    refused(request({ stream: true }), /not streamed/u);
-    refused(request({ itemCount: undefined }), /itemCount absent must declare/u);
-    refused(request({ itemCount: 0 }), /itemCount 0/u);
-    refused(request({ itemCount: 41, max_tokens: 28_700 }), /itemCount 41/u);
-    refused(request({ itemCount: 2.5 }), /itemCount 2.5/u);
-    refused(request({ itemCount: 40 }), /max_tokens 3000 differs from max\(3000, 700 × 40\) = 28000/u);
-    refused(request({ max_tokens: undefined }), /max_tokens absent differs/u);
-    refused(request({ tools: [{ type: "function", function: { name: "lookup" } }] }), /no tools \(tools\)/u);
-    refused(request({ tool_choice: "none" }), /no tools \(tool_choice\)/u);
-    refused(request({ functions: [], parallel_tool_calls: false }), /no tools \(functions, parallel_tool_calls\)/u);
-    refused(request({ top_p: 1 }), /fields outside the instrument request: top_p/u);
-    refused(request({ response_format: { type: "json_object" } }), /fields outside the instrument request: response_format/u);
-    refused(request({ max_completion_tokens: 3000, n: 2 }), /max_completion_tokens, n/u);
-    expect(() => verbatimInstrumentCall(verbatim, request(), "judge-model")).not.toThrow();
+    refused(item({ messages: [{ ...system, content: composed.systemPrompt.normalize("NFD") }, user] }), /system message differs/u, composed);
+    expect(() => verbatimInstrumentCall(composed, item({ messages: [{ ...system, content: composed.systemPrompt }, user] }), "judge-model")).not.toThrow();
+    refused(item({ messages: [user] }), /first message must be the instrument's system message/u);
+    refused(item({ messages: [user, system] }), /first message must be the instrument's system message/u);
+    refused(item({ messages: [system, user, system] }), /only the first message may be a system message/u);
+    refused(item({ messages: [system, { role: "developer", content: "x" }, user] }), /role "developer"/u);
+    refused(item({ messages: [system, { role: "tool", content: "x" }, user] }), /role "tool"/u);
+    refused(item({ messages: [system, { role: "assistant", content: "x" }] }), /at least one user message/u);
+    refused(item({ messages: [system, { ...user, name: "reviewer" }] }), /exactly role and content/u);
+    refused(item({ messages: [system, { role: "user", content: [{ type: "text", text: "x" }] }] }), /content must be a string/u);
+    refused(item({ messages: [] }), /non-empty array/u);
+    refused(item({ messages: "x" }), /non-empty array/u);
+    refused(item({ messages: undefined }), /non-empty array/u);
+    refused(item({ itemCount: undefined }), /itemCount absent must declare/u);
+    refused(item({ itemCount: 0 }), /itemCount 0/u);
+    refused(item({ itemCount: 41 }), /itemCount 41/u);
+    refused(item({ itemCount: 2.5 }), /itemCount 2.5/u);
+    refused(item({ model: "other-model" }), /model "other-model" is not the worker's model "judge-model"/u);
+    refused(item({ max_tokens: 3500 }), /max_tokens 3500 differs from max\(3000, 700 × 2\) = 3000/u);
+    refused(item({ itemCount: 40, max_tokens: 3000 }), /max_tokens 3000 differs from max\(3000, 700 × 40\) = 28000/u);
+    refused(item({ temperature: 0.2 }), /temperature 0.2 differs/u);
+    refused(item({ temperature: "0" }), /temperature "0" differs/u);
+    refused(item({ seed: 7 }), /seed 7 differs from the instrument's absent seed/u);
+    refused(item({ seed: null }), /seed null differs from the instrument's 7/u, { ...verbatim, seed: 7 });
+    refused(item({ seed: 8 }), /seed 8 differs/u, { ...verbatim, seed: 7 });
+    refused(item({ reasoning_effort: "low" }), /reasoning_effort "low" differs/u);
+    refused(item({ stream: true }), /not streamed/u);
+    refused(item({ tools: [{ type: "function", function: { name: "lookup" } }] }), /no tools \(tools\)/u);
+    refused(item({ tool_choice: "none" }), /no tools \(tool_choice\)/u);
+    refused(item({ functions: [], parallel_tool_calls: false }), /no tools \(functions, parallel_tool_calls\)/u);
+    refused(item({ top_p: 1 }), /fields outside the instrument request: top_p/u);
+    refused(item({ response_format: { type: "json_object" } }), /fields outside the instrument request: response_format/u);
+    refused(item({ max_completion_tokens: 3000, n: 2 }), /max_completion_tokens, n/u);
+    expect(() => verbatimInstrumentCall(verbatim, item(), "judge-model")).not.toThrow();
   });
 
   it("bounds the caller-supplied values and field names it echoes", () => {
     let error: Error | undefined;
     const wide = Object.fromEntries(Array.from({ length: 20 }, (_, index) => [`${"k".repeat(500)}${index}`, 1]));
-    try { verbatimInstrumentCall(verbatim, request(wide), "judge-model"); } catch (caught) { error = caught as Error; }
+    try { verbatimInstrumentCall(verbatim, item(wide), "judge-model"); } catch (caught) { error = caught as Error; }
     expect(error?.message).toMatch(/and 12 more\.$/u);
     expect(error!.message.length).toBeLessThan(1_000);
-    try { verbatimInstrumentCall(verbatim, request({ model: "m".repeat(100_000) }), "judge-model"); } catch (caught) { error = caught as Error; }
+    try { verbatimInstrumentCall(verbatim, item({ model: "m".repeat(100_000) }), "judge-model"); } catch (caught) { error = caught as Error; }
     expect(error!.message.length).toBeLessThan(300);
   });
 
   it("names the digests of both prompts when the system message differs, never their text", () => {
     let error: Error | undefined;
-    try { verbatimInstrumentCall(verbatim, request({ messages: [{ role: "system", content: "A confidential system prompt." }, { role: "user", content: "x" }] }), "judge-model"); }
+    try { verbatimInstrumentCall(verbatim, item({ messages: [{ role: "system", content: "A confidential system prompt." }, { role: "user", content: "x" }] }), "judge-model"); }
     catch (caught) { error = caught as Error; }
     expect(error?.message).toContain(sha256Hex("A confidential system prompt.").slice(0, 12));
     expect(error?.message).toContain(sha256Hex(verbatim.systemPrompt).slice(0, 12));

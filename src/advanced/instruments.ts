@@ -17,11 +17,13 @@ import { canonicalJson, sha256Hex } from "./fingerprint.js";
  * - `policy-wrapped` (the default, and what a bundle without `transport` means):
  *   the system prompt is the broker's worker policy plus the instrument prompt,
  *   and items carry only user and assistant messages.
- * - `verbatim`: an item is the executor's complete chat-completions request,
- *   system message included. The daemon checks it against the bundle and sends
- *   exactly that request upstream, with nothing added but the bundle's response
- *   format (see verbatimInstrumentCall). Only run principals granted the digest
- *   may use such an instrument.
+ * - `verbatim`: an item carries the executor's messages exactly as built,
+ *   system message included. The daemon checks them (and any request setting
+ *   the item repeats) against the bundle and sends them unchanged in the
+ *   chat-completions request of the worker's model and the bundle's settings,
+ *   with nothing added but the bundle's response format (see
+ *   verbatimInstrumentCall). Only run principals granted the digest may use
+ *   such an instrument.
  */
 export const INSTRUMENT_MESSAGE_MODES = ["policy-wrapped", "verbatim"] as const;
 export type InstrumentMessageMode = (typeof INSTRUMENT_MESSAGE_MODES)[number];
@@ -130,14 +132,19 @@ export function instrumentCall(bundle: InstrumentBundle, input: unknown): Instru
 
 /** Closed failure code of a verbatim item the daemon refuses to send (a 400-class refusal, never retried). */
 export const INSTRUMENT_MESSAGE_MISMATCH = "INSTRUMENT_MESSAGE_MISMATCH";
-/** The chat-completions fields a verbatim request may carry; everything else is refused. */
-export const VERBATIM_REQUEST_FIELDS = ["model", "messages", "max_tokens", "temperature", "seed", "reasoning_effort", "stream"] as const;
-/** Fields a verbatim item may carry: the request plus the entry count the item declares (never sent upstream). */
-const VERBATIM_ITEM_FIELDS = new Set<string>([...VERBATIM_REQUEST_FIELDS, "itemCount"]);
+/** Request settings a verbatim item may repeat; each must then equal what the daemon sends. */
+export const VERBATIM_SETTING_FIELDS = ["model", "max_tokens", "temperature", "seed", "reasoning_effort", "stream"] as const;
+/** Fields a verbatim item may carry: its messages, the entry count it declares (never sent upstream) and the settings. */
+const VERBATIM_ITEM_FIELDS = new Set<string>(["messages", "itemCount", ...VERBATIM_SETTING_FIELDS]);
 const TOOL_FIELDS = ["tools", "tool_choice", "functions", "function_call", "parallel_tool_calls"];
 const VERBATIM_ROLES = new Set(["system", "user", "assistant"]);
 
-/** One verbatim call: the executor's request exactly as submitted (without itemCount) and the entry count it declared. */
+/**
+ * One verbatim call: the chat-completions request the daemon sends and the entry count the item declared.
+ * `request` is exactly {model, messages, max_tokens, temperature, seed (only when the bundle sets one),
+ * reasoning_effort, stream: false}: the worker's model, the messages as submitted (the same array) and the
+ * bundle's settings. A census executor's own request has these keys, so it can recompute the request digest.
+ */
 export type VerbatimCall = { request: Record<string, unknown>; itemCount: number };
 
 const plainObject = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
@@ -152,23 +159,23 @@ function mismatch(reason: string): PuppenclawError {
 }
 
 /**
- * Checks one verbatim item against the installed bundle and the worker's model.
- * The item is the executor's chat-completions request plus `itemCount`, the
- * number of instrument entries the call carries. It is refused (a PuppenclawError
- * with code INSTRUMENT_MESSAGE_MISMATCH) unless:
- * - the first message is a system message equal to the installed `systemPrompt`
- *   byte for byte, and no other message is a system message;
- * - every message is exactly {role, content} with a string content and the role
- *   system, user or assistant, and at least one is a user message;
- * - `model` is the worker's model; `temperature` equals the bundle's; `seed`
- *   equals the bundle's (absent or null when the bundle has none);
- *   `reasoning_effort` equals the bundle's reasoning; `stream` is absent or false;
- * - `max_tokens` = max(minimum, perItem × itemCount), with 1 ≤ itemCount ≤ itemsPerCall;
+ * Checks one verbatim item against the installed bundle and the worker's model, and builds the request the
+ * daemon sends for it. The item carries the executor's messages exactly as built and `itemCount`, the number
+ * of instrument entries the call carries; it may repeat the settings of the request it built (`model`,
+ * `max_tokens`, `temperature`, `seed`, `reasoning_effort`, `stream`). It is refused (a PuppenclawError with
+ * code INSTRUMENT_MESSAGE_MISMATCH) unless:
+ * - the first message is a system message equal to the installed `systemPrompt` byte for byte, and no other
+ *   message is a system message;
+ * - every message is exactly {role, content} with a string content and the role system, user or assistant,
+ *   and at least one is a user message;
+ * - 1 ≤ itemCount ≤ itemsPerCall;
+ * - every setting it repeats equals what is sent: `model` the worker's model, `max_tokens`
+ *   max(minimum, perItem × itemCount), `temperature` and `reasoning_effort` the bundle's temperature and
+ *   reasoning, `seed` the bundle's (null or absent when the bundle has none), `stream` false;
  * - it names no tools and no other field.
- * The returned request is the item without `itemCount`, values untouched.
  */
 export function verbatimInstrumentCall(bundle: InstrumentBundle, input: unknown, model: string): VerbatimCall {
-  if (!plainObject(input)) throw mismatch("an item is the executor's chat request object {model, messages, max_tokens, temperature, reasoning_effort, itemCount}");
+  if (!plainObject(input)) throw mismatch("an item is an object {messages, itemCount} with the messages exactly as the executor built them");
   const tools = TOOL_FIELDS.filter((key) => Object.hasOwn(input, key));
   if (tools.length > 0) throw mismatch(`verbatim calls carry no tools (${tools.join(", ")})`);
   const extra = Object.keys(input).filter((key) => !VERBATIM_ITEM_FIELDS.has(key));
@@ -189,21 +196,23 @@ export function verbatimInstrumentCall(bundle: InstrumentBundle, input: unknown,
   }
   if (rest.some((message) => message.role === "system")) throw mismatch("only the first message may be a system message");
   if (!rest.some((message) => message.role === "user")) throw mismatch("a call needs at least one user message");
-  if (input.model !== model) throw mismatch(`model ${shown(input.model)} is not the worker's model ${shown(model)}`);
-  if (typeof input.temperature !== "number" || input.temperature !== bundle.temperature) throw mismatch(`temperature ${shown(input.temperature)} differs from the instrument's ${bundle.temperature}`);
-  if (bundle.seed === null ? input.seed !== undefined && input.seed !== null : input.seed !== bundle.seed) {
-    throw mismatch(`seed ${shown(input.seed)} differs from the instrument's ${bundle.seed === null ? "absent seed" : bundle.seed}`);
-  }
-  if (input.reasoning_effort !== bundle.reasoning) throw mismatch(`reasoning_effort ${shown(input.reasoning_effort)} differs from the instrument's ${shown(bundle.reasoning)}`);
-  if (input.stream !== undefined && input.stream !== false) throw mismatch("verbatim calls are not streamed (stream must be false or absent)");
   const itemCount = input.itemCount;
   if (typeof itemCount !== "number" || !Number.isSafeInteger(itemCount) || itemCount < 1 || itemCount > bundle.itemsPerCall) {
     throw mismatch(`itemCount ${shown(itemCount)} must declare the call's entry count, 1 to ${bundle.itemsPerCall}`);
   }
-  const expected = instrumentMaxTokens(bundle, itemCount);
-  if (input.max_tokens !== expected) {
-    throw mismatch(`max_tokens ${shown(input.max_tokens)} differs from max(${bundle.maxOutputTokens.minimum}, ${bundle.maxOutputTokens.perItem} × ${itemCount}) = ${expected}`);
+  const maxTokens = instrumentMaxTokens(bundle, itemCount);
+  if (input.model !== undefined && input.model !== model) throw mismatch(`model ${shown(input.model)} is not the worker's model ${shown(model)}`);
+  if (input.max_tokens !== undefined && input.max_tokens !== maxTokens) {
+    throw mismatch(`max_tokens ${shown(input.max_tokens)} differs from max(${bundle.maxOutputTokens.minimum}, ${bundle.maxOutputTokens.perItem} × ${itemCount}) = ${maxTokens}`);
   }
-  const { itemCount: _itemCount, ...request } = input;
-  return { request, itemCount };
+  if (input.temperature !== undefined && input.temperature !== bundle.temperature) throw mismatch(`temperature ${shown(input.temperature)} differs from the instrument's ${bundle.temperature}`);
+  if (input.seed !== undefined && (bundle.seed === null ? input.seed !== null : input.seed !== bundle.seed)) {
+    throw mismatch(`seed ${shown(input.seed)} differs from the instrument's ${bundle.seed === null ? "absent seed" : bundle.seed}`);
+  }
+  if (input.reasoning_effort !== undefined && input.reasoning_effort !== bundle.reasoning) throw mismatch(`reasoning_effort ${shown(input.reasoning_effort)} differs from the instrument's ${shown(bundle.reasoning)}`);
+  if (input.stream !== undefined && input.stream !== false) throw mismatch("verbatim calls are not streamed (stream must be false or absent)");
+  return {
+    request: { model, messages, max_tokens: maxTokens, temperature: bundle.temperature, ...(bundle.seed !== null ? { seed: bundle.seed } : {}), reasoning_effort: bundle.reasoning, stream: false },
+    itemCount
+  };
 }

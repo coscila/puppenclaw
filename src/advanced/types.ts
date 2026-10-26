@@ -11,7 +11,7 @@ export const bulkSubmitZod = z.object({
   schema: z.record(z.string(), z.unknown()).optional(), concurrency: z.number().int().positive().safe().default(60),
   /**
    * Instrument mode (capability instrumentMode): request settings come from the installed bundle. A verbatim
-   * bundle (capability instrumentVerbatim) takes each item as the executor's complete request instead.
+   * bundle (capability instrumentVerbatim) takes each item's messages as the executor built them, system message included.
    */
   instrumentDigest: instrumentDigestZod.optional(),
 }).strict().refine((r) => new Set(r.items.map((x) => x.id)).size === r.items.length, "Item ids must be unique.");

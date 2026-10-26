@@ -512,8 +512,8 @@ export async function createDaemonServer(params: {
     // and start/send resultView=turn; every one is opt-in per request.
     // eventFeed/brokerOutbox: GET /v2/events and POST /v2/events/ack over the broker
     // outbox; instrumentMode: PUT|GET /v2/instruments and bulk jobs naming a digest;
-    // instrumentVerbatim: bundles with transport.messages "verbatim", whose items are the
-    // executor's complete requests, sent unchanged and receipted with requestSha256.
+    // instrumentVerbatim: bundles with transport.messages "verbatim", whose items carry the
+    // executor's messages, sent unchanged and receipted with requestSha256.
     features: () => ({
       health: 1,
       opsIdle: 1,

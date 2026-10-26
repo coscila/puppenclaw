@@ -713,7 +713,7 @@ export class PrincipalRegistry implements PrincipalHooks {
       },
       principal: { id: record.id, kind: record.kind, runId: record.runId, state, grants, revision: record.revision, usage: this.usageView(record, entry.usage, entry.active) },
       // Instrument mode, like the turn socket, but only the installed instruments this principal is granted,
-      // verbatim ones included (instrumentVerbatim: their items are the executor's complete requests).
+      // verbatim ones included (instrumentVerbatim: their items carry the executor's messages, sent unchanged).
       instrumentMode: 1,
       instrumentVerbatim: 1,
       instruments: this.runtime.instruments().filter((installed) => grants.instruments.includes(installed.digest))
