@@ -6,7 +6,7 @@
  * principal socket, and the event loop sampled the way /v2/health does.
  */
 import { spawn } from "node:child_process";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { request } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -167,4 +167,6 @@ const result = {
 };
 process.stdout.write(`${JSON.stringify(result)}\n`);
 await registry.shutdown(); await runtime.close(); await registry.close(); await statistics.close(); upstream.kill();
+// The stores hold every call's input (about 100 MB per run by default): remove them with the scenario.
+await rm(root, { recursive: true, force: true });
 process.exit(0);

@@ -19,7 +19,7 @@
  * processes it starts.
  */
 import { spawn } from "node:child_process";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -64,5 +64,6 @@ const scenarios: [string, Record<string, unknown>][] = [
   ["max", { ...base, latencyMs: 1 }]
 ];
 const results: unknown[] = [];
-for (const [name, config] of scenarios) if (ONLY === undefined || ONLY === name) results.push(await scenario(name, config));
+try { for (const [name, config] of scenarios) if (ONLY === undefined || ONLY === name) results.push(await scenario(name, config)); }
+finally { await rm(outDir, { recursive: true, force: true }); }
 process.stdout.write(`${JSON.stringify({ measuredAt: new Date().toISOString(), node: process.version, results }, null, 2)}\n`);
