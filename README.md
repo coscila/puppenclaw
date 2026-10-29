@@ -661,8 +661,8 @@ asked again and, once the attempts are spent, settles `completed` with the empty
 text. Each verbatim item also records what the upstream itself said:
 `servedModel` (the model the response named, null when it named none; `model`
 keeps its old meaning and then holds the requested model), `systemFingerprint`
-(the response's own `system_fingerprint`, null when it offered none, when
-`serverFingerprint` is the daemon's synthesized identity) and `httpStatus` of
+(the response's own `system_fingerprint`, null when it offered none;
+`serverFingerprint` then holds the daemon's synthesized identity) and `httpStatus` of
 the settling call (every 4xx other than 401, 403, 404 and 429 settles
 `INVALID_REQUEST`; the status tells a request the judge refused, 400, 413 or 422,
 from a transient one such as 408). `requiredModelFingerprint` is checked against
