@@ -694,6 +694,99 @@ describe("daemon shutdown", () => {
   });
 });
 
+describe("resume along a lineage and worker configuration changes", () => {
+  it("answers a resume of a job resumed before with that resume and clears no provider pause again", async () => {
+    let limited = true;
+    const service = await upstream({ fail: () => limited ? 429 : undefined });
+    const { runtime, registry } = await harness({ providers: [provider("judge", service.url)] });
+    const socket = (await registry.put("run:a", runBody({}, { maxConcurrency: 1 }))).socketPath!;
+    const first = (await unix(socket, "/bulk/submit?view=summary", { body: { configId: "judge", idempotencyKey: "l", concurrency: 1, items: items("l", 1) } })).body;
+    expect((await settledJob(runtime, first.jobId)).state).toBe("paused");
+    // The first resume clears the provider pause and calls again; the provider is still limited, so it pauses again.
+    const resumed = (await unix(socket, `/jobs/${first.jobId}/resume`, { method: "POST" })).body;
+    expect((await settledJob(runtime, resumed.jobId)).state).toBe("paused");
+    expect(service.calls).toBe(2);
+    // Resuming the first job again answers that resume and leaves the provider paused: other work dispatches nothing.
+    const again = await unix(socket, `/jobs/${first.jobId}/resume`, { method: "POST" });
+    expect(again).toMatchObject({ status: 200, body: { jobId: resumed.jobId, state: "paused", resumedFromJobId: first.jobId } });
+    const other = (await unix(socket, "/bulk/submit?view=summary", { body: { configId: "judge", idempotencyKey: "o", concurrency: 1, items: items("o", 1) } })).body;
+    expect((await settledJob(runtime, other.jobId)).state).toBe("paused");
+    expect(runtime.store.jobHeader(other.jobId)!.error).toMatch(/requires attention \(HTTP 429\)/u);
+    expect(service.calls).toBe(2);
+    // Resuming the tail of the lineage is what clears the pause.
+    limited = false;
+    const tail = (await unix(socket, `/jobs/${resumed.jobId}/resume`, { method: "POST" })).body;
+    expect(tail.resumedFromJobId).toBe(resumed.jobId);
+    expect((await settledJob(runtime, tail.jobId)).state).toBe("completed");
+    expect(service.calls).toBe(3);
+  });
+
+  it("names the job holding a key in WORKER_KEY_CONFLICT and refuses a resume under a changed worker configuration with WORKER_CONFIG_CHANGED", async () => {
+    const service = await upstream({ fail: () => 429 });
+    const first = await harness({ providers: [provider("judge", service.url)] });
+    const socket = (await first.registry.put("run:a", runBody())).socketPath!;
+    const body = { configId: "judge", idempotencyKey: "k", concurrency: 1, items: items("k", 1) };
+    const job = (await unix(socket, "/bulk/submit?view=summary", { body })).body;
+    expect((await settledJob(first.runtime, job.jobId)).state).toBe("paused");
+    // The same key for other work names the caller's own job that holds it.
+    expect(await unix(socket, "/bulk/submit", { body: { ...body, items: items("other", 1) } })).toMatchObject({ status: 409, body: { code: "WORKER_KEY_CONFLICT", jobId: job.jobId } });
+    await first.close();
+    // The provider moved to another address while the daemon was down: the worker configuration changed.
+    const moved = await upstream();
+    const second = await harness({ dataDir: first.dataDir, providers: [provider("judge", moved.url)] });
+    expect(await unix(socket, "/bulk/submit", { body })).toMatchObject({ status: 409, body: { code: "WORKER_KEY_CONFLICT", jobId: job.jobId } });
+    const refused = await unix(socket, `/jobs/${job.jobId}/resume`, { method: "POST" });
+    expect(refused).toMatchObject({ status: 409, body: { code: "WORKER_CONFIG_CHANGED" } });
+    expect(refused.body.error).toMatch(/configuration changed/u);
+    // Another key runs under the new configuration.
+    const fresh = (await unix(socket, "/bulk/submit?view=summary", { body: { ...body, idempotencyKey: "k2" } })).body;
+    expect((await settledJob(second.runtime, fresh.jobId)).state).toBe("completed");
+    expect(moved.calls).toBe(1);
+  });
+
+  it("still answers a resume of a job resumed before once the worker configuration changed, so the job that settled its items stays reachable", async () => {
+    const service = await upstream({ fail: (call) => call === 1 ? 429 : undefined });
+    const first = await harness({ providers: [provider("judge", service.url)] });
+    const socket = (await first.registry.put("run:a", runBody())).socketPath!;
+    const root = (await unix(socket, "/bulk/submit?view=summary", { body: { configId: "judge", idempotencyKey: "w", concurrency: 1, items: items("w", 1) } })).body;
+    expect((await settledJob(first.runtime, root.jobId)).state).toBe("paused");
+    const child = (await unix(socket, `/jobs/${root.jobId}/resume`, { method: "POST" })).body;
+    expect((await settledJob(first.runtime, child.jobId)).state).toBe("completed");
+    await first.close();
+    const moved = await upstream();
+    const second = await harness({ dataDir: first.dataDir, providers: [provider("judge", moved.url)] });
+    // The lookup answers before the configuration check: the completed resume, with no new job and no call.
+    expect(await unix(socket, `/jobs/${root.jobId}/resume`, { method: "POST" })).toMatchObject({ status: 200, body: { jobId: child.jobId, state: "completed", resumedFromJobId: root.jobId } });
+    expect(second.runtime.store.jobHeaders("principal:run:a").map((header) => header.jobId).sort()).toEqual([root.jobId, child.jobId].sort());
+    expect(moved.calls).toBe(0);
+    expect(service.calls).toBe(2);
+  });
+
+  it("reopens principal sockets only when asked, so the daemon opens them after broker recovery", async () => {
+    const service = await upstream({ hold: true });
+    const first = await harness({ providers: [provider("judge", service.url)] });
+    const socket = (await first.registry.put("run:a", runBody({}, { maxConcurrency: 1 }))).socketPath!;
+    const job = (await unix(socket, "/bulk/submit?view=summary", { body: { configId: "judge", idempotencyKey: "r", concurrency: 1, items: items("r", 2) } })).body;
+    await until(() => service.calls === 1);
+    await first.close();
+    service.hold = false;
+    // As the daemon starts: principals reattach without their sockets, recovery relaunches the job, then the sockets open.
+    process.env.TEST_MODEL_KEY = "test-secret";
+    const runtime = await AdvancedRuntime.open(join(first.dataDir, "advanced"), { defaultLimit: 60 });
+    runtime.attach({ start: async () => ({ content: [{ type: "text", text: "done" }], details: { output: "done", session: { state: "completed" } } }), quiesce: async () => {}, getSession: () => null, contribution: () => {} });
+    const registry = await PrincipalRegistry.open({ dataDir: first.dataDir, runtime, providers: new Map([["judge", provider("judge", service.url)]]), reopenSockets: false });
+    cleanups.push(async () => { await registry.shutdown(); await runtime.close(); await registry.close(); });
+    await expect(unix(socket, "/configs")).rejects.toMatchObject({ code: expect.stringMatching(/^(ENOENT|ECONNREFUSED)$/u) });
+    await runtime.recover();
+    await registry.reopenSockets();
+    expect((await unix(socket, "/configs")).body.authorization.principalId).toBe("run:a");
+    expect((await settledJob(runtime, job.jobId)).state).toBe("completed");
+    expect(runtime.store.jobHeaders("principal:run:a").map((header) => header.jobId)).toEqual([job.jobId]);
+    // The relaunched job ran each item once more at most: the aborted call and the queued one.
+    expect(service.calls).toBe(3);
+  });
+});
+
 describe("legacy attempt authority", () => {
   async function chat(registryOptions: { legacy: boolean }) {
     const service = await upstream();

@@ -58,6 +58,8 @@ export type BrokerReceiptPayload = {
   model: string;
   serverFingerprint: string;
   settingsSha256: string;
+  /** sha256 of the canonical JSON of the request body the settling call sent upstream; null when there is none (agent jobs, older receipts). */
+  requestSha256: string | null;
   instrumentDigest: string | null;
   outputDigest: string;
   outputBytes: number;
@@ -167,7 +169,7 @@ export function brokerReceiptPayload(input: {
   jobId: string;
   instrumentDigest: string | null;
   item: ItemResult;
-  receipt: Pick<UsageReceipt, "model" | "usage" | "createdAt" | "updatedAt"> & Partial<Pick<UsageReceipt, "attempt" | "serverFingerprint" | "settingsSha256" | "finishReason">>;
+  receipt: Pick<UsageReceipt, "model" | "usage" | "createdAt" | "updatedAt"> & Partial<Pick<UsageReceipt, "attempt" | "serverFingerprint" | "settingsSha256" | "requestSha256" | "finishReason">>;
   fallbackFingerprint: string;
   fallbackSettingsSha256: string;
   endedAt?: string;
@@ -190,6 +192,7 @@ export function brokerReceiptPayload(input: {
     model: receipt.model,
     serverFingerprint: nonEmpty(item.serverFingerprint) ?? nonEmpty(receipt.serverFingerprint) ?? input.fallbackFingerprint,
     settingsSha256: nonEmpty(item.settingsSha256) ?? nonEmpty(receipt.settingsSha256) ?? input.fallbackSettingsSha256,
+    requestSha256: nonEmpty(item.requestSha256) ?? nonEmpty(receipt.requestSha256) ?? null,
     instrumentDigest: input.instrumentDigest,
     outputDigest: digest.digest,
     outputBytes: digest.bytes,

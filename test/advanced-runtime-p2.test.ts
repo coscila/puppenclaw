@@ -68,7 +68,7 @@ describe("P2 instrument mode", () => {
     const up = await upstream((_body, res) => reply(res, answer('{"labels":["T"]}')));
     const { runtime, socket } = await setup(up.url);
     const schema = { type: "object", properties: { labels: { type: "array", items: { type: "string" }, uniqueItems: true } }, required: ["labels"] };
-    const installed = runtime.installInstrument(DIGEST, bundle({ responseSchema: schema, seed: 20260911 }));
+    const installed = runtime.installInstrument(DIGEST, bundle({ responseSchema: schema, seed: 4242 }));
     expect(installed.settingsSha256).toMatch(/^[0-9a-f]{64}$/u);
     expect((await unix(socket, "/configs")).body).toMatchObject({ instrumentMode: 1, instruments: [{ digest: DIGEST, instrumentId: "citation-census@1", version: 1, itemsPerCall: 40 }] });
     const messages = [{ role: "user", content: "ENTRY 1\nENTRY 2" }];
@@ -81,7 +81,7 @@ describe("P2 instrument mode", () => {
       // System prompt = the broker's worker policy, a blank line, then the instrument prompt.
       expect(input[0]).toEqual({ role: "system", content: instrumentSystemPrompt(String(input[0]!.content).split("\n\n")[0]!, bundle()) });
       expect(String(input[0]!.content).startsWith("You are a scientific worker")).toBe(true);
-      expect(body).toMatchObject({ model: "test-model", stream: false, temperature: 0, seed: 20260911, reasoning: { effort: "none" } });
+      expect(body).toMatchObject({ model: "test-model", stream: false, temperature: 0, seed: 4242, reasoning: { effort: "none" } });
       // The provider gets the dialect-safe schema; validation stays local.
       expect((body.text as { format: { schema: unknown } }).format.schema).toEqual(schema);
     }

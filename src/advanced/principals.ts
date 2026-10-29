@@ -27,8 +27,9 @@ import {
   type PrincipalState,
   type PrincipalUsage
 } from "./principals-schema.js";
+import { INSTRUMENT_MESSAGE_MISMATCH, storedMessageMode } from "./instruments.js";
 import { PrincipalStore, type PrincipalAuditEntry } from "./principals-store.js";
-import { publicJob, type AdvancedRuntime } from "./runtime.js";
+import { conflictingJob, publicJob, type AdvancedRuntime } from "./runtime.js";
 import { pageOptions } from "./store.js";
 import {
   bulkSubmitZod,
@@ -109,6 +110,12 @@ export type PrincipalRegistryOptions = {
   legacyAttemptAuthority?: boolean;
   now?: () => number;
   warn?: (message: string) => void;
+  /**
+   * false: live principals reattach without reopening their sockets; reopenSockets() opens them. The daemon opens
+   * them only after broker recovery, so no job can be submitted before recovery has requeued the jobs that were
+   * running at the restart (recovery would otherwise launch such a new job a second time).
+   */
+  reopenSockets?: boolean;
 };
 
 function stable(value: unknown): string {
@@ -161,6 +168,7 @@ function socketStatus(error: unknown): [number, string] {
       return [403, error.code];
     case "INSTRUMENT_NOT_ALLOWED":
     case "INSTRUMENT_REQUEST_CONFLICT":
+    case INSTRUMENT_MESSAGE_MISMATCH:
       return [400, error.code];
     case "WORKER_NOT_FOUND":
     case "WORKER_CONFIG_NOT_FOUND":
@@ -211,9 +219,19 @@ export class PrincipalRegistry implements PrincipalHooks {
         continue;
       }
       const entry = registry.attach(record);
-      if (record.socket) await registry.listen(entry).catch((error: unknown) => registry.warn(`puppenclaw: principal ${record.id} socket did not reopen: ${errorText(error)}`));
+      if (record.socket && options.reopenSockets !== false) await registry.listen(entry).catch((error: unknown) => registry.warn(`puppenclaw: principal ${record.id} socket did not reopen: ${errorText(error)}`));
     }
     return registry;
+  }
+
+  /** Opens the sockets of live principals whose socket is not open (at boot, after broker recovery), at the same paths. */
+  async reopenSockets(): Promise<void> {
+    for (const entry of [...this.entries.values()]) {
+      await this.serialize(entry.record.id, async () => {
+        if (this.closing || !entry.record.socket || entry.socket || entry.record.revokedAt !== null || this.entries.get(entry.record.id) !== entry) return;
+        await this.listen(entry).catch((error: unknown) => this.warn(`puppenclaw: principal ${entry.record.id} socket did not reopen: ${errorText(error)}`));
+      });
+    }
   }
 
   // --- pcp/2 routes -------------------------------------------------------
@@ -667,7 +685,7 @@ export class PrincipalRegistry implements PrincipalHooks {
     } catch (error) {
       if (res.headersSent) { res.destroy(); return; }
       const [status, code] = socketStatus(error);
-      reply(status, { error: errorText(error), code });
+      reply(status, { error: errorText(error), code, ...conflictingJob(error) });
     }
   }
 
@@ -710,10 +728,12 @@ export class PrincipalRegistry implements PrincipalHooks {
         publicLiteratureAllowed: record.kind === "run" && state === "active", instruments: grants.instruments
       },
       principal: { id: record.id, kind: record.kind, runId: record.runId, state, grants, revision: record.revision, usage: this.usageView(record, entry.usage, entry.active) },
-      // Instrument mode, like the turn socket, but only the installed instruments this principal is granted.
+      // Instrument mode, like the turn socket, but only the installed instruments this principal is granted,
+      // verbatim ones included (instrumentVerbatim: their items carry the executor's messages, sent unchanged).
       instrumentMode: 1,
+      instrumentVerbatim: 1,
       instruments: this.runtime.instruments().filter((installed) => grants.instruments.includes(installed.digest))
-        .map((installed) => ({ digest: installed.digest, instrumentId: installed.bundle.instrumentId, version: installed.bundle.version, itemsPerCall: installed.bundle.itemsPerCall })),
+        .map((installed) => ({ digest: installed.digest, instrumentId: installed.bundle.instrumentId, version: installed.bundle.version, itemsPerCall: installed.bundle.itemsPerCall, transport: { messages: storedMessageMode(installed.bundle) } })),
       workers: participant.config.workers.map((worker) => ({
         id: worker.id, assignment: worker.assignment, providerId: worker.modelProvider.id, model: worker.modelProvider.model,
         modelProvider: { id: worker.modelProvider.id, model: worker.modelProvider.model, kind: worker.modelProvider.kind, label: worker.modelProvider.label, reasoningProfile: worker.modelProvider.reasoningProfile },

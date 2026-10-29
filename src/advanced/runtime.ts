@@ -15,10 +15,10 @@ import { BulkResponseTransport, shapeLikeNamespaceProxy, type BulkRequestScope, 
 import { EgressPolicy, proxyConnect, proxyHttp } from "./egress.js";
 import { ClaudeOAuthRelay } from "./claude-oauth-relay.js";
 import { noUsage, UsageParser } from "./usage.js";
-import { responseOutputText } from "./responses-output.js";
+import { chatCompletionContent, responseOutputText } from "./responses-output.js";
 import { responseSchemaForProvider } from "./response-schema.js";
-import { effectiveSettings, finishReasonOf, serverFingerprint, settingsSha256 } from "./fingerprint.js";
-import { instrumentBundleZod, instrumentCall, instrumentMaxTokens, instrumentSystemPrompt, installedSettingsSha256, type InstrumentBundle } from "./instruments.js";
+import { canonicalJson, effectiveSettings, finishReasonOf, serverFingerprint, settingsSha256, sha256Hex } from "./fingerprint.js";
+import { INSTRUMENT_MESSAGE_MISMATCH, instrumentBundleZod, instrumentCall, instrumentMaxTokens, instrumentMessageMode, instrumentSystemPrompt, installedSettingsSha256, storedInstrumentBundle, storedMessageMode, verbatimBundleProblem, verbatimInstrumentCall, type InstrumentBundle } from "./instruments.js";
 import { instrumentDigestOf, outputDigest } from "./outbox.js";
 import { bulkRetryFromEnvironment, failureCodeForStatus, PAUSE_HTTP_STATUS, resumeAfterFromHeaders, retryDelayMs, RETRYABLE_HTTP_STATUS, RETRYABLE_TRANSPORT_CODES, sleep, type BulkRetryOptions } from "./retry.js";
 import { PRINCIPAL_PAUSE_REASONS, principalPauseCode, principalPauseOf, type PrincipalAdmission, type PrincipalHooks, type PrincipalItemKey, type PrincipalPauseReason } from "./principals-schema.js";
@@ -100,25 +100,50 @@ function publicSummary({ job, revision, progress }: { job: WorkerJobHeader; revi
     ...(job.resumedFromJobId ? { resumedFromJobId: job.resumedFromJobId } : {}), ...optionalJobFields(job), ...(job.error ? { error: job.error } : {}), revision, progress };
 }
 function queryPage(url: URL): Required<PageOptions> { return pageOptions({ after: Number(url.searchParams.get("after") ?? 0), limit: Number(url.searchParams.get("limit") ?? 100) }); }
+/** The caller's own job named by a WORKER_KEY_CONFLICT refusal (its id only), so the caller can read what that key holds. */
+export function conflictingJob(error: unknown): { jobId?: string } {
+  const jobId = error instanceof PuppenclawError && error.code === "WORKER_KEY_CONFLICT" ? error.details?.jobId : undefined;
+  return typeof jobId === "string" ? { jobId } : {};
+}
 /** Status codes of socket errors that are the caller's fault rather than a conflict. */
-const BAD_REQUEST_CODES = new Set(["INSTRUMENT_NOT_ALLOWED", "INSTRUMENT_REQUEST_CONFLICT"]);
+const BAD_REQUEST_CODES = new Set(["INSTRUMENT_NOT_ALLOWED", "INSTRUMENT_REQUEST_CONFLICT", INSTRUMENT_MESSAGE_MISMATCH]);
+/** Codes a bulk item records when its request is refused before any provider call (receipt-less); anything else is INVALID_REQUEST. */
+const ITEM_REFUSAL_CODES = new Set([INSTRUMENT_MESSAGE_MISMATCH, "PRINCIPAL_REQUIRED"]);
+const VERBATIM_PRINCIPAL_REQUIRED = "A verbatim instrument runs only over a run principal socket (a principal bound to a study run) granted its digest; chat-turn attempt authority and other principals cannot bypass the worker policy.";
+/** Verbatim instruments bypass the worker policy, so only a run principal (one bound to a study run) may run them. */
+const verbatimAuthority = (holder: { principalId?: string; runId?: string }): boolean => holder.principalId !== undefined && holder.runId !== undefined;
 export type AdvancedRuntimeOptions = { store?: AdvancedStoreOptions; transport?: BulkResponseTransport; retry?: BulkRetryOptions };
 /**
  * A running job. `stopping`: the daemon is shutting down a principal job; what is in flight
  * returns to the queue unsettled and the job keeps its state, so restart recovery requeues it.
  */
 type ActiveJob = { cancelled: boolean; stopping: boolean; principal: boolean; abort: AbortController; reason?: string };
-type BuiltBulkRequest = { body: Buffer; model: string; settingsSha256: string };
+/**
+ * One item's provider request. `bodySha256` digests the bytes sent; `requestSha256` the canonical JSON of the
+ * body (equal for verbatim calls, whose body is that canonical JSON). `api` names the upstream route: verbatim
+ * instruments are chat-completions requests, everything else goes to the Responses API.
+ */
+type BuiltBulkRequest = { body: Buffer; model: string; settingsSha256: string; bodySha256: string; requestSha256: string; api: "responses" | "chat" };
+const BULK_PATHS: Record<BuiltBulkRequest["api"], string> = { responses: "/v1/responses", chat: "/v1/chat/completions" };
 /** One bulk call: either never dispatched (no receipt) or dispatched with its transport receipt. */
 type BulkOutcome =
   | { dispatched: false; code: "CANCELLED" | "PROVIDER_PAUSED" | "PROVIDER_AUTH_REQUIRED"; message: string }
   | { dispatched: false; code: "PRINCIPAL_REFUSED"; refusal: PrincipalPauseReason; message: string }
-  | { dispatched: true; ok: boolean; receipt: UsageReceipt; payload: unknown; finishReason: string | null; httpStatus?: number; code?: string; retryable: boolean; message: string; resumeAfter?: string; cancelled: boolean };
+  | { dispatched: true; ok: boolean; receipt: UsageReceipt; payload: unknown; finishReason: string | null; httpStatus?: number; code?: string; retryable: boolean; message: string; resumeAfter?: string; cancelled: boolean;
+      /** As the response named them: the served model and its system_fingerprint (null when it named none). */
+      servedModel: string | null; systemFingerprint: string | null;
+      /** A chat completion whose first choice carries no content (retried like a failed call, then settled as an empty answer). */
+      empty: boolean };
 type DispatchedBulkOutcome = Extract<BulkOutcome, { dispatched: true }>;
-/** What an item records of the call that settles it; `attempts` counts the provider calls made for the item. */
-function measuredFields(call: DispatchedBulkOutcome, attempts: number): Partial<ItemResult> {
+/**
+ * What an item records of the call that settles it; `attempts` counts the provider calls made for the item. A verbatim
+ * call also records what the upstream itself reported (served model, system_fingerprint, HTTP status), so the executor
+ * never mistakes the requested model or the daemon's synthesized fingerprint for the server's own answer.
+ */
+function measuredFields(call: DispatchedBulkOutcome, attempts: number, verbatim = false): Partial<ItemResult> {
   const { receipt } = call;
-  return { usage: receipt.usage, model: receipt.model, promptSha256: receipt.promptSha256, attempts, finishReason: call.finishReason, ...(receipt.serverFingerprint ? { serverFingerprint: receipt.serverFingerprint } : {}), ...(receipt.settingsSha256 ? { settingsSha256: receipt.settingsSha256 } : {}) };
+  return { usage: receipt.usage, model: receipt.model, promptSha256: receipt.promptSha256, attempts, finishReason: call.finishReason, ...(receipt.serverFingerprint ? { serverFingerprint: receipt.serverFingerprint } : {}), ...(receipt.settingsSha256 ? { settingsSha256: receipt.settingsSha256 } : {}), ...(receipt.requestSha256 ? { requestSha256: receipt.requestSha256 } : {}),
+    ...(verbatim ? { servedModel: call.servedModel, systemFingerprint: call.systemFingerprint, ...(call.httpStatus !== undefined ? { httpStatus: call.httpStatus } : {}) } : {}) };
 }
 export class AdvancedRuntime {
   private driver: RuntimeDriver | null = null;
@@ -216,9 +241,15 @@ export class AdvancedRuntime {
 
   // ------------------------------------------------------------------ instruments (pcp/2 instrumentMode)
 
-  /** Allow-lists an instrument bundle under its opaque digest; the digest is never recomputed here. */
+  /**
+   * Allow-lists an instrument bundle under its opaque digest; the digest is never recomputed here. A
+   * policy-wrapped bundle is stored without `transport` (storedInstrumentBundle), so spelling out the default
+   * installs the same instrument and daemons from before transport modes still read it.
+   */
   installInstrument(digest: string, body: unknown): InstrumentRecord {
-    const bundle = instrumentBundleZod.parse(body);
+    const bundle = storedInstrumentBundle(instrumentBundleZod.parse(body));
+    const problem = verbatimBundleProblem(bundle);
+    if (problem) throw new PuppenclawError("INVALID_INSTRUMENT", problem);
     if (bundle.responseSchema) { try { compileSchema(bundle.responseSchema); } catch (error) { throw new PuppenclawError("INVALID_INSTRUMENT", `responseSchema is not a valid JSON Schema: ${message(error)}`); } }
     return this.store.putInstrument(digest, bundle, installedSettingsSha256(WORKER_POLICY, bundle));
   }
@@ -306,7 +337,7 @@ export class AdvancedRuntime {
     if (this.servers.has(name)) return;
     const path = join(this.socketRoot, `${hash(name).slice(0, 24)}.sock`);
     await unlink(path).catch((e) => { if (e.code !== "ENOENT") throw e; });
-    const server = createServer((req, res) => { req.on("error", () => res.destroy()); res.on("error", () => res.destroy()); void this.handle(name, req, res).catch((error) => { if (!res.headersSent) { res.writeHead(error instanceof PuppenclawError ? (BAD_REQUEST_CODES.has(error.code) ? 400 : 409) : 400, { "content-type": "application/json" }); res.end(JSON.stringify({ error: message(error), code: error instanceof PuppenclawError ? error.code : "INVALID_REQUEST" })); } else res.destroy(); }); });
+    const server = createServer((req, res) => { req.on("error", () => res.destroy()); res.on("error", () => res.destroy()); void this.handle(name, req, res).catch((error) => { if (!res.headersSent) { res.writeHead(error instanceof PuppenclawError ? (BAD_REQUEST_CODES.has(error.code) ? 400 : 409) : 400, { "content-type": "application/json" }); res.end(JSON.stringify({ error: message(error), code: error instanceof PuppenclawError ? error.code : "INVALID_REQUEST", ...conflictingJob(error) })); } else res.destroy(); }); });
     server.on("connect", (req, socket, head) => {
       let participant: RuntimeParticipant; try { participant = this.requireParticipant(name); } catch { socket.destroy(); return; }
       if (participant.provider.kind === "claude-code" && ClaudeOAuthRelay.accepts(req.url) && this.oauthRelay) {
@@ -325,7 +356,7 @@ export class AdvancedRuntime {
     const json = (value: unknown) => { res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" }); res.end(JSON.stringify(value)); };
     if (/^http:\/\//u.test(req.url ?? "")) { await proxyHttp(this.policy, req, res); return; }
     if (path.startsWith("/native/")) { await this.native(p, req, res); return; }
-    if (req.method === "GET" && ["/configs", "/configs/list"].includes(path)) { json({ version: 1, revision: p.config.revision, capacity: { scope: "provider", providers: [...new Set(p.config.workers.map((w) => w.modelProvider.id))].map((providerId) => ({ providerId, ...(this.bulkConcurrency.group(providerId) ? { capacityGroup: this.bulkConcurrency.group(providerId) } : {}), ...this.bulkConcurrency.snapshot(providerId) })) }, authorization: { publicLiteratureAllowed: this.principals?.legacyAttemptAuthority !== false && !p.jobId && p.permissionMode === "approve-all" && p.interactionMode === "execute", attemptId: p.attemptId, workspace: p.directory }, workers: p.config.workers.map((w) => ({ id: w.id, assignment: w.assignment, providerId: w.modelProvider.id, model: w.modelProvider.model, modelProvider: { id: w.modelProvider.id, model: w.modelProvider.model, kind: w.modelProvider.kind, label: w.modelProvider.label, reasoningProfile: w.modelProvider.reasoningProfile }, agent: w.agent, effort: w.effort, ...(w.evidencePolicy ? { evidencePolicy: w.evidencePolicy } : {}), bulkConcurrencyLimit: this.bulkConcurrency.limit(w.modelProvider.id), bulkAvailable: this.principals?.legacyAttemptAuthority !== false && w.modelProvider.kind === "codex-openai-compatible" })), instrumentMode: 1, instruments: this.store.instruments().map((record) => ({ digest: record.digest, instrumentId: record.bundle.instrumentId, version: record.bundle.version, itemsPerCall: record.bundle.itemsPerCall })) }); return; }
+    if (req.method === "GET" && ["/configs", "/configs/list"].includes(path)) { json({ version: 1, revision: p.config.revision, capacity: { scope: "provider", providers: [...new Set(p.config.workers.map((w) => w.modelProvider.id))].map((providerId) => ({ providerId, ...(this.bulkConcurrency.group(providerId) ? { capacityGroup: this.bulkConcurrency.group(providerId) } : {}), ...this.bulkConcurrency.snapshot(providerId) })) }, authorization: { publicLiteratureAllowed: this.principals?.legacyAttemptAuthority !== false && !p.jobId && p.permissionMode === "approve-all" && p.interactionMode === "execute", attemptId: p.attemptId, workspace: p.directory }, workers: p.config.workers.map((w) => ({ id: w.id, assignment: w.assignment, providerId: w.modelProvider.id, model: w.modelProvider.model, modelProvider: { id: w.modelProvider.id, model: w.modelProvider.model, kind: w.modelProvider.kind, label: w.modelProvider.label, reasoningProfile: w.modelProvider.reasoningProfile }, agent: w.agent, effort: w.effort, ...(w.evidencePolicy ? { evidencePolicy: w.evidencePolicy } : {}), bulkConcurrencyLimit: this.bulkConcurrency.limit(w.modelProvider.id), bulkAvailable: this.principals?.legacyAttemptAuthority !== false && w.modelProvider.kind === "codex-openai-compatible" })), instrumentMode: 1, instruments: this.store.instruments().filter((record) => storedMessageMode(record.bundle) === "policy-wrapped").map((record) => ({ digest: record.digest, instrumentId: record.bundle.instrumentId, version: record.bundle.version, itemsPerCall: record.bundle.itemsPerCall, transport: { messages: "policy-wrapped" } })) }); return; }
     if (req.method === "GET" && path === "/jobs") {
       if (summary) json(this.jobSummaries(p.parentSessionName, queryPage(url)));
       else { const jobs = this.store.jobs(p.parentSessionName); json({ jobs: jobs.map(publicJob) }); this.observeJobs(p, jobs); } return;
@@ -361,7 +392,8 @@ export class AdvancedRuntime {
     if (this.requireParticipant(p.sessionName).attemptId !== p.attemptId) throw new PuppenclawError("ORCHESTRATION_TURN_CLOSED", "Attempt ownership changed."); if (p.jobId) throw new PuppenclawError("WORKER_DELEGATION_DENIED", "Worker jobs cannot expand the parent's worker allocation.");
     const config = this.worker(p, request.configId), fingerprint = hash({ kind, config, request });
     const duplicate = this.store.duplicate(p.parentSessionName, p.attemptId, request.idempotencyKey);
-    if (duplicate) { if (duplicate.fingerprint !== fingerprint) throw new PuppenclawError("WORKER_KEY_CONFLICT", "Idempotency key was used for different work."); return summary ? this.jobSummary(duplicate.jobId) : publicJob(duplicate); }
+    // A conflict names the caller's own job that holds the key (submitted under another worker configuration or request).
+    if (duplicate) { if (duplicate.fingerprint !== fingerprint) throw new PuppenclawError("WORKER_KEY_CONFLICT", "Idempotency key was used for different work.", { jobId: duplicate.jobId }); return summary ? this.jobSummary(duplicate.jobId) : publicJob(duplicate); }
     // Bulk authority: a principal's grants (its granted instruments restrict which installed ones it may run),
     // or (PUPPENCLAW_LEGACY_ATTEMPT_AUTHORITY=on) an approved execution turn below.
     if (p.principalId !== undefined) this.principals!.admitJob(p, kind, request, config);
@@ -371,8 +403,10 @@ export class AdvancedRuntime {
     if (p.permissionMode === "deny-all") throw new PuppenclawError("WORKER_PERMISSION_DENIED", "This parent turn cannot launch worker tools.");
     if (kind === "bulk" && (request as BulkSubmit).schema) compileSchema((request as BulkSubmit).schema!);
     if (kind === "bulk" && (request as BulkSubmit).instrumentDigest) {
-      this.installedInstrument((request as BulkSubmit).instrumentDigest!);
+      const instrument = this.installedInstrument((request as BulkSubmit).instrumentDigest!);
       if ((request as BulkSubmit).schema) throw new PuppenclawError("INSTRUMENT_REQUEST_CONFLICT", "An instrument job takes its response schema from the installed instrument.");
+      // A verbatim instrument bypasses the worker policy: only a run principal granted its digest (admitJob above) runs it.
+      if (instrumentMessageMode(instrument) === "verbatim" && !verbatimAuthority(p)) throw new PuppenclawError("PRINCIPAL_REQUIRED", VERBATIM_PRINCIPAL_REQUIRED);
     }
     const job: WorkerJob = { jobId: randomUUID(), kind, state: "queued", parentSessionName: p.parentSessionName, attemptId: p.attemptId,
       configRevision: p.config.revision, config, idempotencyKey: request.idempotencyKey, fingerprint, createdAt: timestamp(), updatedAt: timestamp(), request, results: [], ...(p.ownerKey ? { ownerKey: p.ownerKey } : {}), ...(resumedFromJobId ? { resumedFromJobId } : {}),
@@ -490,9 +524,26 @@ export class AdvancedRuntime {
     const current = this.store.jobHeader(job.jobId)!;
     if (!["cancelled", "paused"].includes(current.state)) { const counts = this.store.progress(job.jobId); this.store.updateHeader(job.jobId, { state: counts.completed === counts.total ? "completed" : "failed", updatedAt: timestamp() }); }
   }
-  /** The request body of one item call, shaped like the namespace proxy when it goes to the upstream directly. */
+  /**
+   * The request body of one item call. Policy-wrapped calls are Responses requests, shaped like the namespace
+   * proxy when they go to the upstream directly. A verbatim instrument call carries the executor's messages,
+   * checked against the installed bundle (verbatimInstrumentCall): they are sent unchanged in the chat-completions
+   * request of the worker's model and the bundle's settings, as its canonical JSON, with nothing added: no worker
+   * policy, no assignment, no response format, no proxy shaping (the namespace proxy forwards chat completions
+   * unchanged as well). Throws when the item may not be sent.
+   */
   private buildBulkRequest(job: WorkerJob, item: BulkSubmit["items"][number], instrument: InstrumentBundle | undefined, route: BulkRoute): BuiltBulkRequest {
     const provider = job.config.modelProvider, request = job.request as BulkSubmit;
+    if (instrument && instrumentMessageMode(instrument) === "verbatim") {
+      // submit() refuses other authority; a stored job reaching dispatch some other way is held to the same rule.
+      if (!verbatimAuthority(job)) throw new PuppenclawError("PRINCIPAL_REQUIRED", VERBATIM_PRINCIPAL_REQUIRED);
+      // installInstrument refuses such a bundle; one stored before that rule is never sent with a format the executor did not build.
+      const problem = verbatimBundleProblem(instrument);
+      if (problem) throw new PuppenclawError(INSTRUMENT_MESSAGE_MISMATCH, `Verbatim instrument call refused: ${problem}`);
+      const call = verbatimInstrumentCall(instrument, item.input, provider.model);
+      const text = canonicalJson(call.request), digest = sha256Hex(text);
+      return { body: Buffer.from(text), model: provider.model, settingsSha256: settingsSha256(effectiveSettings(call.request)), bodySha256: digest, requestSha256: digest, api: "chat" };
+    }
     let payload: Record<string, unknown>;
     if (instrument) {
       const call = instrumentCall(instrument, item.input);
@@ -513,7 +564,8 @@ export class AdvancedRuntime {
         ...(request.schema ? { text: { format: { type: "json_schema", name: "worker_result", strict: true, schema: responseSchemaForProvider(request.schema, provider) } } } : {}) };
     }
     if (route.direct) shapeLikeNamespaceProxy(payload);
-    return { body: Buffer.from(JSON.stringify(payload)), model: provider.model, settingsSha256: settingsSha256(effectiveSettings(payload)) };
+    const text = JSON.stringify(payload);
+    return { body: Buffer.from(text), model: provider.model, settingsSha256: settingsSha256(effectiveSettings(payload)), bodySha256: sha256Hex(text), requestSha256: sha256Hex(canonicalJson(payload)), api: "responses" };
   }
   /** One item: its calls (retried on transient failures) and its single settlement; false when it did not settle. */
   private async runItem(job: WorkerJob, p: RuntimeParticipant, item: BulkSubmit["items"][number], base: ItemResult, instrument: InstrumentBundle | undefined, validate: ValidateFunction | undefined, active: ActiveJob, lineage: string): Promise<boolean> {
@@ -522,13 +574,20 @@ export class AdvancedRuntime {
     const route = this.bulkTransport.route(provider, this.bulkConcurrency.poolKey(provider.id), this.bulkConcurrency.limit(provider.id));
     let request: BuiltBulkRequest;
     try { request = this.buildBulkRequest(job, item, instrument, route); }
-    catch (error) { this.settleBulkItem(job, base, { state: "failed", error: message(error), errorCode: "INVALID_REQUEST" }); return true; }
+    catch (error) {
+      // Refused before any provider call or principal admission: the item settles failed without a receipt.
+      const errorCode = error instanceof PuppenclawError && ITEM_REFUSAL_CODES.has(error.code) ? error.code : "INVALID_REQUEST";
+      this.settleBulkItem(job, base, { state: "failed", error: message(error), errorCode }); return true;
+    }
+    const verbatim = request.api === "chat";
     let outcome: BulkOutcome, attempt = 0, lastCall: DispatchedBulkOutcome | undefined;
     for (;;) {
       attempt += 1;
       outcome = await this.bulkCall(participant, job, { lineage, itemId: item.id }, request, route, attempt, instrumentDigest);
       if (outcome.dispatched) lastCall = outcome;
-      if (!outcome.dispatched || outcome.ok || active.cancelled || active.stopping || !outcome.retryable || attempt >= this.retry.attempts) break;
+      if (!outcome.dispatched || active.cancelled || active.stopping || attempt >= this.retry.attempts) break;
+      // An empty chat completion is asked again like a failed call; once the attempts are spent it settles as an empty answer.
+      if (outcome.ok ? !outcome.empty : !outcome.retryable) break;
       // A retried attempt keeps its receipt row (usage, diagnostics) but never becomes the item's receipt.
       this.store.putReceipt(outcome.receipt);
       if (!await sleep(retryDelayMs(this.retry, attempt), active.abort.signal)) break;
@@ -541,7 +600,7 @@ export class AdvancedRuntime {
     if (!outcome.dispatched) {
       // A later attempt was refused before dispatch. An item that already made a provider call settles with
       // that call's receipt, so its provenance and usage still reach the feed; one that made none has no receipt.
-      const earlier = lastCall ? { fields: measuredFields(lastCall, attempt - 1), receipt: lastCall.receipt } : undefined;
+      const earlier = lastCall ? { fields: measuredFields(lastCall, attempt - 1, verbatim), receipt: lastCall.receipt } : undefined;
       if (outcome.code === "CANCELLED" || active.cancelled) {
         if (!earlier) return false;
         this.settleBulkItem(job, base, { ...earlier.fields, state: "cancelled", error: active.reason ?? "Worker cancelled by its controller or parent turn closure.", errorCode: "CANCELLED" }, earlier.receipt, instrumentDigest);
@@ -559,7 +618,7 @@ export class AdvancedRuntime {
       return true;
     }
     const receipt = outcome.receipt;
-    const measured = measuredFields(outcome, attempt);
+    const measured = measuredFields(outcome, attempt, verbatim);
     if (!outcome.ok) {
       // Cancelled in flight, or during the backoff before another attempt: the job's cancellation wins.
       if (outcome.cancelled || active.cancelled) { this.settleBulkItem(job, base, { ...measured, state: "cancelled", error: active.reason ?? "Worker cancelled by its controller or parent turn closure.", errorCode: "CANCELLED" }, receipt, instrumentDigest); return true; }
@@ -573,17 +632,21 @@ export class AdvancedRuntime {
       return true;
     }
     // Who answered decides before what the answer says: a different model pauses the provider whether its
-    // output parses, validates or was cut at the token limit. The receipt stays; the output is dropped.
+    // output parses, validates or was cut at the token limit. The receipt stays; the output is dropped. A verbatim
+    // call counts only what the response itself names: one that names no model (or the wrong one) is drift, never
+    // the requested model taken on trust.
     const required = instrument?.requiredModelFingerprint;
-    if (required && required !== receipt.serverFingerprint && required !== receipt.model) {
-      const drift = `Model drift: the instrument requires ${required}; the provider served ${receipt.model} (${receipt.serverFingerprint ?? "no fingerprint"}).`;
+    const servedModel = verbatim ? outcome.servedModel : receipt.model;
+    const servedFingerprint = verbatim ? outcome.systemFingerprint : receipt.serverFingerprint;
+    if (required && required !== servedFingerprint && required !== servedModel) {
+      const drift = `Model drift: the instrument requires ${required}; the provider served ${servedModel ?? "a response naming no model"} (${servedFingerprint ?? "no fingerprint"}).`;
       this.pausedProviders.set(pauseKey, drift);
       this.settleBulkItem(job, base, { ...measured, state: "paused", error: drift, errorCode: "MODEL_DRIFT" }, receipt, instrumentDigest);
       this.pauseJob(job.jobId, drift, pauseKey, active);
       return true;
     }
     const truncated = outcome.finishReason === "length";
-    let output: unknown = responseOutputText(outcome.payload), failure: { error: string; errorCode: string } | undefined;
+    let output: unknown = verbatim ? chatCompletionContent(outcome.payload) ?? "" : responseOutputText(outcome.payload), failure: { error: string; errorCode: string } | undefined;
     if (validate) {
       try { output = JSON.parse(String(output)); } catch { failure = { error: truncated ? "Provider output was cut at the output-token limit and is not valid structured JSON." : "Provider returned malformed structured JSON.", errorCode: "STRUCTURED_OUTPUT_INVALID" }; }
       if (!failure && !validate(output)) failure = { error: `Provider output failed schema validation: ${ajv.errorsText(validate.errors)}`, errorCode: "STRUCTURED_OUTPUT_INVALID" };
@@ -632,30 +695,40 @@ export class AdvancedRuntime {
       const key = provider.authTokenEnv && process.env[provider.authTokenEnv];
       if (!key) return { dispatched: false, code: "PROVIDER_AUTH_REQUIRED", message: "Provider API credential is unavailable." };
       receipt = { version: 1, requestId, parentSessionName: p.parentSessionName, sessionName: p.sessionName, attemptId: p.attemptId, jobId: job.jobId, ...(p.ownerKey ? { ownerKey: p.ownerKey } : {}), itemId,
-        providerId: provider.id, model: request.model, role: "subagent", promptSha256: hash(request.body.toString()), state: "running", authTransport: "authorization", usage: noUsage(), createdAt: timestamp(), updatedAt: timestamp(),
-        attempt, settingsSha256: request.settingsSha256, serverFingerprint: serverFingerprint({ model: request.model }), ...(instrumentDigest ? { instrumentDigest } : {}) };
+        providerId: provider.id, model: request.model, role: "subagent", promptSha256: request.bodySha256, state: "running", authTransport: "authorization", usage: noUsage(), createdAt: timestamp(), updatedAt: timestamp(),
+        attempt, settingsSha256: request.settingsSha256, requestSha256: request.requestSha256, serverFingerprint: serverFingerprint({ model: request.model }), ...(instrumentDigest ? { instrumentDigest } : {}) };
       this.publish(receipt, false);
       scope = this.bulkTransport.start(abort.signal, route.dispatcher);
-      const response = await scope.fetch(upstreamUrl(route.provider, "/v1/responses"), { method: "POST", headers: { authorization: `Bearer ${key}`, "content-type": "application/json" }, body: request.body, redirect: "manual" });
+      const response = await scope.fetch(upstreamUrl(route.provider, BULK_PATHS[request.api]), { method: "POST", headers: { authorization: `Bearer ${key}`, "content-type": "application/json" }, body: request.body, redirect: "manual" });
       receipt.httpStatus = response.status;
       const chunks: Buffer[] = []; let length = 0;
       if (response.body) for await (const chunk of response.body) { const data = Buffer.from(chunk); length += data.length; if (length > 16 * 1024 * 1024) throw new Error("Provider JSON exceeded 16 MiB."); chunks.push(data); }
       let payload: unknown = null, parsed = true;
       try { payload = JSON.parse(Buffer.concat(chunks).toString()); } catch { parsed = false; }
       const parser = new UsageParser(false); if (parsed) parser.event(payload);
-      const success = response.ok && parsed && !parser.protocolErrorCode;
+      // A verbatim (chat-completions) call is answered only by a first choice whose message content is text or empty;
+      // anything else in a 2xx body is no answer at all and is asked again like a failed call.
+      const chat = request.api === "chat", content = chat && parsed ? chatCompletionContent(payload) : undefined;
+      const noMessage = chat && response.ok && parsed && !parser.protocolErrorCode && content === undefined;
+      const success = response.ok && parsed && !parser.protocolErrorCode && !noMessage;
       parser.finish(success);
-      receipt.usage = parser.usage; receipt.model = parser.model ?? receipt.model; receipt.state = success ? "completed" : "failed";
-      receipt.serverFingerprint = serverFingerprint({ payload, systemFingerprint: parser.systemFingerprint ?? undefined, model: receipt.model, headers: response.headers });
+      const servedModel = parser.model, systemFingerprint = parser.systemFingerprint;
+      receipt.usage = parser.usage; receipt.model = servedModel ?? receipt.model; receipt.state = success ? "completed" : "failed";
+      receipt.serverFingerprint = serverFingerprint({ payload, systemFingerprint: systemFingerprint ?? undefined, model: receipt.model, headers: response.headers });
       const finishReason = parsed ? finishReasonOf(payload) : null; receipt.finishReason = finishReason;
       if (!response.ok) { const providerError = object(object(payload)?.error); receipt.errorCode = safeErrorCode(providerError?.code) ?? safeErrorCode(providerError?.type) ?? "provider_http_error"; }
       else if (!parsed) receipt.errorCode = "provider_invalid_json";
       else if (parser.protocolErrorCode) receipt.errorCode = parser.protocolErrorCode;
+      else if (noMessage) receipt.errorCode = "provider_no_message";
       this.publish(receipt, false);
-      if (success) return { dispatched: true, ok: true, receipt, payload, finishReason, httpStatus: response.status, retryable: false, message: "", cancelled: false };
+      const answered = { servedModel, systemFingerprint };
+      if (success) return { dispatched: true, ok: true, receipt, payload, finishReason, httpStatus: response.status, retryable: false, message: "", cancelled: false, ...answered, empty: chat && (content === null || content === "") };
       const resumeAfter = resumeAfterFromHeaders(response.headers);
       return { dispatched: true, ok: false, receipt, payload, finishReason, httpStatus: response.status, code: response.ok ? "NO_FINAL_MESSAGE" : failureCodeForStatus(response.status),
-        retryable: RETRYABLE_HTTP_STATUS.has(response.status), message: response.ok ? "Provider did not return valid JSON." : `Provider request failed with HTTP ${response.status}.`, ...(resumeAfter ? { resumeAfter } : {}), cancelled: false };
+        // A chat-completions 2xx without a usable answer is asked again, as an executor calling the judge directly would.
+        retryable: RETRYABLE_HTTP_STATUS.has(response.status) || (chat && response.ok),
+        message: !response.ok ? `Provider request failed with HTTP ${response.status}.` : noMessage ? "Provider answered without a chat completion message." : "Provider did not return valid JSON.",
+        ...(resumeAfter ? { resumeAfter } : {}), cancelled: false, ...answered, empty: false };
     } catch (error) {
       if (!receipt) throw error;
       const timeout = scope?.timeoutError, failure = timeout ?? error, cancelled = !timeout && abort.signal.aborted;
@@ -664,7 +737,7 @@ export class AdvancedRuntime {
       receipt.usage = { ...receipt.usage, quality: receipt.usage.input === null ? "unavailable" : "partial" };
       this.publish(receipt, false);
       return { dispatched: true, ok: false, receipt, payload: null, finishReason: null, code: cancelled ? "CANCELLED" : timeout ? "TIME_LIMIT" : "PROVIDER_UNREACHABLE",
-        retryable: !cancelled && RETRYABLE_TRANSPORT_CODES.has(receipt.errorCode ?? ""), message: message(failure), cancelled };
+        retryable: !cancelled && RETRYABLE_TRANSPORT_CODES.has(receipt.errorCode ?? ""), message: message(failure), cancelled, servedModel: null, systemFingerprint: null, empty: false };
     } finally {
       scope?.close(); release?.();
       // An item charge stays once the call left (receipt created); an admission that dispatched nothing is refunded.
@@ -672,15 +745,26 @@ export class AdvancedRuntime {
       admission?.release(); this.requests.delete(requestId); complete();
     }
   }
+  /**
+   * Resumes a paused or settled job as a new job of its lineage (its unfinished items only). Resuming a job that was
+   * resumed before answers that earlier resume's job and changes nothing else: no provider pause is cleared again, so
+   * a caller walking a long lineage to its tail never lets other work dispatch into a provider that is still limited.
+   * That answer is a lookup and comes first, even when the worker configuration changed since: a caller can still
+   * reach the job that settled its items. Only a resume that would start a new job needs the unchanged configuration.
+   */
   async resume(p: RuntimeParticipant, old: WorkerJob): Promise<Record<string, unknown>> {
     if (!["paused", "interrupted", "failed", "cancelled"].includes(old.state)) throw new Error("Only settled or paused jobs can resume.");
-    const config = this.worker(p, old.config.id); if (hash(config) !== hash(old.config)) throw new Error("Worker configuration changed; submit an explicit new job.");
+    const request = old.kind === "bulk" ? { ...old.request, items: (old.request as BulkSubmit).items.filter((item) => old.results.find((r) => r.id === item.id)?.state !== "completed") } : old.request;
+    if (old.kind === "bulk" && !(request as BulkSubmit).items.length) return publicJob(old);
+    const idempotencyKey = `${hash(old.idempotencyKey).slice(0, 48)}-resume-${old.jobId}`;
+    const earlier = this.store.duplicate(p.parentSessionName, p.attemptId, idempotencyKey);
+    if (earlier && earlier.resumedFromJobId === old.jobId) return publicJob(earlier);
+    const config = this.worker(p, old.config.id);
+    if (hash(config) !== hash(old.config)) throw new PuppenclawError("WORKER_CONFIG_CHANGED", "Worker configuration changed since this job was submitted; submit an explicit new job.");
     this.pausedProviders.delete(providerPauseKey(p, config.modelProvider.id));
     this.pauseResumeAfter.delete(providerPauseKey(p, config.modelProvider.id));
     this.nativeOAuthRecovery.delete(providerPauseKey(p, config.modelProvider.id));
-    const request = old.kind === "bulk" ? { ...old.request, items: (old.request as BulkSubmit).items.filter((item) => old.results.find((r) => r.id === item.id)?.state !== "completed") } : old.request;
-    if (old.kind === "bulk" && !(request as BulkSubmit).items.length) return publicJob(old);
-    return this.submit(p, old.kind, { ...request, idempotencyKey: `${hash(old.idempotencyKey).slice(0, 48)}-resume-${old.jobId}` }, old.jobId);
+    return this.submit(p, old.kind, { ...request, idempotencyKey }, old.jobId);
   }
   async cancel(id: string, reason = "Worker cancelled by its controller or parent turn closure."): Promise<void> {
     const header = this.store.jobHeader(id); if (!header) return;
