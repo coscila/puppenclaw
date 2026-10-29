@@ -816,8 +816,10 @@ Grants:
   client may walk a long lineage to its tail without letting other work dispatch
   into a provider that is still limited. A job whose worker configuration changed
   since it was submitted (a provider's endpoint, model, credential variable or
-  label in `PUPPENCLAW_MODEL_PROVIDERS`) cannot resume (409
-  `WORKER_CONFIG_CHANGED`); submit it again under another idempotency key. A
+  label in `PUPPENCLAW_MODEL_PROVIDERS`) cannot resume into a new job (409
+  `WORKER_CONFIG_CHANGED`); submit it again under another idempotency key. The
+  answer of an earlier resume comes first, so after such a change a client still
+  walks the lineage to the job that settled its items. A
   submission whose idempotency key already holds other work (another worker
   configuration or request) is refused with 409 `WORKER_KEY_CONFLICT`, whose
   body names that job (`jobId`, always one of the caller's own), so the client

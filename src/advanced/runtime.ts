@@ -749,16 +749,18 @@ export class AdvancedRuntime {
    * Resumes a paused or settled job as a new job of its lineage (its unfinished items only). Resuming a job that was
    * resumed before answers that earlier resume's job and changes nothing else: no provider pause is cleared again, so
    * a caller walking a long lineage to its tail never lets other work dispatch into a provider that is still limited.
+   * That answer is a lookup and comes first, even when the worker configuration changed since: a caller can still
+   * reach the job that settled its items. Only a resume that would start a new job needs the unchanged configuration.
    */
   async resume(p: RuntimeParticipant, old: WorkerJob): Promise<Record<string, unknown>> {
     if (!["paused", "interrupted", "failed", "cancelled"].includes(old.state)) throw new Error("Only settled or paused jobs can resume.");
-    const config = this.worker(p, old.config.id);
-    if (hash(config) !== hash(old.config)) throw new PuppenclawError("WORKER_CONFIG_CHANGED", "Worker configuration changed since this job was submitted; submit an explicit new job.");
     const request = old.kind === "bulk" ? { ...old.request, items: (old.request as BulkSubmit).items.filter((item) => old.results.find((r) => r.id === item.id)?.state !== "completed") } : old.request;
     if (old.kind === "bulk" && !(request as BulkSubmit).items.length) return publicJob(old);
     const idempotencyKey = `${hash(old.idempotencyKey).slice(0, 48)}-resume-${old.jobId}`;
     const earlier = this.store.duplicate(p.parentSessionName, p.attemptId, idempotencyKey);
     if (earlier && earlier.resumedFromJobId === old.jobId) return publicJob(earlier);
+    const config = this.worker(p, old.config.id);
+    if (hash(config) !== hash(old.config)) throw new PuppenclawError("WORKER_CONFIG_CHANGED", "Worker configuration changed since this job was submitted; submit an explicit new job.");
     this.pausedProviders.delete(providerPauseKey(p, config.modelProvider.id));
     this.pauseResumeAfter.delete(providerPauseKey(p, config.modelProvider.id));
     this.nativeOAuthRecovery.delete(providerPauseKey(p, config.modelProvider.id));
