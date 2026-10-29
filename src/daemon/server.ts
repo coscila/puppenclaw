@@ -327,13 +327,15 @@ export async function createDaemonServer(params: {
         },
       });
       // Run principals (P3) reattach before broker recovery, so recovered principal
-      // work finds its participant; their sockets reopen at the same paths.
+      // work finds its participant; their sockets reopen at the same paths only after
+      // recovery, so no job is submitted while recovery still requeues the running ones.
       principals = await PrincipalRegistry.open({
         dataDir: params.dataDir,
         runtime: advanced,
         providers: modelProvidersFromEnvironment(),
         legacyAttemptAuthority: legacyAttemptAuthorityFromEnvironment(),
-        warn: (message) => logger.warn(message)
+        warn: (message) => logger.warn(message),
+        reopenSockets: false
       });
       const runningAtBoot = store
         .listSessions()
@@ -344,6 +346,7 @@ export async function createDaemonServer(params: {
         await manager.cancelInterruptedRuntimeTurns(runningAtBoot);
       }
       await advanced.recover();
+      await principals.reopenSockets();
       // Opt-in only: archive and event retention stay off unless their env settings are present.
       maintenance = new AdvancedMaintenance(advanced.store, maintenanceFromEnvironment(), (line) => logger.info(line));
       maintenance.start();

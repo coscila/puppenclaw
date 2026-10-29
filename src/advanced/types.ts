@@ -27,6 +27,12 @@ export type ItemResult = { id: string; state: JobState; output?: unknown; provid
   serverFingerprint?: string; settingsSha256?: string; outputDigest?: string; outputBytes?: number;
   /** sha256 of the canonical JSON of the request body the settling call sent upstream (see UsageReceipt). */
   requestSha256?: string;
+  /**
+   * Verbatim instrument calls only, as the upstream answered the settling call: the model its response named (null
+   * when it named none; `model` then still holds the requested model), its system_fingerprint (null when it offered
+   * none; `serverFingerprint` then holds the daemon's synthesized identity) and the HTTP status.
+   */
+  servedModel?: string | null; systemFingerprint?: string | null; httpStatus?: number;
   /** Closed failure code of a settled item, e.g. PROVIDER_RATE_LIMITED or STRUCTURED_OUTPUT_INVALID. */
   errorCode?: string };
 export type WorkerJob = {

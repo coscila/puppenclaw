@@ -21,9 +21,12 @@ import { canonicalJson, sha256Hex } from "./fingerprint.js";
  *   system message included. The daemon checks them (and any request setting
  *   the item repeats) against the bundle and sends them unchanged in the
  *   chat-completions request of the worker's model and the bundle's settings,
- *   with nothing added but the bundle's response format (see
- *   verbatimInstrumentCall). Only run principals granted the digest may use
- *   such an instrument.
+ *   with nothing added (see verbatimInstrumentCall). A verbatim bundle carries
+ *   no response schema (verbatimBundleProblem): the daemon would have to write
+ *   the response format and parse the answer itself, so the executor could no
+ *   longer recompute the request or read the model's own text. Only run
+ *   principals (kind run, bound to a study run) granted the digest may use such
+ *   an instrument.
  */
 export const INSTRUMENT_MESSAGE_MODES = ["policy-wrapped", "verbatim"] as const;
 export type InstrumentMessageMode = (typeof INSTRUMENT_MESSAGE_MODES)[number];
@@ -46,6 +49,15 @@ export type InstrumentBundle = z.infer<typeof instrumentBundleZod>;
 /** How an installed bundle's item messages reach the upstream; a bundle without `transport` is policy-wrapped. */
 export function instrumentMessageMode(bundle: Pick<InstrumentBundle, "transport">): InstrumentMessageMode {
   return bundle.transport?.messages ?? "policy-wrapped";
+}
+
+/**
+ * Why a bundle cannot be installed as a verbatim instrument, or null. A verbatim call is the executor's request byte
+ * for byte, so the bundle may not make the daemon add a response format (and parse the answer) on its behalf.
+ */
+export function verbatimBundleProblem(bundle: InstrumentBundle): string | null {
+  if (instrumentMessageMode(bundle) !== "verbatim") return null;
+  return bundle.responseSchema != null ? "A verbatim instrument carries no responseSchema: its calls are sent byte for byte as the executor built them and answered with the model's own text." : null;
 }
 
 /** The message mode of a bundle as the allow-list returns it (validated when installed), for listings. */

@@ -593,7 +593,8 @@ its `transport`). The allow-list lives in `advanced.sqlite` and survives
 restarts. The PUT's `settingsSha256` digests the installed settings (system
 prompt as sent, response schema, sampling, the output-token rule, items per
 call, required fingerprint, and `messages: "verbatim"` for a verbatim bundle);
-each receipt's `settingsSha256` digests one call. A bundle without `transport` is
+each receipt's `settingsSha256` digests one call. A verbatim bundle carries no
+response schema (400 `INVALID_INSTRUMENT`). A bundle without `transport` is
 policy-wrapped, and a policy-wrapped bundle is stored without the field whether
 the PUT spells the default out or not: both PUTs install the same instrument, and
 a daemon from before transport modes reads it unchanged.
@@ -644,20 +645,34 @@ the canonical JSON (keys sorted by code point, no whitespace, numbers as
 JSON.stringify writes them) of exactly `{model, messages, max_tokens,
 temperature, seed, reasoning_effort, stream: false}`: the worker's model, the
 messages as submitted and the bundle's settings, `seed` only when the bundle
-sets one, plus `response_format: {type: "json_schema", json_schema: {name:
-"worker_result", strict: true, schema}}` when the bundle has a response schema
-(the provider's dialect-safe schema; validation stays local). A census
-executor's own chat-completions request has exactly these keys. The receipt
-carries `requestSha256` (the sha256 of those bytes), `settingsSha256` over that
+sets one, and nothing else (no response format: a verbatim bundle carries no
+schema, so the answer is the model's own text). A census executor's own
+chat-completions request has exactly these keys. The receipt carries
+`requestSha256` (the sha256 of those bytes), `settingsSha256` over that
 request, `serverFingerprint` and `instrumentDigest`, so the executor proves byte
 identity per call by comparing `requestSha256` with the canonical digest of the
 request it built. The output is the first choice's message content;
-`finish_reason=length`, the response schema and `requiredModelFingerprint`
-apply as above. Only a run principal whose `grants.instruments` include the
-digest runs a verbatim instrument; chat-turn attempt authority never does (409
-`PRINCIPAL_REQUIRED`, and the turn socket does not list it). A daemon from
-before transport modes refuses a verbatim bundle, both at the PUT and for jobs
-naming one, rather than running it policy-wrapped.
+`finish_reason=length` marks the item truncated as above. The answer is
+classified as an executor calling the judge directly classifies it: a 2xx whose
+first choice carries no message with text or null content (no choices, a
+garbled body, content parts) is no answer and is asked again like a failed call
+(`NO_FINAL_MESSAGE`, retryable), an empty completion (content null or empty) is
+asked again and, once the attempts are spent, settles `completed` with the empty
+text. Each verbatim item also records what the upstream itself said:
+`servedModel` (the model the response named, null when it named none; `model`
+keeps its old meaning and then holds the requested model), `systemFingerprint`
+(the response's own `system_fingerprint`, null when it offered none, when
+`serverFingerprint` is the daemon's synthesized identity) and `httpStatus` of
+the settling call (every 4xx other than 401, 403, 404 and 429 settles
+`INVALID_REQUEST`; the status tells a request the judge refused, 400, 413 or 422,
+from a transient one such as 408). `requiredModelFingerprint` is checked against
+those two only: a response that names another model or none at all pauses the
+job (`MODEL_DRIFT`), and the requested model is never taken on trust. Only a run
+principal, one bound to a study run, whose `grants.instruments` include the
+digest runs a verbatim instrument; chat-turn attempt authority and human
+principals never do (409 `PRINCIPAL_REQUIRED`, and the turn socket does not list
+it). A daemon from before transport modes refuses a verbatim bundle, both at the
+PUT and for jobs naming one, rather than running it policy-wrapped.
 
 **Provider pauses and retries.** HTTP 429 and authentication failures (401,
 403) pause the provider for the attempt at once; a 503 does so only after the
@@ -795,6 +810,18 @@ Grants:
   its principal is live and still admits it (grants, budget, expiry, unchanged
   worker configuration); otherwise it waits as `interrupted` for an explicit
   resume. Every item therefore settles, and is reported, exactly once per job.
+- `POST /jobs/{id}/resume` continues a job's unfinished items as a new job of
+  its lineage. Resuming a job that was resumed before answers that earlier
+  resume's job and changes nothing else: it clears no provider pause, so a
+  client may walk a long lineage to its tail without letting other work dispatch
+  into a provider that is still limited. A job whose worker configuration changed
+  since it was submitted (a provider's endpoint, model, credential variable or
+  label in `PUPPENCLAW_MODEL_PROVIDERS`) cannot resume (409
+  `WORKER_CONFIG_CHANGED`); submit it again under another idempotency key. A
+  submission whose idempotency key already holds other work (another worker
+  configuration or request) is refused with 409 `WORKER_KEY_CONFLICT`, whose
+  body names that job (`jobId`, always one of the caller's own), so the client
+  can read what the key holds.
 
 The socket is the identity:
 
@@ -818,7 +845,9 @@ The socket is the identity:
   Agent workers, native model routes, proxying and CONNECT are refused. No
   header, body field or environment variable names a principal.
 - Principals and sockets persist: a restart reopens each socket at the same path
-  in the same directory; only the socket file is replaced.
+  in the same directory; only the socket file is replaced. The daemon reopens
+  the sockets after broker recovery has requeued the jobs that were running, so
+  no job can be submitted while recovery would still launch it a second time.
 
 How a sandbox gets its principal socket (the lab launcher does this; plan R5/E4):
 
@@ -868,7 +897,11 @@ Advanced worker jobs store each result in its own SQLite row and each distinct
 input once, as a blob keyed by the sha256 of its JSON (a resumed job reuses the
 inputs of its predecessor). Existing job records migrate transactionally at
 startup; completed items and idempotency keys survive the migration. Back up the
-daemon state before updating it. See "pcp/2 broker feed and instrument mode"
+daemon state before updating it. Inputs are kept for as long as their jobs: a
+one-item verbatim job of 40 entries stores about 120 KB, so every 10,000 such
+jobs add about 1.2 GB to `advanced.sqlite`. Jobs of a run principal are never
+archived and no run-scoped purge exists yet: plan the data volume for a large
+study run. See "pcp/2 broker feed and instrument mode"
 above for the store's group commit, recovery and rollback behaviour.
 
 For large runs, use `GET /orchestration/jobs?session=NAME&view=summary&after=0&limit=100`

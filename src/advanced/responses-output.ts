@@ -20,7 +20,19 @@ export function responseOutputText(payload: unknown): string {
 
 /** The final answer of a chat completion: the first choice's message content, without reasoning or refusals. */
 export function chatCompletionOutputText(payload: unknown): string {
+  const content = chatCompletionContent(payload);
+  return typeof content === "string" ? content : "";
+}
+
+/**
+ * The first choice's message content of a chat completion: its text, null when the message carries no content
+ * (an empty completion), or undefined when the payload holds no first choice with a message whose content is text
+ * or null (no chat completion at all).
+ */
+export function chatCompletionContent(payload: unknown): string | null | undefined {
   const choices = object(payload)?.choices;
   const message = Array.isArray(choices) ? object(object(choices[0])?.message) : null;
-  return typeof message?.content === "string" ? message.content : "";
+  if (!message) return undefined;
+  const content = message.content;
+  return typeof content === "string" ? content : content === null || content === undefined ? null : undefined;
 }

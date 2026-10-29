@@ -298,41 +298,111 @@ describe("verbatim instruments: receipts", () => {
     expect(receiptEvents(runtime, job.jobId)).toEqual([expect.objectContaining({ itemId: "call", attempt: 2, status: "succeeded", requestSha256: digest })]);
   });
 
-  it("adds only the bundle's response format, dialect-safe, validates the answer locally and keeps truncation and drift checks", async () => {
-    const schema = { type: "object", properties: { labels: { type: "array", items: { type: "string", enum: ["T", "F"] }, uniqueItems: true } }, required: ["labels"], additionalProperties: false };
+  it("refuses a verbatim bundle with a response schema, and never sends one stored before that rule", async () => {
+    const schema = { type: "object", properties: { labels: { type: "array", items: { type: "string" } } }, required: ["labels"], additionalProperties: false };
+    const up = await upstream();
+    const { runtime, registry } = await harness({ providers: [provider(up.url)] });
+    expect(() => runtime.installInstrument(DIGEST, bundle({ responseSchema: schema }))).toThrow(expect.objectContaining({ code: "INVALID_INSTRUMENT", message: expect.stringMatching(/carries no responseSchema/u) }));
+    expect(runtime.instruments()).toEqual([]);
+    // A policy-wrapped bundle may still carry its schema.
+    expect(runtime.installInstrument(WRAPPED, bundle({ responseSchema: schema, transport: { messages: "policy-wrapped" } })).bundle.responseSchema).toEqual(schema);
+    // A verbatim bundle with a schema stored by an earlier build: its items are refused before any call.
+    runtime.store.putInstrument(DIGEST, bundle({ responseSchema: schema }), "legacy-settings");
+    const socket = await principal(registry, "run:census", [DIGEST]);
+    const job = (await unix(socket, "/bulk/submit", { configId: "judge", idempotencyKey: "legacy-schema", instrumentDigest: DIGEST, items: [item("call", "entry", 1)] })).body;
+    const done = await settledJob(runtime, job.jobId);
+    expect(done.results[0]).toMatchObject({ state: "failed", errorCode: INSTRUMENT_MESSAGE_MISMATCH, error: expect.stringMatching(/carries no responseSchema/u) });
+    expect(up.calls).toHaveLength(0);
+  });
+
+  it("returns the model's own text, records a cut answer as truncated, and pauses on drift, including a response that names no model", async () => {
     const answers: Record<string, unknown> = {
-      "good": completion("{\"labels\":[\"T\",\"F\"]}"),
-      "bad-schema": completion("{\"labels\":[\"maybe\"]}"),
-      "cut": completion("{\"labels\":[\"T\"", { choices: [{ index: 0, message: { role: "assistant", content: "{\"labels\":[\"T\"" }, finish_reason: "length" }] })
+      "good": completion("{\"l\":\"1\",\"v\":\"T\"}"),
+      "cut": completion("{\"l\":\"1\"", { choices: [{ index: 0, message: { role: "assistant", content: "{\"l\":\"1\"" }, finish_reason: "length" }] }),
+      "other-model": { ...completion("{\"l\":\"1\"}"), model: "another-model", system_fingerprint: undefined },
+      "no-model": { ...completion("{\"l\":\"1\"}"), model: undefined, system_fingerprint: undefined }
     };
     const up = await upstream({ respond: (_call, raw, res) => {
       const body = JSON.parse(raw.toString()) as { messages: { content: string }[] };
-      const key = body.messages[1]!.content;
-      if (key === "drift") { reply(res, 200, { ...completion("{\"labels\":[]}"), model: "another-model", system_fingerprint: undefined }); return; }
-      reply(res, 200, answers[key]);
+      reply(res, 200, answers[body.messages[1]!.content]);
     } });
-    const { runtime, registry } = await harness({ providers: [provider(up.url, { reasoningProfile: "qwen-3.8" })] });
-    runtime.installInstrument(DIGEST, bundle({ responseSchema: schema }));
-    runtime.installInstrument("pinned", bundle({ responseSchema: schema, requiredModelFingerprint: "judge-served" }));
-    const socket = await principal(registry, "run:census", [DIGEST, "pinned"]);
-    const job = (await unix(socket, "/bulk/submit", { configId: "judge", idempotencyKey: "structured", instrumentDigest: DIGEST, concurrency: 1, items: ["good", "bad-schema", "cut"].map((key) => item(key, key, 1)) })).body;
+    const { runtime, registry } = await harness({ providers: [provider(up.url)] });
+    runtime.installInstrument(DIGEST, bundle());
+    runtime.installInstrument("pinned", bundle({ requiredModelFingerprint: "judge-served" }));
+    const socket = await principal(registry, "run:census", [DIGEST]);
+    const job = (await unix(socket, "/bulk/submit", { configId: "judge", idempotencyKey: "plain", instrumentDigest: DIGEST, concurrency: 1, items: ["good", "cut"].map((key) => item(key, key, 1)) })).body;
     const done = await settledJob(runtime, job.jobId);
-    expect(done.results.map((result) => [result.id, result.state, result.errorCode ?? null, result.truncated ?? false])).toEqual([["good", "completed", null, false], ["bad-schema", "failed", "STRUCTURED_OUTPUT_INVALID", false], ["cut", "failed", "STRUCTURED_OUTPUT_INVALID", true]]);
-    expect(done.results[0]!.output).toEqual({ labels: ["T", "F"] });
-    const providerSchema = { type: "object", properties: { labels: { type: "array", items: { type: "string", enum: ["T", "F"] } } }, required: ["labels"], additionalProperties: false };
-    for (const [index, call] of up.calls.entries()) {
-      const key = ["good", "bad-schema", "cut"][index]!;
-      const expected = { ...executorRequest(key, 1), response_format: { type: "json_schema", json_schema: { name: "worker_result", strict: true, schema: providerSchema } } };
-      expect(call.raw.equals(Buffer.from(canonicalJson(expected)))).toBe(true);
-      expect(done.results[index]).toMatchObject({ requestSha256: sha256(call.raw), settingsSha256: settingsSha256(effectiveSettings(expected)) });
+    expect(done.results.map((result) => [result.id, result.state, result.output, result.truncated ?? false, result.finishReason])).toEqual([["good", "completed", "{\"l\":\"1\",\"v\":\"T\"}", false, "stop"], ["cut", "completed", "{\"l\":\"1\"", true, "length"]]);
+    expect(receiptEvents(runtime, job.jobId).map((payload) => [payload.itemId, payload.status])).toEqual([["good", "succeeded"], ["cut", "truncated"]]);
+    // Who answered decides before what the answer says; a response naming no model never stands for the required one.
+    for (const key of ["other-model", "no-model"]) {
+      // One principal per case: a drift pauses the provider for the principal that met it.
+      const pinnedSocket = await principal(registry, `run:drift-${key}`, ["pinned"]);
+      const pinned = (await unix(pinnedSocket, "/bulk/submit", { configId: "judge", idempotencyKey: `drift-${key}`, instrumentDigest: "pinned", concurrency: 1, items: [item("a", key, 1), item("b", key, 1)] })).body;
+      const drifted = await settledJob(runtime, pinned.jobId);
+      expect(drifted.state, key).toBe("paused");
+      expect(drifted.results.map((result) => [result.state, result.errorCode ?? null]), key).toEqual([["paused", "MODEL_DRIFT"], ["queued", null]]);
+      expect(drifted.results[0], key).not.toHaveProperty("output");
+      expect(drifted.results[0], key).toMatchObject({ servedModel: key === "no-model" ? null : "another-model", systemFingerprint: null, model: key === "no-model" ? "judge-model" : "another-model" });
+      expect(runtime.store.jobHeader(pinned.jobId)!.error, key).toMatch(key === "no-model" ? /served a response naming no model/u : /served another-model/u);
     }
-    expect(receiptEvents(runtime, job.jobId).map((payload) => [payload.itemId, payload.status])).toEqual([["good", "succeeded"], ["bad-schema", "failed"], ["cut", "truncated"]]);
-    // Who answered decides before what the answer says.
-    const pinned = (await unix(socket, "/bulk/submit", { configId: "judge", idempotencyKey: "drift", instrumentDigest: "pinned", concurrency: 1, items: [item("a", "drift", 1), item("b", "drift", 1)] })).body;
-    const drifted = await settledJob(runtime, pinned.jobId);
-    expect(drifted.state).toBe("paused");
-    expect(drifted.results.map((result) => [result.state, result.errorCode ?? null])).toEqual([["paused", "MODEL_DRIFT"], ["queued", null]]);
-    expect(drifted.results[0]).not.toHaveProperty("output");
+  });
+});
+
+describe("verbatim instruments: what the upstream answered", () => {
+  it("records the served model, the system_fingerprint (null when the daemon synthesized one) and the HTTP status of the settling call", async () => {
+    const up = await upstream({ respond: (_call, raw, res) => {
+      const key = (JSON.parse(raw.toString()) as { messages: { content: string }[] }).messages[1]!.content;
+      if (key === "plain") reply(res, 200, completion("T"));
+      else if (key === "no-fingerprint") reply(res, 200, { ...completion("T"), system_fingerprint: null });
+      else reply(res, 200, { ...completion("T"), model: undefined, system_fingerprint: undefined });
+    } });
+    const { runtime, registry } = await harness({ providers: [provider(up.url)] });
+    runtime.installInstrument(DIGEST, bundle());
+    const socket = await principal(registry, "run:census", [DIGEST]);
+    const job = (await unix(socket, "/bulk/submit", { configId: "judge", idempotencyKey: "answered", instrumentDigest: DIGEST, concurrency: 1, items: ["plain", "no-fingerprint", "no-model"].map((key) => item(key, key, 1)) })).body;
+    const results = new Map((await settledJob(runtime, job.jobId)).results.map((result) => [result.id, result]));
+    expect(results.get("plain")).toMatchObject({ state: "completed", servedModel: "judge-served", systemFingerprint: "fp_verbatim", serverFingerprint: "fp_verbatim", httpStatus: 200, model: "judge-served" });
+    expect(results.get("no-fingerprint")).toMatchObject({ state: "completed", servedModel: "judge-served", systemFingerprint: null, httpStatus: 200 });
+    expect(results.get("no-fingerprint")!.serverFingerprint).toMatch(/^judge-served@[0-9a-f]{16}$/u);
+    // No served model: the item says so; `model` keeps the requested model as before.
+    expect(results.get("no-model")).toMatchObject({ state: "completed", servedModel: null, systemFingerprint: null, model: "judge-model" });
+  });
+
+  it("asks a 2xx without a chat completion message again and then fails it, asks an empty completion again and then settles it empty, and reports a 408 with its status", async () => {
+    const seen = new Map<string, number>();
+    const up = await upstream({ respond: (_call, raw, res) => {
+      const key = (JSON.parse(raw.toString()) as { messages: { content: string }[] }).messages[1]!.content;
+      const n = (seen.get(key) ?? 0) + 1; seen.set(key, n);
+      if (key === "no-choices") reply(res, 200, { ...completion("T"), choices: [] });
+      else if (key === "no-message") reply(res, 200, { ...completion("T"), choices: [{ index: 0, finish_reason: "stop" }] });
+      else if (key === "parts") reply(res, 200, { ...completion("T"), choices: [{ index: 0, message: { role: "assistant", content: [{ type: "text", text: "T" }] }, finish_reason: "stop" }] });
+      else if (key === "garbled") { if (n === 1) { res.writeHead(200, { "content-type": "application/json" }); res.end("{\"choices\": [tru"); } else reply(res, 200, completion("T")); }
+      else if (key === "empty") reply(res, 200, completion(null, { choices: [{ index: 0, message: { role: "assistant", content: null }, finish_reason: "length" }] }));
+      else if (key === "empty-once") reply(res, 200, n === 1 ? completion("") : completion("T"));
+      else if (key === "timeout-408") reply(res, 408, { error: { type: "request_timeout" } });
+      else reply(res, 200, completion("T"));
+    } });
+    const { runtime, registry } = await harness({ providers: [provider(up.url)], retryAttempts: 3 });
+    runtime.installInstrument(DIGEST, bundle());
+    const socket = await principal(registry, "run:census", [DIGEST]);
+    const keys = ["no-choices", "no-message", "parts", "garbled", "empty", "empty-once", "timeout-408"];
+    const job = (await unix(socket, "/bulk/submit", { configId: "judge", idempotencyKey: "classify", instrumentDigest: DIGEST, concurrency: 1, items: keys.map((key) => item(key, key, 1)) })).body;
+    const results = new Map((await settledJob(runtime, job.jobId)).results.map((result) => [result.id, result]));
+    for (const key of ["no-choices", "no-message", "parts"]) {
+      expect(results.get(key), key).toMatchObject({ state: "failed", errorCode: "NO_FINAL_MESSAGE", attempts: 3, httpStatus: 200 });
+      expect(results.get(key), key).not.toHaveProperty("output");
+      expect(seen.get(key), key).toBe(3);
+    }
+    expect(results.get("garbled")).toMatchObject({ state: "completed", output: "T", attempts: 2 });
+    expect(results.get("empty")).toMatchObject({ state: "completed", output: "", attempts: 3, truncated: true, finishReason: "length" });
+    expect(seen.get("empty")).toBe(3);
+    expect(results.get("empty-once")).toMatchObject({ state: "completed", output: "T", attempts: 2 });
+    expect(results.get("timeout-408")).toMatchObject({ state: "failed", errorCode: "INVALID_REQUEST", httpStatus: 408, attempts: 1 });
+    // Every attempt kept its transport receipt; each item settled once.
+    expect(receiptEvents(runtime, job.jobId).map((payload) => payload.itemId).sort()).toEqual([...keys].sort());
+    const failed = receiptEvents(runtime, job.jobId).find((payload) => payload.itemId === "no-choices")!;
+    expect(failed.error).toEqual({ code: "NO_FINAL_MESSAGE", retryable: true });
   });
 });
 
@@ -392,6 +462,8 @@ describe("verbatim instruments: authority", () => {
     expect(body.input[0]!.content.endsWith(`\n\n${SYSTEM}`)).toBe(true);
     // Policy-wrapped receipts carry requestSha256 too: the canonical JSON of the Responses body sent.
     expect(runtime.store.job(wrapped.jobId)!.results[0]!.requestSha256).toBe(sha256(canonicalJson(JSON.parse(up.calls[0]!.raw.toString()))));
+    // Only verbatim items record what the upstream itself named.
+    for (const field of ["servedModel", "systemFingerprint", "httpStatus"]) expect(runtime.store.job(wrapped.jobId)!.results[0]).not.toHaveProperty(field);
 
     // Defence in depth: a verbatim job without a principal that reached dispatch anyway is refused per item, without a call.
     const internals = runtime as unknown as { participants: Map<string, RuntimeParticipant>; launch(job: WorkerJob, p: RuntimeParticipant): void };
@@ -408,5 +480,17 @@ describe("verbatim instruments: authority", () => {
     expect(result).toMatchObject({ state: "failed", errorCode: "PRINCIPAL_REQUIRED" });
     expect(up.calls).toHaveLength(1);
     expect(runtime.store.jobReceipts(forged.jobId)).toEqual([]);
+  });
+
+  it("refuses a verbatim instrument to a principal that is not bound to a study run, even with the grant", async () => {
+    const up = await upstream();
+    const { runtime, registry } = await harness({ providers: [provider(up.url)] });
+    runtime.installInstrument(DIGEST, bundle());
+    const view = await registry.put("human:reviewer", { kind: "human", runId: null, ownerKey: OWNER, grants: { providers: ["judge"], instruments: [DIGEST], maxConcurrency: 8, maxItems: null, tokenBudget: null, expiresAt: null }, socket: true });
+    const refused = await unix(view.socketPath!, "/bulk/submit", { configId: "judge", idempotencyKey: "human", instrumentDigest: DIGEST, items: [item("x", "entry", 1)] });
+    expect(refused).toMatchObject({ status: 409, body: { code: "PRINCIPAL_REQUIRED" } });
+    expect(refused.body.error).toMatch(/bound to a study run/u);
+    expect(runtime.store.jobHeaders("principal:human:reviewer")).toEqual([]);
+    expect(up.calls).toHaveLength(0);
   });
 });

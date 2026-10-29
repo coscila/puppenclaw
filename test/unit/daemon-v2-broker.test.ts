@@ -99,6 +99,10 @@ describe("pcp/2 verbatim instruments on the daemon", () => {
         expect(invalid.statusCode, JSON.stringify(transport)).toBe(400);
         expect(JSON.parse(invalid.body)).toMatchObject({ code: "INVALID_INSTRUMENT" });
       }
+      // A verbatim bundle carries no response schema: the daemon would have to write the format and parse the answer.
+      const schema = await put("digest-schema", { ...verbatim, responseSchema: { type: "object", properties: { l: { type: "string" } } } });
+      expect(schema.statusCode).toBe(400);
+      expect(JSON.parse(schema.body)).toMatchObject({ code: "INVALID_INSTRUMENT", error: expect.stringMatching(/carries no responseSchema/u) });
       // Spelling out the default installs the instrument a bundle without transport is.
       const plain = await put("digest-plain", instrument);
       const explicit = await put("digest-plain", { ...instrument, transport: { messages: "policy-wrapped" } });

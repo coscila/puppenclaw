@@ -29,7 +29,7 @@ import {
 } from "./principals-schema.js";
 import { INSTRUMENT_MESSAGE_MISMATCH, storedMessageMode } from "./instruments.js";
 import { PrincipalStore, type PrincipalAuditEntry } from "./principals-store.js";
-import { publicJob, type AdvancedRuntime } from "./runtime.js";
+import { conflictingJob, publicJob, type AdvancedRuntime } from "./runtime.js";
 import { pageOptions } from "./store.js";
 import {
   bulkSubmitZod,
@@ -110,6 +110,12 @@ export type PrincipalRegistryOptions = {
   legacyAttemptAuthority?: boolean;
   now?: () => number;
   warn?: (message: string) => void;
+  /**
+   * false: live principals reattach without reopening their sockets; reopenSockets() opens them. The daemon opens
+   * them only after broker recovery, so no job can be submitted before recovery has requeued the jobs that were
+   * running at the restart (recovery would otherwise launch such a new job a second time).
+   */
+  reopenSockets?: boolean;
 };
 
 function stable(value: unknown): string {
@@ -213,9 +219,19 @@ export class PrincipalRegistry implements PrincipalHooks {
         continue;
       }
       const entry = registry.attach(record);
-      if (record.socket) await registry.listen(entry).catch((error: unknown) => registry.warn(`puppenclaw: principal ${record.id} socket did not reopen: ${errorText(error)}`));
+      if (record.socket && options.reopenSockets !== false) await registry.listen(entry).catch((error: unknown) => registry.warn(`puppenclaw: principal ${record.id} socket did not reopen: ${errorText(error)}`));
     }
     return registry;
+  }
+
+  /** Opens the sockets of live principals whose socket is not open (at boot, after broker recovery), at the same paths. */
+  async reopenSockets(): Promise<void> {
+    for (const entry of [...this.entries.values()]) {
+      await this.serialize(entry.record.id, async () => {
+        if (this.closing || !entry.record.socket || entry.socket || entry.record.revokedAt !== null || this.entries.get(entry.record.id) !== entry) return;
+        await this.listen(entry).catch((error: unknown) => this.warn(`puppenclaw: principal ${entry.record.id} socket did not reopen: ${errorText(error)}`));
+      });
+    }
   }
 
   // --- pcp/2 routes -------------------------------------------------------
@@ -669,7 +685,7 @@ export class PrincipalRegistry implements PrincipalHooks {
     } catch (error) {
       if (res.headersSent) { res.destroy(); return; }
       const [status, code] = socketStatus(error);
-      reply(status, { error: errorText(error), code });
+      reply(status, { error: errorText(error), code, ...conflictingJob(error) });
     }
   }
 
