@@ -426,9 +426,10 @@ set; none of them is added to the open `/health` and `/capabilities`.
   ms over a 30 s window) and `memory`.
 - `GET /v2/capabilities`: `features` (`health`, `opsIdle`, `usageLedger`,
   `compactStatus`, `keyedStreaming`, `sseGap`, and the broker's `eventFeed`,
-  `brokerOutbox`, `instrumentMode` and `instrumentVerbatim` described below),
-  `limits`, and provider dialect limits, e.g. the structured-output keywords
-  removed for `qwen-3.8`.
+  `brokerOutbox`, `instrumentMode`, `instrumentVerbatim` and `workerPolicy`
+  described below), `advancedOrchestration` (the worker policy details, see
+  "Worker policy"), `limits`, and provider dialect limits, e.g. the
+  structured-output keywords removed for `qwen-3.8`.
 - `GET /ops/idle`: counts only, each measured at request time (active turns,
   turn and runner processes, running turn keys, active and paused broker jobs,
   active compute jobs, open streams). Restart survivors count only while their
@@ -906,6 +907,88 @@ run binding, grants, usage, counted items and audit go. Daemons from before prin
   it only denies, never grants.
 - Any other value fails startup.
 
+
+### Worker policy (`advancedOrchestration.workerPolicy`)
+
+A turn's advanced orchestration may give each worker a policy that coscila
+decides and the daemon enforces wherever it admits jobs (plan E4):
+
+- `evidencePolicy`: `public-literature`, `entitled-institutional` (licensed full
+  text under the institution's entitlement) or `confidential-manuscript` (an
+  unpublished manuscript of which only identifiers may leave);
+- `capabilityProfile`: `code-authoring` (Claude workers only), `evidence-only`
+  (bulk calls on supplied evidence, no agent, tools or programs) or
+  `run-fixed-programs` (only the programs it is given: a Claude worker as an
+  agent, any other through pinned-instrument bulk calls only);
+- `instruments`: 1-16 pinned instruments `{id: "name@version", digest: <sha256
+  hex>}` with unique ids and digests, for evidence-only and run-fixed-programs
+  workers.
+
+The daemon advertises it as `advancedOrchestration.workerPolicy: 1` in
+`/capabilities` and as `features.workerPolicy: 1` in `/v2/capabilities`, whose
+`advancedOrchestration` adds `evidencePolicies`, `capabilityProfiles`,
+`onPremisesProviders` and `identifierOnlyEgress: "coscila"`. coscila sends these
+fields only to a daemon that advertises it. Both lists are versioned: an unknown
+evidence policy is refused with 400 `UNSUPPORTED_EVIDENCE_POLICY`, an unknown
+profile with 400 `UNSUPPORTED_CAPABILITY_PROFILE`, never ignored. Coscila's
+contract rules are checked again (400 `INVALID_WORKER_POLICY`): an
+entitled-institutional or confidential-manuscript worker is evidence-only,
+pinned instruments belong to an evidence-only or run-fixed-programs worker, and
+code-authoring needs agent `claude`.
+
+On the turn socket:
+
+- An entitled-institutional or confidential-manuscript worker uses on-premises
+  providers only, as if granted `model:onprem-only`: its bulk submissions are
+  refused with 403 `PROVIDER_NOT_ON_PREMISES` before any call, `GET /configs`
+  reports it with `bulkAvailable: false`, and an item still queued when the
+  configuration changes is refused at dispatch (failed, the same code, no call).
+- No agent job for an evidence-only worker, nor for a run-fixed-programs or
+  code-authoring worker that is not Claude (403 `CAPABILITY_PROFILE_DENIED`).
+  coscila's sandbox wrapper refuses these too, when its profiles are enforced.
+- A worker with pinned instruments submits bulk work under one of them only
+  (403 `INSTRUMENT_REQUIRED`, 403 `INSTRUMENT_NOT_PINNED`); a run-fixed-programs
+  worker that is not Claude and pins none has no bulk calls either
+  (`INSTRUMENT_REQUIRED`, `bulkAvailable: false`). coscila pins the registry's
+  `name@version` and registry digest, while the daemon allow-lists the broker
+  digest derived from it, so a pin matches an installed bundle whose
+  `instrumentId` (or `instrumentId@version`) is the pin's id, or whose digest
+  equals the pin's digest; the daemon cannot recompute a registry digest.
+- `GET /configs` lists `capabilityProfile` and `instruments` only for workers
+  that have them; a worker without policy is listed and admitted exactly as
+  before.
+
+On premises is decided from the daemon's own provider configuration, never from
+the URL a turn sends (the lab's loopback proxies forward to external services
+too). `PUPPENCLAW_ONPREM_PROVIDERS` is a JSON array of provider ids, each
+configured in `PUPPENCLAW_MODEL_PROVIDERS` with a `baseUrl`, for example
+`["remote_qwen38_none","remote_qwen38_low"]`. A worker's provider is on premises
+when its id is listed and it names the configured kind and endpoint (model,
+label and credential variable may differ). Unset means no provider is on
+premises, so restricted evidence is refused; an invalid value or an id that
+`PUPPENCLAW_MODEL_PROVIDERS` does not configure fails startup.
+
+Identifier-only egress for confidential-manuscript evidence stays with coscila:
+the daemon's egress proxy allows or denies hosts and tunnels TLS it cannot read.
+On the daemon's side such a worker is evidence-only, so it gets no agent job and
+with it no egress tunnel, and its bulk calls go to an on-premises provider only.
+
+A session persists only the workers without a policy, in the frozen shape every
+earlier daemon loads (`state.json` never holds a worker policy field; a turn
+whose workers all have one leaves no orchestration there). A later turn that
+sends no orchestration falls back to what was persisted, so it can never run a
+policy worker with fewer restrictions. Run principals are unaffected: their
+workers come from their grants and carry no policy, and their grants carry no
+evidence policy yet.
+
+`PUPPENCLAW_WORKER_POLICY`: `on` (default) as above; `off` advertises nothing
+and refuses any worker policy field with 400 `WORKER_POLICY_DISABLED`, before any
+session state changes, while orchestrations without one run as before. Any
+other value fails startup. Rollback: a daemon from before worker policy loads
+the state this version writes, and opens `advanced.sqlite`, where a job's stored
+worker configuration keeps its policy fields; it does not enforce them, and a
+resume under its own configuration (coscila withholds the fields from it) is
+refused with `WORKER_CONFIG_CHANGED`.
 
 Advanced worker jobs store each result in its own SQLite row and each distinct
 input once, as a blob keyed by the sha256 of its JSON (a resumed job reuses the

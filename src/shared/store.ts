@@ -5,12 +5,12 @@ import { dirname, join } from "node:path";
 import { z } from "zod";
 
 import {
-  advancedOrchestrationZod,
   agentKindZod,
   effortLevelZod,
   exposureModeZod,
   modelProviderConfigZod,
   permissionModeZod,
+  persistedAdvancedOrchestrationZod,
   planningProfileZod,
   REMOTE_CONTROL_VERBS,
   remoteVerbZod,
@@ -252,7 +252,8 @@ const sessionInfoZod = z
     model: z.string().min(1).optional(),
     modelProviderId: z.string().min(1).optional(),
     modelProvider: modelProviderConfigZod.optional(),
-    orchestration: advancedOrchestrationZod.optional(),
+    // The frozen shape every daemon since advanced orchestration loads; a turn's worker policy fields never reach state.
+    orchestration: persistedAdvancedOrchestrationZod.optional(),
     skills: z.array(z.string().min(1)).optional(),
     tokenUsage: tokenUsageZod.optional(),
     pendingQuestion: z.string().optional(),
