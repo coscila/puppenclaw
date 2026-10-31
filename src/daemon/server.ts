@@ -68,7 +68,7 @@ import { EventLoopMonitor } from "./event-loop.js";
 import { identityEnvelope, identityHeaders, resolveBuildId, type DaemonIdentity } from "./identity.js";
 import { registerV2Routes, type StreamBacklog } from "./v2.js";
 import { registerV2BrokerRoutes } from "./v2-broker.js";
-import { EVENT_PAGE_MAX, EVENT_WAIT_MAX_MS, INLINE_OUTPUT_MAX_BYTES } from "../advanced/outbox.js";
+import { BROKER_OUTBOX_LEVEL, EVENT_PAGE_MAX, EVENT_WAIT_MAX_MS, INLINE_OUTPUT_MAX_BYTES } from "../advanced/outbox.js";
 import { registerV2PrincipalRoutes } from "./v2-principals.js";
 import { SseEventStream, sseMaxPendingBytesFromEnv, type SseEvent } from "./sse.js";
 import {
@@ -525,7 +525,8 @@ export async function createDaemonServer(params: {
       keyedStreaming: 1,
       sseGap: 1,
       eventFeed: 1,
-      brokerOutbox: 1,
+      // 2: broker.job carries resumedFromJobId, broker.receipt servedModel, systemFingerprint and httpStatus.
+      brokerOutbox: BROKER_OUTBOX_LEVEL,
       instrumentMode: 1,
       instrumentVerbatim: 1,
       // Run principals need the bearer token; legacyAttemptAuthority says chat turns still carry bulk authority.

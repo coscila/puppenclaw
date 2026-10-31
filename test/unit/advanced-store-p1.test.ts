@@ -160,12 +160,14 @@ describe("P1 broker outbox and feed", () => {
       [1, BROKER_JOB_EVENT, null], [2, BROKER_JOB_EVENT, null], [3, BROKER_RECEIPT_EVENT, "one"], [4, BROKER_RECEIPT_EVENT, "two"], [5, BROKER_JOB_EVENT, null]
     ]);
     const last = page.events[4]!.payload as BrokerJobPayload;
-    // The pcp/2 fields plus two link hints (parentSessionName, attemptId).
-    expect(Object.keys(last).sort()).toEqual(["attemptId", "counts", "createdAt", "instrumentDigest", "jobId", "ownerKey", "parentSessionName", "principalId", "runId", "state", "updatedAt"]);
-    expect(last).toMatchObject({ jobId: "j", ownerKey: "owner-key-0123456789", principalId: null, runId: null, state: "failed", instrumentDigest: null, parentSessionName: "parent", attemptId: "attempt",
+    // The pcp/2 fields plus three link hints (parentSessionName, attemptId and, from brokerOutbox:2, resumedFromJobId).
+    expect(Object.keys(last).sort()).toEqual(["attemptId", "counts", "createdAt", "instrumentDigest", "jobId", "ownerKey", "parentSessionName", "principalId", "resumedFromJobId", "runId", "state", "updatedAt"]);
+    expect(last).toMatchObject({ jobId: "j", ownerKey: "owner-key-0123456789", principalId: null, runId: null, state: "failed", instrumentDigest: null, parentSessionName: "parent", attemptId: "attempt", resumedFromJobId: null,
       counts: { total: 3, queued: 1, running: 0, succeeded: 0, failed: 1, cancelled: 0, truncated: 1 } });
     const truncated = page.events[2]!.payload as BrokerReceiptPayload;
-    expect(Object.keys(truncated).sort()).toEqual(["attempt", "endedAt", "error", "finishReason", "instrumentDigest", "itemId", "jobId", "model", "output", "outputBytes", "outputDigest", "requestSha256", "serverFingerprint", "settingsSha256", "startedAt", "status", "usage"]);
+    expect(Object.keys(truncated).sort()).toEqual(["attempt", "endedAt", "error", "finishReason", "httpStatus", "instrumentDigest", "itemId", "jobId", "model", "output", "outputBytes", "outputDigest", "requestSha256", "servedModel", "serverFingerprint", "settingsSha256", "startedAt", "status", "systemFingerprint", "usage"]);
+    // brokerOutbox:2: what the upstream answered; this item recorded none and its receipt no HTTP status.
+    expect(truncated).toMatchObject({ servedModel: null, systemFingerprint: null, httpStatus: null });
     expect(truncated).toMatchObject({ jobId: "j", itemId: "one", attempt: 1, status: "truncated", finishReason: "length", model: "served-model", serverFingerprint: "fp_test",
       settingsSha256: "b".repeat(64), requestSha256: null, usage: { input: 10, output: 2, cacheRead: 0, cacheWrite: 0 }, output: "answer one", outputBytes: 10, error: null,
       startedAt: "2026-10-25T00:00:01.000Z", endedAt: "2026-10-25T00:00:02.000Z" });

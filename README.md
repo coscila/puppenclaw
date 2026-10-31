@@ -492,7 +492,7 @@ state writes, event-loop lag and stalled-stream memory against a built daemon.
 
 The advanced broker reports to coscila through an acknowledged event feed and
 runs measurement instruments that coscila installs. `GET /v2/capabilities`
-advertises each part under `features`: `eventFeed: 1`, `brokerOutbox: 1`,
+advertises each part under `features`: `eventFeed: 1`, `brokerOutbox: 2`,
 `instrumentMode: 1` and `instrumentVerbatim: 1` (limits `eventPageMax`,
 `eventWaitMsMax`, `eventInlineOutputMax`). The routes need the bearer token
 like every v2 route, and every body carries `protocol`, `bootId` and `spoolId`;
@@ -526,10 +526,13 @@ renames them.
   `INVALID_EVENT_CURSOR`.
 - `broker.job` payload: `{jobId, ownerKey, principalId, runId, state, counts:
   {total, queued, running, succeeded, failed, cancelled, truncated},
-  instrumentDigest, createdAt, updatedAt}` (absent values are null), plus two
+  instrumentDigest, createdAt, updatedAt}` (absent values are null), plus three
   link hints beyond these pcp/2 fields: `parentSessionName` (the chat's daemon
-  session, or `principal:<id>`) and `attemptId`. coscila ties a job to its chat
-  by them and erases a purged chat's jobs by the session. Counts
+  session, or `principal:<id>`), `attemptId` and, from `brokerOutbox: 2`,
+  `resumedFromJobId` (the job this one resumes, null when it resumes none; a
+  resume re-runs a job's unfinished items under their item ids in a new job, so
+  a consumer counting items per lineage follows it). coscila ties a job to its
+  chat by them and erases a purged chat's jobs by the session. Counts
   fold item states into these categories: paused and interrupted items count as
   failed (a resume runs them in a new job), a truncated item counts once, as
   truncated. Items in flight when a job pauses or is cancelled settle after
@@ -538,10 +541,18 @@ renames them.
   did not change).
 - `broker.receipt` payload: `{jobId, itemId, attempt, status
   (succeeded|failed|truncated|cancelled), finishReason, usage: {input, output,
-  cacheRead, cacheWrite}, model, serverFingerprint, settingsSha256,
-  requestSha256, instrumentDigest, outputDigest, outputBytes, output, startedAt,
-  endedAt, error: {code, retryable} | null}` (`requestSha256` is null for agent
-  jobs and for receipts written before it existed). `output` is inline only up
+  cacheRead, cacheWrite}, model, serverFingerprint, servedModel,
+  systemFingerprint, httpStatus, settingsSha256, requestSha256, instrumentDigest,
+  outputDigest, outputBytes, output, startedAt, endedAt, error: {code,
+  retryable} | null}` (`requestSha256` is null for agent jobs and for receipts
+  written before it existed). `model` and `serverFingerprint` can hold the
+  requested model and the daemon's synthesized identity; `servedModel`,
+  `systemFingerprint` and `httpStatus` (`brokerOutbox: 2`) say what the upstream
+  itself answered to the settling call: the model its response named, its
+  `system_fingerprint` (each null when it named none) and the HTTP status (null
+  without an HTTP response). Agent jobs and items settled by a daemon before
+  `brokerOutbox: 2` have null `servedModel` and `systemFingerprint`; their
+  `httpStatus` comes from the settling call's receipt. `output` is inline only up
   to 16384 UTF-8 bytes; larger outputs stay in the job's result pages.
   `outputDigest` is the sha256 of the output as a string, or of its compact JSON
   when it is structured. Agent jobs report their single item over all its native
@@ -658,7 +669,8 @@ first choice carries no message with text or null content (no choices, a
 garbled body, content parts) is no answer and is asked again like a failed call
 (`NO_FINAL_MESSAGE`, retryable), an empty completion (content null or empty) is
 asked again and, once the attempts are spent, settles `completed` with the empty
-text. Each verbatim item also records what the upstream itself said:
+text. Each bulk item, verbatim or policy-wrapped, also records what the upstream
+itself said, and its `broker.receipt` event carries the same:
 `servedModel` (the model the response named, null when it named none; `model`
 keeps its old meaning and then holds the requested model), `systemFingerprint`
 (the response's own `system_fingerprint`, null when it offered none;

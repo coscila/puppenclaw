@@ -136,14 +136,15 @@ type BulkOutcome =
       empty: boolean };
 type DispatchedBulkOutcome = Extract<BulkOutcome, { dispatched: true }>;
 /**
- * What an item records of the call that settles it; `attempts` counts the provider calls made for the item. A verbatim
- * call also records what the upstream itself reported (served model, system_fingerprint, HTTP status), so the executor
- * never mistakes the requested model or the daemon's synthesized fingerprint for the server's own answer.
+ * What an item records of the call that settles it; `attempts` counts the provider calls made for the item. Every
+ * bulk call also records what the upstream itself reported (served model, system_fingerprint, HTTP status), so the
+ * executor and the broker.receipt event (brokerOutbox:2) never pass the requested model or the daemon's synthesized
+ * fingerprint off as the server's own answer.
  */
-function measuredFields(call: DispatchedBulkOutcome, attempts: number, verbatim = false): Partial<ItemResult> {
+function measuredFields(call: DispatchedBulkOutcome, attempts: number): Partial<ItemResult> {
   const { receipt } = call;
   return { usage: receipt.usage, model: receipt.model, promptSha256: receipt.promptSha256, attempts, finishReason: call.finishReason, ...(receipt.serverFingerprint ? { serverFingerprint: receipt.serverFingerprint } : {}), ...(receipt.settingsSha256 ? { settingsSha256: receipt.settingsSha256 } : {}), ...(receipt.requestSha256 ? { requestSha256: receipt.requestSha256 } : {}),
-    ...(verbatim ? { servedModel: call.servedModel, systemFingerprint: call.systemFingerprint, ...(call.httpStatus !== undefined ? { httpStatus: call.httpStatus } : {}) } : {}) };
+    servedModel: call.servedModel, systemFingerprint: call.systemFingerprint, ...(call.httpStatus !== undefined ? { httpStatus: call.httpStatus } : {}) };
 }
 export class AdvancedRuntime {
   private driver: RuntimeDriver | null = null;
@@ -600,7 +601,7 @@ export class AdvancedRuntime {
     if (!outcome.dispatched) {
       // A later attempt was refused before dispatch. An item that already made a provider call settles with
       // that call's receipt, so its provenance and usage still reach the feed; one that made none has no receipt.
-      const earlier = lastCall ? { fields: measuredFields(lastCall, attempt - 1, verbatim), receipt: lastCall.receipt } : undefined;
+      const earlier = lastCall ? { fields: measuredFields(lastCall, attempt - 1), receipt: lastCall.receipt } : undefined;
       if (outcome.code === "CANCELLED" || active.cancelled) {
         if (!earlier) return false;
         this.settleBulkItem(job, base, { ...earlier.fields, state: "cancelled", error: active.reason ?? "Worker cancelled by its controller or parent turn closure.", errorCode: "CANCELLED" }, earlier.receipt, instrumentDigest);
@@ -618,7 +619,7 @@ export class AdvancedRuntime {
       return true;
     }
     const receipt = outcome.receipt;
-    const measured = measuredFields(outcome, attempt, verbatim);
+    const measured = measuredFields(outcome, attempt);
     if (!outcome.ok) {
       // Cancelled in flight, or during the backoff before another attempt: the job's cancellation wins.
       if (outcome.cancelled || active.cancelled) { this.settleBulkItem(job, base, { ...measured, state: "cancelled", error: active.reason ?? "Worker cancelled by its controller or parent turn closure.", errorCode: "CANCELLED" }, receipt, instrumentDigest); return true; }

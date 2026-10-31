@@ -28,9 +28,10 @@ export type ItemResult = { id: string; state: JobState; output?: unknown; provid
   /** sha256 of the canonical JSON of the request body the settling call sent upstream (see UsageReceipt). */
   requestSha256?: string;
   /**
-   * Verbatim instrument calls only, as the upstream answered the settling call: the model its response named (null
-   * when it named none; `model` then still holds the requested model), its system_fingerprint (null when it offered
-   * none; `serverFingerprint` then holds the daemon's synthesized identity) and the HTTP status.
+   * Bulk calls, as the upstream answered the settling call: the model its response named (null when it named none;
+   * `model` then still holds the requested model), its system_fingerprint (null when it offered none;
+   * `serverFingerprint` then holds the daemon's synthesized identity) and the HTTP status (absent when the call got no
+   * HTTP response). Items a daemon settled before this version recorded them for verbatim calls only.
    */
   servedModel?: string | null; systemFingerprint?: string | null; httpStatus?: number;
   /** Closed failure code of a settled item, e.g. PROVIDER_RATE_LIMITED or STRUCTURED_OUTPUT_INVALID. */
