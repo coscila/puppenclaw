@@ -175,18 +175,27 @@ describe("rollback to 426d493: state.json", () => {
       statisticsContext: { version: 1, chatId: "chat", attemptId: "attempt-1" }, orchestration: { version: 1, revision: 3, workers } });
     expect((await manager.start(params)).details).toMatchObject({ output: "Seeded existing session." });
     expect(store.getSession("parent")!.orchestration).toEqual({ version: 1, revision: 3, workers: [workers[2]] });
+    // A later turn whose workers all carry a policy leaves no orchestration in state, not the stale one of revision 3.
+    const policyOnly = advancedOrchestrationZod.parse({ version: 1, revision: 4, workers: workers.slice(0, 2) });
+    expect((await manager.send({ name: "parent", message: "Seed existing session again", permissionMode: "approve-all", interactionMode: "execute",
+      statisticsContext: { version: 1, chatId: "chat", attemptId: "attempt-2" }, orchestration: policyOnly, contextFiles: [] })).details).toMatchObject({ output: "Seeded existing session." });
+    expect(store.getSession("parent")).not.toHaveProperty("orchestration");
+    // A plain turn persists its orchestration again.
+    expect((await manager.send({ name: "parent", message: "Seed existing session once more", permissionMode: "approve-all", interactionMode: "execute",
+      statisticsContext: { version: 1, chatId: "chat", attemptId: "attempt-3" }, orchestration: advancedOrchestrationZod.parse({ version: 1, revision: 5, workers: [workers[2]] }), contextFiles: [] })).details).toMatchObject({ output: "Seeded existing session." });
+    expect(store.getSession("parent")!.orchestration).toEqual({ version: 1, revision: 5, workers: [workers[2]] });
     await close();
     const state = JSON.parse(await readFile(join(root, "sessions", "state.json"), "utf8")) as { sessions: Record<string, { orchestration?: unknown }> };
     expect(JSON.stringify(state)).not.toMatch(/capabilityProfile|instruments|entitled-institutional/u);
 
     const legacy = await SessionStore426d493.open(join(root, "sessions"));
     expect(legacy.getRecoveryStatus().required).toBe(false);
-    expect(legacy.getSession("parent")).toMatchObject({ name: "parent", orchestration: { version: 1, revision: 3, workers: [{ id: "public", evidencePolicy: "public-literature" }] } });
+    expect(legacy.getSession("parent")).toMatchObject({ name: "parent", orchestration: { version: 1, revision: 5, workers: [{ id: "public", evidencePolicy: "public-literature" }] } });
     await legacy.close();
 
     // Control: had the session kept the turn's orchestration, 426d493 would have refused the whole state at load.
     const control = await createTempDir("pcfr-state-control-");
-    state.sessions.parent!.orchestration = { version: 1, revision: 3, workers };
+    state.sessions.parent!.orchestration = { version: 1, revision: 4, workers };
     const { writeFile } = await import("node:fs/promises");
     await writeFile(join(control, "state.json"), JSON.stringify(state));
     const refused = await SessionStore426d493.open(control);
