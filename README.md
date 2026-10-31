@@ -747,11 +747,16 @@ daemon's statistics and usage-ledger hooks.
 `node --experimental-strip-types scripts/measure-verbatim.mts` does the same for
 census-shaped verbatim instrument calls through a run principal socket (40
 entries of about 3 KB per call by default) and checks that every call's bytes, as
-the mock upstream hashed them, equal its receipt's `requestSha256`. A submission
-is parsed, digested and stored on the event loop, so its size bounds the lag it
-causes: about 23 ms for ten such calls (1.2 MB) against about 220 ms for a
-hundred, so keep verbatim submissions to about ten calls; one call per job also
-works (`--calls 1 --submitters 60`).
+the mock upstream hashed them, equal its receipt's `requestSha256`. A bulk
+submission's digests (the job fingerprint, each item's digest and the key of its
+stored input) are computed on a worker thread; posting the request there costs a
+structured clone of a few milliseconds, and any worker failure digests inline,
+with identical values. Parsing the submission and storing its inputs stay on the
+event loop, so its size still bounds the lag it causes: with `--calls 100 --jobs
+6` (13 MB per submission) the largest event-loop lag fell from 171-197 ms to
+about 92 ms; ten calls (1.3 MB) cost about 30 ms either way. Keep verbatim
+submissions to tens of calls, or submit one call per job (`--calls 1
+--submitters 60`).
 
 ### pcp/2 run principals (`principals:1`)
 

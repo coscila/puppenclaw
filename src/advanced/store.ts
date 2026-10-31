@@ -335,8 +335,9 @@ export class AdvancedStore {
     else this.headerTouches.set(job.jobId, this.now().getTime());
   }
 
-  private saveInput(jobId: string, itemId: string, input: unknown): void {
-    const data = JSON.stringify(input) ?? "null", digest = sha256Hex(data);
+  /** `digest`, when given, is sha256Hex of that JSON computed elsewhere (the digest worker), so it is not hashed again here. */
+  private saveInput(jobId: string, itemId: string, input: unknown, precomputed?: string): void {
+    const data = JSON.stringify(input) ?? "null", digest = precomputed ?? sha256Hex(data);
     this.stmt("INSERT OR IGNORE INTO blobs (digest,data,bytes) VALUES (?,?,?)").run(digest, data, Buffer.byteLength(data));
     this.stmt("INSERT OR IGNORE INTO item_inputs (job_id,item_id,digest) VALUES (?,?,?)").run(jobId, itemId, digest);
   }
@@ -347,7 +348,7 @@ export class AdvancedStore {
   }
 
   /** Header, item rows and outbox rows of one job in the current transaction. */
-  private writeJob(job: WorkerJob, batch: BatchContext, extra: { receipts?: ReceiptSettlement[] }): void {
+  private writeJob(job: WorkerJob, batch: BatchContext, extra: { receipts?: ReceiptSettlement[]; inputDigests?: readonly string[] }): void {
     const previous = this.priorState(job.jobId);
     const items = job.kind === "bulk" ? (job.request as BulkSubmit).items : [];
     const first = this.revision(job.results.length + 1);
@@ -356,7 +357,7 @@ export class AdvancedStore {
     const save = this.stmt("INSERT INTO job_items (job_id,item_id,ordinal,input,result,state,revision) VALUES (?,?,?,NULL,?,?,?) ON CONFLICT(job_id,item_id) DO UPDATE SET result=excluded.result,state=excluded.state,revision=excluded.revision WHERE job_items.result<>excluded.result");
     for (const [ordinal, result] of job.results.entries()) {
       const input = items[ordinal];
-      if (input && (previous === null || !exists.get(job.jobId, result.id))) this.saveInput(job.jobId, result.id, input.input);
+      if (input && (previous === null || !exists.get(job.jobId, result.id))) this.saveInput(job.jobId, result.id, input.input, extra.inputDigests?.[ordinal]);
       save.run(job.jobId, result.id, ordinal, JSON.stringify(result), result.state, first + 1 + ordinal);
     }
     this.stmt("UPDATE jobs SET revision=? WHERE id=?").run(first + job.results.length, job.jobId);
@@ -400,9 +401,12 @@ export class AdvancedStore {
     return true;
   }
 
-  /** Creates a job now, in its own transaction, so a submit returns only what is committed. */
-  createJob(job: WorkerJob): void {
-    this.applyNow((batch) => this.writeJob(job, batch, {}));
+  /**
+   * Creates a job now, in its own transaction, so a submit returns only what is committed. `inputDigests[i]` is the
+   * blob key of item i's input (sha256 of its JSON) when the caller computed it already.
+   */
+  createJob(job: WorkerJob, options: { inputDigests?: readonly string[] } = {}): void {
+    this.applyNow((batch) => this.writeJob(job, batch, options.inputDigests ? { inputDigests: options.inputDigests } : {}));
   }
 
   /** Full job write (creation and rewrites); emits broker.job on a state change and the given terminal receipts. */
