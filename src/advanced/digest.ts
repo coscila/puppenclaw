@@ -5,7 +5,7 @@ import { Worker } from "node:worker_threads";
  * Submission digests (job fingerprint, item digests, input blob digests). A census-sized bulk submission (a hundred
  * calls, about 13 MB) took about 70 ms of these on the event loop; SubmissionDigester computes them on a worker thread
  * instead, where posting the request costs a structured clone of a few milliseconds. The values are exactly the ones
- * computed inline (bulkSubmissionDigests), so stored fingerprints, item digests and blob keys do not change.
+ * computed inline (submissionDigests), so stored fingerprints, item digests and blob keys do not change.
  */
 
 /**
