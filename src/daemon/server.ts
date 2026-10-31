@@ -3,6 +3,7 @@ import { AdvancedMaintenance, maintenanceFromEnvironment } from "../advanced/mai
 import type { UsageReceipt } from "../advanced/types.js";
 import { PrincipalRegistry } from "../advanced/principals.js";
 import { legacyAttemptAuthorityFromEnvironment, modelProvidersFromEnvironment } from "../advanced/principals-schema.js";
+import { submissionDigestsInlineFromEnvironment } from "../advanced/digest.js";
 import { onPremisesProvidersFromEnvironment, WORKER_POLICY_DISABLED, workerPolicyDisabledError, workerPolicyEnabledFromEnvironment, type WorkerPolicySettings } from "../advanced/worker-policy.js";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { join } from "node:path";
@@ -298,7 +299,7 @@ export async function createDaemonServer(params: {
       // The daemon's provider configuration: what principals can be granted, and what counts as on premises.
       const modelProviders = modelProvidersFromEnvironment();
       workerPolicy = { enabled: workerPolicyEnabledFromEnvironment(), onPremises: onPremisesProvidersFromEnvironment(process.env, modelProviders) };
-      advanced = await AdvancedRuntime.open(join(params.dataDir, "advanced"), undefined, { store: { warn: (code) => logger.warn(code) } });
+      advanced = await AdvancedRuntime.open(join(params.dataDir, "advanced"), undefined, { store: { warn: (code) => logger.warn(code) }, digests: { inline: submissionDigestsInlineFromEnvironment() } });
       advanced.useWorkerPolicy(workerPolicy);
       /** The usage-ledger row of a settled broker call with measured usage (ids keep it unique). */
       const brokerLedgerEntry = (receipt: UsageReceipt) => {

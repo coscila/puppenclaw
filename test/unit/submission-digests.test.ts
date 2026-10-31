@@ -6,7 +6,7 @@ import type { Worker } from "node:worker_threads";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { stableHash, stableJson, SubmissionDigester, submissionDigests } from "../../src/advanced/digest.js";
+import { stableHash, stableJson, SubmissionDigester, submissionDigests, submissionDigestsInlineFromEnvironment } from "../../src/advanced/digest.js";
 import { AdvancedRuntime } from "../../src/advanced/runtime.js";
 import { startParamsZod } from "../../src/shared/schema.js";
 import type { ModelProviderConfig, SessionInfo } from "../../src/shared/types.js";
@@ -49,6 +49,13 @@ describe("submission digests", () => {
     // Concurrent submissions each get their own answer.
     const many = await Promise.all(Array.from({ length: 20 }, (_, index) => digester.digest("bulk", config, { ...request, idempotencyKey: `k${index}` })));
     expect(many.map((entry) => entry.fingerprint)).toEqual(Array.from({ length: 20 }, (_, index) => legacyHash({ kind: "bulk", config, request: { ...request, idempotencyKey: `k${index}` } })));
+  });
+
+  it("reads PUPPENCLAW_SUBMISSION_DIGESTS: worker by default, inline on request, anything else refused", () => {
+    expect(submissionDigestsInlineFromEnvironment({})).toBe(false);
+    expect(submissionDigestsInlineFromEnvironment({ PUPPENCLAW_SUBMISSION_DIGESTS: "worker" })).toBe(false);
+    expect(submissionDigestsInlineFromEnvironment({ PUPPENCLAW_SUBMISSION_DIGESTS: " Inline " })).toBe(true);
+    expect(() => submissionDigestsInlineFromEnvironment({ PUPPENCLAW_SUBMISSION_DIGESTS: "thread" })).toThrow(/worker or inline/u);
   });
 
   it("falls back inline when the worker dies mid-request, and after closing", async () => {

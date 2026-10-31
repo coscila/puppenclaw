@@ -59,6 +59,17 @@ parentPort.on("message", (message) => {
 });
 `;
 
+/**
+ * PUPPENCLAW_SUBMISSION_DIGESTS: `worker` (default) digests bulk submissions on the digest worker; `inline` digests
+ * them on the event loop, as before. Either gives the same values. Any other value fails startup.
+ */
+export function submissionDigestsInlineFromEnvironment(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env.PUPPENCLAW_SUBMISSION_DIGESTS?.trim().toLowerCase() ?? "";
+  if (raw === "" || raw === "worker") return false;
+  if (raw === "inline") return true;
+  throw new Error("PUPPENCLAW_SUBMISSION_DIGESTS must be worker or inline.");
+}
+
 /** A worker that fails this often stays off: submissions are then digested inline, as before. */
 const MAX_WORKER_FAILURES = 3;
 type Pending = { resolve: (value: SubmissionDigests) => void; fallback: () => void };
