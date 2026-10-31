@@ -174,3 +174,53 @@ describe("managed compute runtime", () => {
     }
   });
 });
+
+describe("managed compute submissions", () => {
+  it("starts one supervisor for overlapping submissions of the same job id, the late first one included", async () => {
+    const { writeFile, readFile, mkdir } = await import("node:fs/promises");
+    const { vi } = await import("vitest");
+    const root = await createTempDir("puppenclaw-compute-submit-");
+    const workspace = join(root, "workspace");
+    await mkdir(workspace, { recursive: true });
+    // A supervisor stand-in that only records that it was started.
+    const started = join(root, "started.log");
+    const supervisor = join(root, "supervisor.mjs");
+    await writeFile(
+      supervisor,
+      `import { appendFileSync } from "node:fs";\nappendFileSync(${JSON.stringify(started)}, "started\\n");\n`
+    );
+    const capabilities = await import("../../src/compute/capabilities.js");
+    const probe = vi.spyOn(capabilities, "computeExecutorCapabilities").mockReturnValue([
+      { id: "bubblewrap-local", available: true, hardLimits: false }
+    ]);
+    const { ComputeRuntime } = await import("../../src/compute/runtime.js");
+    const { makeConfig } = await import("../helpers.js");
+    const runtime = await ComputeRuntime.open({
+      dataDir: join(root, "data"),
+      config: makeConfig({ orchestration: { localWorker: { projectRoots: [workspace] } } }),
+      supervisorPath: supervisor
+    });
+    try {
+      const spec = {
+        jobId: "study-step-1",
+        executor: "bubblewrap-local",
+        command: ["true"],
+        cwd: workspace,
+        env: {},
+        resources: { cpuCores: 1, memoryMiB: 128, wallTimeSeconds: 30, gpuCount: 0, diskMiB: 0 }
+      };
+      // The resubmission and the delayed first submission overlap.
+      const [first, second] = await Promise.all([runtime.submit(spec), runtime.submit(spec)]);
+      expect(first.id).toBe("study-step-1");
+      expect(second.id).toBe("study-step-1");
+      // A third one, after both, meets the stored job.
+      expect((await runtime.submit(spec)).id).toBe("study-step-1");
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      const lines = (await readFile(started, "utf8")).trim().split("\n");
+      expect(lines).toEqual(["started"]);
+    } finally {
+      runtime.close();
+      probe.mockRestore();
+    }
+  });
+});

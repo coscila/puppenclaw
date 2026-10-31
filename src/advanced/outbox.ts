@@ -3,11 +3,19 @@ import { createHash } from "node:crypto";
 import type { ItemResult, JobState, UsageReceipt, WorkerJobHeader } from "./types.js";
 
 /**
- * pcp/2 broker outbox (capabilities eventFeed:1 and brokerOutbox:1). Every row
+ * pcp/2 broker outbox (capabilities eventFeed:1 and brokerOutbox). Every row
  * is written in the transaction that changes the job or settles the item, so
  * the feed can never miss or invent a change. Payload shapes are the binding
- * contract shared with coscila's feed collector; keep field names stable.
+ * contract shared with coscila's feed collector; keep field names stable and
+ * add fields only (consumers ignore what they do not know).
+ *
+ * brokerOutbox:2 adds, with every field always present: `resumedFromJobId` on
+ * broker.job (null when the job resumes none), and `servedModel`,
+ * `systemFingerprint` and `httpStatus` on broker.receipt (what the upstream
+ * itself answered to the settling call; null when it named none or the daemon
+ * did not observe it).
  */
+export const BROKER_OUTBOX_LEVEL = 2;
 export const BROKER_JOB_EVENT = "broker.job";
 export const BROKER_RECEIPT_EVENT = "broker.receipt";
 export type BrokerEventType = typeof BROKER_JOB_EVENT | typeof BROKER_RECEIPT_EVENT;
@@ -44,6 +52,12 @@ export type BrokerJobPayload = {
    */
   parentSessionName: string;
   attemptId: string;
+  /**
+   * The job this one resumes (brokerOutbox:2): a resume re-runs the unfinished items of a paused, interrupted, failed
+   * or cancelled job under their item ids in a new job, so a consumer counting items per lineage follows this link.
+   * Null when the job resumes none.
+   */
+  resumedFromJobId: string | null;
 };
 
 export type BrokerReceiptStatus = "succeeded" | "failed" | "truncated" | "cancelled";
@@ -55,8 +69,20 @@ export type BrokerReceiptPayload = {
   status: BrokerReceiptStatus;
   finishReason: string | null;
   usage: { input: number | null; output: number | null; cacheRead: number | null; cacheWrite: number | null };
+  /** The served model when the response named one, else the requested model (see servedModel). */
   model: string;
+  /** The upstream system_fingerprint when it sent one, else the daemon's synthesized identity (see systemFingerprint). */
   serverFingerprint: string;
+  /**
+   * brokerOutbox:2, what the upstream itself answered to the settling call of a bulk item: the model its response
+   * named, its system_fingerprint and the HTTP status. servedModel and systemFingerprint are null when the response
+   * named none (model and serverFingerprint then hold the requested model and the synthesized identity) and for
+   * receipts whose answer the daemon did not record (agent jobs, items settled by a daemon before this field);
+   * httpStatus is null when the call got no HTTP response.
+   */
+  servedModel: string | null;
+  systemFingerprint: string | null;
+  httpStatus: number | null;
   settingsSha256: string;
   /** sha256 of the canonical JSON of the request body the settling call sent upstream; null when there is none (agent jobs, older receipts). */
   requestSha256: string | null;
@@ -139,7 +165,8 @@ export function brokerJobPayload(job: WorkerJobHeader, counts: BrokerJobCounts):
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
     parentSessionName: job.parentSessionName,
-    attemptId: job.attemptId
+    attemptId: job.attemptId,
+    resumedFromJobId: nonEmpty(job.resumedFromJobId) ?? null
   };
 }
 
@@ -169,7 +196,7 @@ export function brokerReceiptPayload(input: {
   jobId: string;
   instrumentDigest: string | null;
   item: ItemResult;
-  receipt: Pick<UsageReceipt, "model" | "usage" | "createdAt" | "updatedAt"> & Partial<Pick<UsageReceipt, "attempt" | "serverFingerprint" | "settingsSha256" | "requestSha256" | "finishReason">>;
+  receipt: Pick<UsageReceipt, "model" | "usage" | "createdAt" | "updatedAt"> & Partial<Pick<UsageReceipt, "attempt" | "serverFingerprint" | "settingsSha256" | "requestSha256" | "finishReason" | "httpStatus">>;
   fallbackFingerprint: string;
   fallbackSettingsSha256: string;
   endedAt?: string;
@@ -191,6 +218,9 @@ export function brokerReceiptPayload(input: {
     },
     model: receipt.model,
     serverFingerprint: nonEmpty(item.serverFingerprint) ?? nonEmpty(receipt.serverFingerprint) ?? input.fallbackFingerprint,
+    servedModel: nonEmpty(item.servedModel ?? undefined) ?? null,
+    systemFingerprint: nonEmpty(item.systemFingerprint ?? undefined) ?? null,
+    httpStatus: httpStatusOf(item.httpStatus) ?? httpStatusOf(receipt.httpStatus) ?? null,
     settingsSha256: nonEmpty(item.settingsSha256) ?? nonEmpty(receipt.settingsSha256) ?? input.fallbackSettingsSha256,
     requestSha256: nonEmpty(item.requestSha256) ?? nonEmpty(receipt.requestSha256) ?? null,
     instrumentDigest: input.instrumentDigest,
@@ -219,4 +249,8 @@ function defaultErrorCode(state: JobState): string {
 
 function nonEmpty(value: string | undefined): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function httpStatusOf(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 100 && value <= 999 ? value : undefined;
 }

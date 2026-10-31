@@ -341,7 +341,7 @@ export type SessionInfo = {
   model?: string;
   modelProviderId?: string;
   modelProvider?: ModelProviderConfig;
-  orchestration?: AdvancedOrchestration;
+  orchestration?: PersistedAdvancedOrchestration;
   brokerSocket?: string;
   skills?: string[];
   tokenUsage?: TokenUsage;
@@ -591,4 +591,7 @@ export type CommandParseResult =
       message: string;
     };
 
+/** A turn's advanced orchestration as start and send accept it, worker policy fields included. */
 export type AdvancedOrchestration = import("zod").infer<typeof import("./schema.js").advancedOrchestrationZod>;
+/** The orchestration a session persists: the frozen shape older daemons load (see persistedAdvancedOrchestrationZod). */
+export type PersistedAdvancedOrchestration = import("zod").infer<typeof import("./schema.js").persistedAdvancedOrchestrationZod>;

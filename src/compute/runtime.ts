@@ -37,6 +37,9 @@ export function executorConstraintError(spec: ComputeJobSpec): string | null {
 }
 
 export class ComputeRuntime {
+  /** Submissions in flight by job id: a second submission of the same id waits for the first (see submit). */
+  private readonly submitting = new Map<string, Promise<ComputeJobRecord>>();
+
   private constructor(
     private readonly store: ComputeStore,
     private readonly rootDir: string,
@@ -90,9 +93,31 @@ export class ComputeRuntime {
       : this.store.listActiveBySession(sessionName);
   }
 
-  /** `principal` is the socket binding of `spec.principalId`, resolved by the caller from the principal registry. */
+  /**
+   * `principal` is the socket binding of `spec.principalId`, resolved by the caller from the principal registry.
+   * Idempotent per job id, also for submissions that overlap: a caller that could not confirm its submission sends it
+   * again under the same id (coscila does so for Study Run steps), and the first one, delayed, may arrive while the
+   * second is still being set up; the later one waits for it and returns the same job, so one id never starts two
+   * supervisors.
+   */
   async submit(input: unknown, options: { principal?: PrincipalSocketBinding } = {}): Promise<ComputeJobRecord> {
     const spec = computeJobSpecZod.parse(input);
+    const inFlight = this.submitting.get(spec.jobId);
+    if (inFlight) {
+      await inFlight.catch(() => undefined);
+      const settled = this.store.get(spec.jobId);
+      if (settled) return this.reconcile(settled);
+    }
+    const work = this.submitOnce(spec, options);
+    this.submitting.set(spec.jobId, work);
+    try {
+      return await work;
+    } finally {
+      if (this.submitting.get(spec.jobId) === work) this.submitting.delete(spec.jobId);
+    }
+  }
+
+  private async submitOnce(spec: ComputeJobSpec, options: { principal?: PrincipalSocketBinding }): Promise<ComputeJobRecord> {
     const existing = this.store.get(spec.jobId);
     if (existing) return this.reconcile(existing);
     if (spec.principalId !== options.principal?.principalId) {

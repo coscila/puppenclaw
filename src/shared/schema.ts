@@ -103,25 +103,109 @@ export const modelProviderConfigZod = z
       });
     }
   });
-export const advancedOrchestrationZod = z.object({
-  version: z.literal(1),
-  revision: z.number().int().nonnegative().safe(),
-  workers: z.array(z.object({
-    id: skillNameString.max(128),
-    assignment: nonEmptyString.max(50_000),
-    evidencePolicy: z.literal("public-literature").optional(),
-    agent: agentKindZod,
-    effort: effortLevelZod.optional(),
-    modelProvider: modelProviderConfigZod,
-  }).strict()).min(1),
-}).strict().superRefine((value, context) => {
+/**
+ * Worker policy (plan E4; capability advancedOrchestration.workerPolicy). Both lists are versioned: a value this
+ * daemon does not know is refused with a typed error (UNSUPPORTED_EVIDENCE_POLICY, UNSUPPORTED_CAPABILITY_PROFILE),
+ * never ignored, since ignoring a restriction would grant more than the caller asked for.
+ * - Evidence policies: public-literature (published claims and public sources); entitled-institutional (licensed full
+ *   text acquired under the institution's entitlement) and confidential-manuscript (an unpublished manuscript of which
+ *   only identifiers may leave), both for evidence-only workers on an on-premises provider.
+ * - Capability profiles: code-authoring (writes and runs code; Claude workers only); evidence-only (bulk calls on
+ *   supplied evidence, no agent, tools or programs); run-fixed-programs (runs only the programs it is given: a Claude
+ *   worker as an agent, any other through pinned-instrument bulk calls only).
+ */
+export const WORKER_EVIDENCE_POLICIES = ["public-literature", "entitled-institutional", "confidential-manuscript"] as const;
+export const WORKER_CAPABILITY_PROFILES = ["code-authoring", "evidence-only", "run-fixed-programs"] as const;
+export type WorkerEvidencePolicy = (typeof WORKER_EVIDENCE_POLICIES)[number];
+export type WorkerCapabilityProfile = (typeof WORKER_CAPABILITY_PROFILES)[number];
+/** Closed error codes of worker-policy shapes; a daemon answers them instead of INVALID_PARAMS (see issueCode). */
+export const UNSUPPORTED_EVIDENCE_POLICY = "UNSUPPORTED_EVIDENCE_POLICY";
+export const UNSUPPORTED_CAPABILITY_PROFILE = "UNSUPPORTED_CAPABILITY_PROFILE";
+export const INVALID_WORKER_POLICY = "INVALID_WORKER_POLICY";
+/** A pinned instrument as the review engine's registry names it: name@version and its registry digest (sha256 hex). */
+export const WORKER_INSTRUMENT_ID_PATTERN = /^[a-z][a-z0-9-]*@[1-9][0-9]*$/u;
+
+/** The typed error code a schema issue carries (custom issues with `params.code`), if any. */
+export function issueCode(issue: { code?: string; params?: unknown }): string | undefined {
+  const params = issue.code === "custom" && issue.params && typeof issue.params === "object" ? issue.params as { code?: unknown } : undefined;
+  return typeof params?.code === "string" ? params.code : undefined;
+}
+
+/** A string from a versioned list; any other string is a custom issue carrying `code`, so the daemon answers that code. */
+function versionedValue<const T extends readonly [string, ...string[]]>(values: T, code: string, label: string): z.ZodType<T[number]> {
+  const known = new Set<string>(values);
+  return z.string().superRefine((value, context) => {
+    if (!known.has(value)) {
+      context.addIssue({ code: "custom", message: `${label} ${JSON.stringify(value.slice(0, 64))} is not supported by this daemon; supported: ${values.join(", ")}.`, params: { code, supported: [...values] } });
+    }
+  }) as unknown as z.ZodType<T[number]>;
+}
+
+export const workerInstrumentZod = z.object({
+  id: z.string().regex(WORKER_INSTRUMENT_ID_PATTERN, "Instrument ids look like name@version."),
+  digest: z.string().regex(/^[0-9a-f]{64}$/u, "Instrument digests are sha256 hex digests.")
+}).strict();
+
+const workerConfigShape = {
+  id: skillNameString.max(128),
+  assignment: nonEmptyString.max(50_000),
+  agent: agentKindZod,
+  effort: effortLevelZod.optional(),
+  modelProvider: modelProviderConfigZod,
+};
+
+function refineWorkerIdentity(value: { workers: { id: string; agent: string; modelProvider: { kind?: string | undefined } }[] }, context: z.RefinementCtx): void {
   if (new Set(value.workers.map((worker) => worker.id)).size !== value.workers.length)
     context.addIssue({ code: 'custom', path: ['workers'], message: 'Worker configuration ids must be unique.' });
   for (const [i, worker] of value.workers.entries()) {
     if ((worker.agent === 'claude') !== (worker.modelProvider.kind === 'claude-code'))
       context.addIssue({ code: 'custom', path: ['workers', i, 'agent'], message: 'Worker agent must match its model provider harness.' });
   }
+}
+
+/**
+ * A turn's advanced orchestration as start and send accept it. The worker policy fields (evidencePolicy beyond
+ * public-literature, capabilityProfile, instruments) are what coscila sends to a daemon that advertises
+ * advancedOrchestration.workerPolicy; the rules below are the ones coscila's contract applies, checked again here.
+ * Session state never holds this shape: it persists persistedAdvancedOrchestrationZod (persistedOrchestration).
+ */
+export const advancedOrchestrationZod = z.object({
+  version: z.literal(1),
+  revision: z.number().int().nonnegative().safe(),
+  workers: z.array(z.object({
+    ...workerConfigShape,
+    evidencePolicy: versionedValue(WORKER_EVIDENCE_POLICIES, UNSUPPORTED_EVIDENCE_POLICY, "Evidence policy").optional(),
+    capabilityProfile: versionedValue(WORKER_CAPABILITY_PROFILES, UNSUPPORTED_CAPABILITY_PROFILE, "Capability profile").optional(),
+    instruments: z.array(workerInstrumentZod).min(1).max(16).optional(),
+  }).strict()).min(1),
+}).strict().superRefine((value, context) => {
+  refineWorkerIdentity(value, context);
+  const invalid = (i: number, field: string, message: string) => context.addIssue({ code: "custom", path: ["workers", i, field], message, params: { code: INVALID_WORKER_POLICY } });
+  for (const [i, worker] of value.workers.entries()) {
+    if (worker.instruments) {
+      if (new Set(worker.instruments.map((instrument) => instrument.id)).size !== worker.instruments.length) invalid(i, "instruments", "Instrument ids must be unique.");
+      if (new Set(worker.instruments.map((instrument) => instrument.digest)).size !== worker.instruments.length) invalid(i, "instruments", "Each instrument digest belongs to one instrument.");
+      if (worker.capabilityProfile !== "evidence-only" && worker.capabilityProfile !== "run-fixed-programs") invalid(i, "instruments", "Pinned instruments belong to an evidence-only or run-fixed-programs worker.");
+    }
+    if ((worker.evidencePolicy === "entitled-institutional" || worker.evidencePolicy === "confidential-manuscript") && worker.capabilityProfile !== "evidence-only")
+      invalid(i, "evidencePolicy", `Evidence policy ${worker.evidencePolicy} is for on-premises judges: the worker needs the evidence-only capability profile.`);
+    if (worker.capabilityProfile === "code-authoring" && worker.agent !== "claude") invalid(i, "capabilityProfile", "Only Claude workers author code: code-authoring needs agent claude.");
+  }
 });
+
+/**
+ * The orchestration a session persists in state.json: exactly the shape every daemon since advanced orchestration
+ * validates its state with (frozen; 426d493 and older refuse anything else and would stop at load). It never carries
+ * the worker policy fields; persistedOrchestration() decides what of a turn's orchestration may be kept.
+ */
+export const persistedAdvancedOrchestrationZod = z.object({
+  version: z.literal(1),
+  revision: z.number().int().nonnegative().safe(),
+  workers: z.array(z.object({
+    ...workerConfigShape,
+    evidencePolicy: z.literal("public-literature").optional(),
+  }).strict()).min(1),
+}).strict().superRefine(refineWorkerIdentity);
 
 export const orchestrationStepKindZod = z.enum([
   "judge",

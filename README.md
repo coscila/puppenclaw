@@ -426,9 +426,10 @@ set; none of them is added to the open `/health` and `/capabilities`.
   ms over a 30 s window) and `memory`.
 - `GET /v2/capabilities`: `features` (`health`, `opsIdle`, `usageLedger`,
   `compactStatus`, `keyedStreaming`, `sseGap`, and the broker's `eventFeed`,
-  `brokerOutbox`, `instrumentMode` and `instrumentVerbatim` described below),
-  `limits`, and provider dialect limits, e.g. the structured-output keywords
-  removed for `qwen-3.8`.
+  `brokerOutbox`, `instrumentMode`, `instrumentVerbatim` and `workerPolicy`
+  described below), `advancedOrchestration` (the worker policy details, see
+  "Worker policy"), `limits`, and provider dialect limits, e.g. the
+  structured-output keywords removed for `qwen-3.8`.
 - `GET /ops/idle`: counts only, each measured at request time (active turns,
   turn and runner processes, running turn keys, active and paused broker jobs,
   active compute jobs, open streams). Restart survivors count only while their
@@ -492,7 +493,7 @@ state writes, event-loop lag and stalled-stream memory against a built daemon.
 
 The advanced broker reports to coscila through an acknowledged event feed and
 runs measurement instruments that coscila installs. `GET /v2/capabilities`
-advertises each part under `features`: `eventFeed: 1`, `brokerOutbox: 1`,
+advertises each part under `features`: `eventFeed: 1`, `brokerOutbox: 2`,
 `instrumentMode: 1` and `instrumentVerbatim: 1` (limits `eventPageMax`,
 `eventWaitMsMax`, `eventInlineOutputMax`). The routes need the bearer token
 like every v2 route, and every body carries `protocol`, `bootId` and `spoolId`;
@@ -526,10 +527,13 @@ renames them.
   `INVALID_EVENT_CURSOR`.
 - `broker.job` payload: `{jobId, ownerKey, principalId, runId, state, counts:
   {total, queued, running, succeeded, failed, cancelled, truncated},
-  instrumentDigest, createdAt, updatedAt}` (absent values are null), plus two
+  instrumentDigest, createdAt, updatedAt}` (absent values are null), plus three
   link hints beyond these pcp/2 fields: `parentSessionName` (the chat's daemon
-  session, or `principal:<id>`) and `attemptId`. coscila ties a job to its chat
-  by them and erases a purged chat's jobs by the session. Counts
+  session, or `principal:<id>`), `attemptId` and, from `brokerOutbox: 2`,
+  `resumedFromJobId` (the job this one resumes, null when it resumes none; a
+  resume re-runs a job's unfinished items under their item ids in a new job, so
+  a consumer counting items per lineage follows it). coscila ties a job to its
+  chat by them and erases a purged chat's jobs by the session. Counts
   fold item states into these categories: paused and interrupted items count as
   failed (a resume runs them in a new job), a truncated item counts once, as
   truncated. Items in flight when a job pauses or is cancelled settle after
@@ -538,10 +542,18 @@ renames them.
   did not change).
 - `broker.receipt` payload: `{jobId, itemId, attempt, status
   (succeeded|failed|truncated|cancelled), finishReason, usage: {input, output,
-  cacheRead, cacheWrite}, model, serverFingerprint, settingsSha256,
-  requestSha256, instrumentDigest, outputDigest, outputBytes, output, startedAt,
-  endedAt, error: {code, retryable} | null}` (`requestSha256` is null for agent
-  jobs and for receipts written before it existed). `output` is inline only up
+  cacheRead, cacheWrite}, model, serverFingerprint, servedModel,
+  systemFingerprint, httpStatus, settingsSha256, requestSha256, instrumentDigest,
+  outputDigest, outputBytes, output, startedAt, endedAt, error: {code,
+  retryable} | null}` (`requestSha256` is null for agent jobs and for receipts
+  written before it existed). `model` and `serverFingerprint` can hold the
+  requested model and the daemon's synthesized identity; `servedModel`,
+  `systemFingerprint` and `httpStatus` (`brokerOutbox: 2`) say what the upstream
+  itself answered to the settling call: the model its response named, its
+  `system_fingerprint` (each null when it named none) and the HTTP status (null
+  without an HTTP response). Agent jobs and items settled by a daemon before
+  `brokerOutbox: 2` have null `servedModel` and `systemFingerprint`; their
+  `httpStatus` comes from the settling call's receipt. `output` is inline only up
   to 16384 UTF-8 bytes; larger outputs stay in the job's result pages.
   `outputDigest` is the sha256 of the output as a string, or of its compact JSON
   when it is structured. Agent jobs report their single item over all its native
@@ -658,7 +670,8 @@ first choice carries no message with text or null content (no choices, a
 garbled body, content parts) is no answer and is asked again like a failed call
 (`NO_FINAL_MESSAGE`, retryable), an empty completion (content null or empty) is
 asked again and, once the attempts are spent, settles `completed` with the empty
-text. Each verbatim item also records what the upstream itself said:
+text. Each bulk item, verbatim or policy-wrapped, also records what the upstream
+itself said, and its `broker.receipt` event carries the same:
 `servedModel` (the model the response named, null when it named none; `model`
 keeps its old meaning and then holds the requested model), `systemFingerprint`
 (the response's own `system_fingerprint`, null when it offered none;
@@ -734,11 +747,19 @@ daemon's statistics and usage-ledger hooks.
 `node --experimental-strip-types scripts/measure-verbatim.mts` does the same for
 census-shaped verbatim instrument calls through a run principal socket (40
 entries of about 3 KB per call by default) and checks that every call's bytes, as
-the mock upstream hashed them, equal its receipt's `requestSha256`. A submission
-is parsed, digested and stored on the event loop, so its size bounds the lag it
-causes: about 23 ms for ten such calls (1.2 MB) against about 220 ms for a
-hundred, so keep verbatim submissions to about ten calls; one call per job also
-works (`--calls 1 --submitters 60`).
+the mock upstream hashed them, equal its receipt's `requestSha256`. A bulk
+submission's digests (the job fingerprint, each item's digest and the key of its
+stored input) are computed on a worker thread; posting the request there costs a
+structured clone of a few milliseconds, and any worker failure digests inline,
+with identical values (`PUPPENCLAW_SUBMISSION_DIGESTS=inline` digests on the
+event loop as before; the default is `worker`; any other value fails startup).
+Parsing the submission and storing its inputs stay on the event loop, so its size
+still bounds the lag it causes: with `--calls 100 --jobs 6` (13 MB per
+submission) the largest event-loop lag fell from 171-197 ms to about 92 ms; ten
+calls (1.3 MB) cost about 30 ms either way, and one call per job from 60
+submitters (`--calls 1 --jobs 800 --submitters 60`) ran at 8.8-9.2k entries/s
+instead of 7.4-8.0k. Keep verbatim submissions to tens of calls, or submit one
+call per job.
 
 ### pcp/2 run principals (`principals:1`)
 
@@ -894,6 +915,88 @@ run binding, grants, usage, counted items and audit go. Daemons from before prin
   it only denies, never grants.
 - Any other value fails startup.
 
+
+### Worker policy (`advancedOrchestration.workerPolicy`)
+
+A turn's advanced orchestration may give each worker a policy that coscila
+decides and the daemon enforces wherever it admits jobs (plan E4):
+
+- `evidencePolicy`: `public-literature`, `entitled-institutional` (licensed full
+  text under the institution's entitlement) or `confidential-manuscript` (an
+  unpublished manuscript of which only identifiers may leave);
+- `capabilityProfile`: `code-authoring` (Claude workers only), `evidence-only`
+  (bulk calls on supplied evidence, no agent, tools or programs) or
+  `run-fixed-programs` (only the programs it is given: a Claude worker as an
+  agent, any other through pinned-instrument bulk calls only);
+- `instruments`: 1-16 pinned instruments `{id: "name@version", digest: <sha256
+  hex>}` with unique ids and digests, for evidence-only and run-fixed-programs
+  workers.
+
+The daemon advertises it as `advancedOrchestration.workerPolicy: 1` in
+`/capabilities` and as `features.workerPolicy: 1` in `/v2/capabilities`, whose
+`advancedOrchestration` adds `evidencePolicies`, `capabilityProfiles`,
+`onPremisesProviders` and `identifierOnlyEgress: "coscila"`. coscila sends these
+fields only to a daemon that advertises it. Both lists are versioned: an unknown
+evidence policy is refused with 400 `UNSUPPORTED_EVIDENCE_POLICY`, an unknown
+profile with 400 `UNSUPPORTED_CAPABILITY_PROFILE`, never ignored. Coscila's
+contract rules are checked again (400 `INVALID_WORKER_POLICY`): an
+entitled-institutional or confidential-manuscript worker is evidence-only,
+pinned instruments belong to an evidence-only or run-fixed-programs worker, and
+code-authoring needs agent `claude`.
+
+On the turn socket:
+
+- An entitled-institutional or confidential-manuscript worker uses on-premises
+  providers only, as if granted `model:onprem-only`: its bulk submissions are
+  refused with 403 `PROVIDER_NOT_ON_PREMISES` before any call, `GET /configs`
+  reports it with `bulkAvailable: false`, and an item still queued when the
+  configuration changes is refused at dispatch (failed, the same code, no call).
+- No agent job for an evidence-only worker, nor for a run-fixed-programs or
+  code-authoring worker that is not Claude (403 `CAPABILITY_PROFILE_DENIED`).
+  coscila's sandbox wrapper refuses these too, when its profiles are enforced.
+- A worker with pinned instruments submits bulk work under one of them only
+  (403 `INSTRUMENT_REQUIRED`, 403 `INSTRUMENT_NOT_PINNED`); a run-fixed-programs
+  worker that is not Claude and pins none has no bulk calls either
+  (`INSTRUMENT_REQUIRED`, `bulkAvailable: false`). coscila pins the registry's
+  `name@version` and registry digest, while the daemon allow-lists the broker
+  digest derived from it, so a pin matches an installed bundle whose
+  `instrumentId` (or `instrumentId@version`) is the pin's id, or whose digest
+  equals the pin's digest; the daemon cannot recompute a registry digest.
+- `GET /configs` lists `capabilityProfile` and `instruments` only for workers
+  that have them; a worker without policy is listed and admitted exactly as
+  before.
+
+On premises is decided from the daemon's own provider configuration, never from
+the URL a turn sends (the lab's loopback proxies forward to external services
+too). `PUPPENCLAW_ONPREM_PROVIDERS` is a JSON array of provider ids, each
+configured in `PUPPENCLAW_MODEL_PROVIDERS` with a `baseUrl`, for example
+`["remote_qwen38_none","remote_qwen38_low"]`. A worker's provider is on premises
+when its id is listed and it names the configured kind and endpoint (model,
+label and credential variable may differ). Unset means no provider is on
+premises, so restricted evidence is refused; an invalid value or an id that
+`PUPPENCLAW_MODEL_PROVIDERS` does not configure fails startup.
+
+Identifier-only egress for confidential-manuscript evidence stays with coscila:
+the daemon's egress proxy allows or denies hosts and tunnels TLS it cannot read.
+On the daemon's side such a worker is evidence-only, so it gets no agent job and
+with it no egress tunnel, and its bulk calls go to an on-premises provider only.
+
+A session persists only the workers without a policy, in the frozen shape every
+earlier daemon loads (`state.json` never holds a worker policy field; a turn
+whose workers all have one leaves no orchestration there). A later turn that
+sends no orchestration falls back to what was persisted, so it can never run a
+policy worker with fewer restrictions. Run principals are unaffected: their
+workers come from their grants and carry no policy, and their grants carry no
+evidence policy yet.
+
+`PUPPENCLAW_WORKER_POLICY`: `on` (default) as above; `off` advertises nothing
+and refuses any worker policy field with 400 `WORKER_POLICY_DISABLED`, before any
+session state changes, while orchestrations without one run as before. Any
+other value fails startup. Rollback: a daemon from before worker policy loads
+the state this version writes, and opens `advanced.sqlite`, where a job's stored
+worker configuration keeps its policy fields; it does not enforce them, and a
+resume under its own configuration (coscila withholds the fields from it) is
+refused with `WORKER_CONFIG_CHANGED`.
 
 Advanced worker jobs store each result in its own SQLite row and each distinct
 input once, as a blob keyed by the sha256 of its JSON (a resumed job reuses the

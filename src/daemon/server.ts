@@ -3,6 +3,8 @@ import { AdvancedMaintenance, maintenanceFromEnvironment } from "../advanced/mai
 import type { UsageReceipt } from "../advanced/types.js";
 import { PrincipalRegistry } from "../advanced/principals.js";
 import { legacyAttemptAuthorityFromEnvironment, modelProvidersFromEnvironment } from "../advanced/principals-schema.js";
+import { submissionDigestsInlineFromEnvironment } from "../advanced/digest.js";
+import { onPremisesProvidersFromEnvironment, WORKER_POLICY_DISABLED, workerPolicyDisabledError, workerPolicyEnabledFromEnvironment, type WorkerPolicySettings } from "../advanced/worker-policy.js";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { join } from "node:path";
 
@@ -42,6 +44,8 @@ import {
   costParamsZod,
   focusParamsZod,
   forkParamsZod,
+  INVALID_WORKER_POLICY,
+  issueCode,
   logsParamsZod,
   ownerSessionCleanupParamsZod,
   ownerSessionListParamsZod,
@@ -60,15 +64,19 @@ import {
   stopParamsZod,
   suspendParamsZod,
   unfocusParamsZod,
+  UNSUPPORTED_CAPABILITY_PROFILE,
+  UNSUPPORTED_EVIDENCE_POLICY,
+  WORKER_CAPABILITY_PROFILES,
+  WORKER_EVIDENCE_POLICIES,
   workerManifestZod
 } from "../shared/schema.js";
-import type { ParsedPluginConfig, StateRecoveryStatus, ToolResult } from "../shared/types.js";
+import type { AdvancedOrchestration, ParsedPluginConfig, StateRecoveryStatus, ToolResult } from "../shared/types.js";
 import { ensureDir, redactSensitiveText } from "../shared/utils.js";
 import { EventLoopMonitor } from "./event-loop.js";
 import { identityEnvelope, identityHeaders, resolveBuildId, type DaemonIdentity } from "./identity.js";
 import { registerV2Routes, type StreamBacklog } from "./v2.js";
 import { registerV2BrokerRoutes } from "./v2-broker.js";
-import { EVENT_PAGE_MAX, EVENT_WAIT_MAX_MS, INLINE_OUTPUT_MAX_BYTES } from "../advanced/outbox.js";
+import { BROKER_OUTBOX_LEVEL, EVENT_PAGE_MAX, EVENT_WAIT_MAX_MS, INLINE_OUTPUT_MAX_BYTES } from "../advanced/outbox.js";
 import { registerV2PrincipalRoutes } from "./v2-principals.js";
 import { SseEventStream, sseMaxPendingBytesFromEnv, type SseEvent } from "./sse.js";
 import {
@@ -140,9 +148,11 @@ export async function createDaemonServer(params: {
       const summary = error.issues
         .map((issue) => `${issue.path.map(String).join(".") || "(params)"}: ${issue.message}`)
         .join("; ");
+      // A versioned value this daemon does not know (an evidence policy, say) answers its own typed code.
+      const typed = error.issues.map((issue) => issueCode(issue)).find((code) => code !== undefined);
       return reply.code(400).send({
         ok: false,
-        code: "INVALID_PARAMS",
+        code: typed ?? "INVALID_PARAMS",
         error: redactSensitiveText(`Invalid parameters: ${summary}`)
       });
     }
@@ -247,6 +257,7 @@ export async function createDaemonServer(params: {
     let advanced: AdvancedRuntime | undefined;
     let maintenance: AdvancedMaintenance | undefined;
     let principals: PrincipalRegistry | undefined;
+    let workerPolicy: WorkerPolicySettings | undefined;
     try {
       // The owner lease is held, so every leftover record belongs to a dead
       // daemon. Reap before reconciliation so killed runners read as orphaned.
@@ -285,7 +296,11 @@ export async function createDaemonServer(params: {
       });
       resourceMonitor.start();
       const outputRouter = new OutputRouter(logger);
-      advanced = await AdvancedRuntime.open(join(params.dataDir, "advanced"), undefined, { store: { warn: (code) => logger.warn(code) } });
+      // The daemon's provider configuration: what principals can be granted, and what counts as on premises.
+      const modelProviders = modelProvidersFromEnvironment();
+      workerPolicy = { enabled: workerPolicyEnabledFromEnvironment(), onPremises: onPremisesProvidersFromEnvironment(process.env, modelProviders) };
+      advanced = await AdvancedRuntime.open(join(params.dataDir, "advanced"), undefined, { store: { warn: (code) => logger.warn(code) }, digests: { inline: submissionDigestsInlineFromEnvironment() } });
+      advanced.useWorkerPolicy(workerPolicy);
       /** The usage-ledger row of a settled broker call with measured usage (ids keep it unique). */
       const brokerLedgerEntry = (receipt: UsageReceipt) => {
         if (receipt.state === "running" || receipt.usage.input === null || receipt.usage.output === null) return null;
@@ -332,7 +347,7 @@ export async function createDaemonServer(params: {
       principals = await PrincipalRegistry.open({
         dataDir: params.dataDir,
         runtime: advanced,
-        providers: modelProvidersFromEnvironment(),
+        providers: modelProviders,
         legacyAttemptAuthority: legacyAttemptAuthorityFromEnvironment(),
         warn: (message) => logger.warn(message),
         reopenSockets: false
@@ -370,6 +385,7 @@ export async function createDaemonServer(params: {
         advanced,
         maintenance,
         principals,
+        workerPolicy,
         outputRouter,
         manager,
         orchestrator,
@@ -399,6 +415,7 @@ export async function createDaemonServer(params: {
     advanced,
     maintenance,
     principals,
+    workerPolicy,
     outputRouter,
     manager,
     orchestrator,
@@ -420,7 +437,9 @@ export async function createDaemonServer(params: {
   app.get("/capabilities", async () => ({
     ok: true,
     version: 1,
-    advancedOrchestration: { version: 1, durableJobs: true, recordedTransport: true, namespaceRequired: true, workerJoinContinuation: true, incrementalResults: true, aggregateBulkConcurrency: true, nativeClaudeOAuthRefresh: 1, nativeClaudeSafetyClassifier: 1 },
+    // workerPolicy (plan E4): worker capability profiles, pinned instruments and every evidence policy are accepted and
+    // enforced; coscila sends them only to a daemon that advertises it (off with PUPPENCLAW_WORKER_POLICY=off).
+    advancedOrchestration: { version: 1, durableJobs: true, recordedTransport: true, namespaceRequired: true, workerJoinContinuation: true, incrementalResults: true, aggregateBulkConcurrency: true, nativeClaudeOAuthRefresh: 1, nativeClaudeSafetyClassifier: 1, ...(workerPolicy.enabled ? { workerPolicy: 1 } : {}) },
     sessionStart: true,
     sessionStartStream: true,
     sessionSend: true,
@@ -525,13 +544,24 @@ export async function createDaemonServer(params: {
       keyedStreaming: 1,
       sseGap: 1,
       eventFeed: 1,
-      brokerOutbox: 1,
+      // 2: broker.job carries resumedFromJobId, broker.receipt servedModel, systemFingerprint and httpStatus.
+      brokerOutbox: BROKER_OUTBOX_LEVEL,
       instrumentMode: 1,
       instrumentVerbatim: 1,
+      ...(workerPolicy.enabled ? { workerPolicy: 1 } : {}),
       // Run principals need the bearer token; legacyAttemptAuthority says chat turns still carry bulk authority.
       ...(authToken.length > 0 ? { principals: 1 } : {}),
       ...(principals.legacyAttemptAuthority ? { legacyAttemptAuthority: 1 } : {})
     }),
+    advancedOrchestration: () => workerPolicy.enabled ? {
+      workerPolicy: 1,
+      evidencePolicies: [...WORKER_EVIDENCE_POLICIES],
+      capabilityProfiles: [...WORKER_CAPABILITY_PROFILES],
+      // Decided from the daemon's provider configuration (PUPPENCLAW_ONPREM_PROVIDERS with PUPPENCLAW_MODEL_PROVIDERS).
+      onPremisesProviders: [...workerPolicy.onPremises.keys()].sort(),
+      // Identifier-only egress of confidential-manuscript evidence is enforced by coscila; the daemon has no hook for it.
+      identifierOnlyEgress: "coscila"
+    } : undefined,
     limits: () => ({
       turnKeyMax: 128,
       ledgerPageMax: MAX_LEDGER_PAGE_ROWS,
@@ -930,8 +960,16 @@ export async function createDaemonServer(params: {
   const presentTurnResult = (result: ToolResult, resultView: "session" | "turn" | undefined): ToolResult =>
     resultView === "turn" ? withIdentity(turnScopedResult(result)) : ok(result);
 
+  // PUPPENCLAW_WORKER_POLICY=off refuses worker policy fields before any session state changes (advanced.begin
+  // checks again for other entry points).
+  const refuseDisabledWorkerPolicy = (orchestration: AdvancedOrchestration | undefined): void => {
+    const refusal = orchestration ? workerPolicyDisabledError(orchestration, workerPolicy) : undefined;
+    if (refusal) throw refusal;
+  };
+
   app.post("/session/start", async (request) => {
     const { resultView, keyedStreaming: _keyedStreaming, ...parsed } = daemonStartParamsZod.parse(request.body);
+    refuseDisabledWorkerPolicy(parsed.orchestration);
     if (parsed.ownerKey != null) {
       assertOwnerCleanupAuthentication(authToken);
     }
@@ -940,6 +978,7 @@ export async function createDaemonServer(params: {
 
   app.post("/session/start/stream", async (request, reply) => {
     const { resultView, keyedStreaming, ...parsed } = daemonStartParamsZod.parse(request.body);
+    refuseDisabledWorkerPolicy(parsed.orchestration);
     if (parsed.ownerKey != null) {
       assertOwnerCleanupAuthentication(authToken);
     }
@@ -960,6 +999,7 @@ export async function createDaemonServer(params: {
       ...(request.body as Record<string, unknown>),
       name: (request.params as { name: string }).name
     });
+    refuseDisabledWorkerPolicy(parsed.orchestration);
     return presentTurnResult(await manager.send(parsed), resultView);
   });
 
@@ -968,6 +1008,7 @@ export async function createDaemonServer(params: {
       ...(request.body as Record<string, unknown>),
       name: (request.params as { name: string }).name
     });
+    refuseDisabledWorkerPolicy(parsed.orchestration);
     return streamToolResult({
       reply,
       sessionName: parsed.name,
@@ -1249,6 +1290,10 @@ function daemonStatusForError(code: string): number {
   switch (code) {
     case "INVALID_PARAMS":
     case "MODEL_UNAVAILABLE":
+    case UNSUPPORTED_EVIDENCE_POLICY:
+    case UNSUPPORTED_CAPABILITY_PROFILE:
+    case INVALID_WORKER_POLICY:
+    case WORKER_POLICY_DISABLED:
       return 400;
     case "NO_SESSION":
       return 404;

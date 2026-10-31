@@ -1,4 +1,5 @@
 import type { AdvancedRuntime } from "../advanced/runtime.js";
+import { sessionWithOrchestration } from "../advanced/worker-policy.js";
 import { type ChildProcess, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { copyFile, mkdir, readFile, readdir, stat, unlink } from "node:fs/promises";
@@ -1697,7 +1698,8 @@ export class AcpxSessionManager implements ISessionManager {
           ? { ...baseSession, effort: params.effort }
           : baseSession;
       const reasoning = this.resolveSessionReasoning(requestedSession);
-      const session = { ...reasoning.session, ...(params.orchestration ? { orchestration: params.orchestration } : {}) };
+      // The session persists only what older daemons load of the turn's orchestration; advanced.begin reads the turn's own.
+      const session = sessionWithOrchestration(reasoning.session, params.orchestration);
       const sessionSkills = dedupeSkillNames([...(session.skills ?? []), ...installedSkillNames]);
 
       const warnings = dedupeWarnings([
@@ -1926,7 +1928,7 @@ export class AcpxSessionManager implements ISessionManager {
       const requestedSession =
         params.effort == null ? session : { ...session, effort: params.effort };
       const reasoning = this.resolveSessionReasoning(requestedSession);
-      const effectiveSession = { ...reasoning.session, ...(params.orchestration ? { orchestration: params.orchestration } : {}) };
+      const effectiveSession = sessionWithOrchestration(reasoning.session, params.orchestration);
       await this.deps.advanced?.begin(effectiveSession, params, turnPermissionMode(this.effectivePermissionMode(session), params.permissionMode));
       if (providerRefresh.refreshed || params.orchestration) {
         // Persist the daemon-validated provider selection before launching the

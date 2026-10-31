@@ -29,6 +29,8 @@ export type V2RouteDeps = {
   pendingErasures: () => number;
   /** Feature flags advertised in /v2/capabilities; each is opt-in per request. */
   features: () => Record<string, number>;
+  /** advancedOrchestration details (worker policy), when the daemon advertises any. */
+  advancedOrchestration?: () => Record<string, unknown> | undefined;
   limits: () => Record<string, number>;
 };
 
@@ -58,19 +60,23 @@ export function registerV2Routes(app: FastifyInstance, deps: V2RouteDeps): void 
     };
   });
 
-  app.get("/v2/capabilities", async () => ({
-    ok: true,
-    ...identityEnvelope(deps.identity),
-    build: deps.identity.build,
-    pcp: { major: PCP_PROTOCOL.major, minor: PCP_PROTOCOL.minor },
-    features: deps.features(),
-    limits: deps.limits(),
-    providers: {
-      structuredOutput: STRUCTURED_OUTPUT_DIALECTS.map((dialect) => ({
-        reasoningProfile: dialect.reasoningProfile,
-        unsupportedKeywords: [...dialect.unsupportedKeywords],
-        handling: "removed-from-provider-schema-validated-locally"
-      }))
-    }
-  }));
+  app.get("/v2/capabilities", async () => {
+    const advancedOrchestration = deps.advancedOrchestration?.();
+    return {
+      ok: true,
+      ...identityEnvelope(deps.identity),
+      build: deps.identity.build,
+      pcp: { major: PCP_PROTOCOL.major, minor: PCP_PROTOCOL.minor },
+      features: deps.features(),
+      ...(advancedOrchestration ? { advancedOrchestration } : {}),
+      limits: deps.limits(),
+      providers: {
+        structuredOutput: STRUCTURED_OUTPUT_DIALECTS.map((dialect) => ({
+          reasoningProfile: dialect.reasoningProfile,
+          unsupportedKeywords: [...dialect.unsupportedKeywords],
+          handling: "removed-from-provider-schema-validated-locally"
+        }))
+      }
+    };
+  });
 }

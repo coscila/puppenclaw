@@ -367,6 +367,11 @@ describe("verbatim instruments: what the upstream answered", () => {
     expect(results.get("no-fingerprint")!.serverFingerprint).toMatch(/^judge-served@[0-9a-f]{16}$/u);
     // No served model: the item says so; `model` keeps the requested model as before.
     expect(results.get("no-model")).toMatchObject({ state: "completed", servedModel: null, systemFingerprint: null, model: "judge-model" });
+    // brokerOutbox:2: the receipt events carry the same answer next to model and serverFingerprint.
+    const events = new Map(receiptEvents(runtime, job.jobId).map((payload) => [payload.itemId, payload]));
+    expect(events.get("plain")).toMatchObject({ model: "judge-served", serverFingerprint: "fp_verbatim", servedModel: "judge-served", systemFingerprint: "fp_verbatim", httpStatus: 200 });
+    expect(events.get("no-fingerprint")).toMatchObject({ servedModel: "judge-served", systemFingerprint: null, httpStatus: 200, serverFingerprint: results.get("no-fingerprint")!.serverFingerprint });
+    expect(events.get("no-model")).toMatchObject({ model: "judge-model", servedModel: null, systemFingerprint: null, httpStatus: 200 });
   });
 
   it("asks a 2xx without a chat completion message again and then fails it, asks an empty completion again and then settles it empty, and reports a 408 with its status", async () => {
@@ -462,8 +467,10 @@ describe("verbatim instruments: authority", () => {
     expect(body.input[0]!.content.endsWith(`\n\n${SYSTEM}`)).toBe(true);
     // Policy-wrapped receipts carry requestSha256 too: the canonical JSON of the Responses body sent.
     expect(runtime.store.job(wrapped.jobId)!.results[0]!.requestSha256).toBe(sha256(canonicalJson(JSON.parse(up.calls[0]!.raw.toString()))));
-    // Only verbatim items record what the upstream itself named.
-    for (const field of ["servedModel", "systemFingerprint", "httpStatus"]) expect(runtime.store.job(wrapped.jobId)!.results[0]).not.toHaveProperty(field);
+    // Policy-wrapped items record what the upstream itself named as well (brokerOutbox:2 carries it in their receipt events).
+    expect(runtime.store.job(wrapped.jobId)!.results[0]).toMatchObject({ servedModel: "judge-served", systemFingerprint: null, httpStatus: 200 });
+    const wrappedEvent = runtime.store.events(0, 100).events.find((event) => event.type === "broker.receipt" && event.jobId === wrapped.jobId)!.payload as BrokerReceiptPayload;
+    expect(wrappedEvent).toMatchObject({ model: "judge-served", servedModel: "judge-served", systemFingerprint: null, httpStatus: 200 });
 
     // Defence in depth: a verbatim job without a principal that reached dispatch anyway is refused per item, without a call.
     const internals = runtime as unknown as { participants: Map<string, RuntimeParticipant>; launch(job: WorkerJob, p: RuntimeParticipant): void };
