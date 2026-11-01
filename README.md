@@ -426,9 +426,10 @@ set; none of them is added to the open `/health` and `/capabilities`.
   ms over a 30 s window) and `memory`.
 - `GET /v2/capabilities`: `features` (`health`, `opsIdle`, `usageLedger`,
   `compactStatus`, `keyedStreaming`, `sseGap`, and the broker's `eventFeed`,
-  `brokerOutbox`, `instrumentMode`, `instrumentVerbatim` and `workerPolicy`
-  described below), `advancedOrchestration` (the worker policy details, see
-  "Worker policy"), `limits`, and provider dialect limits, e.g. the
+  `brokerOutbox`, `instrumentMode`, `instrumentVerbatim`, `workerPolicy` and
+  `bulkCapacity` described below), `advancedOrchestration` (the worker policy
+  details, see "Worker policy"), `limits`, `bulkCapacity` (the bulk capacity
+  the broker applies, see below), and provider dialect limits, e.g. the
   structured-output keywords removed for `qwen-3.8`.
 - `GET /ops/idle`: counts only, each measured at request time (active turns,
   turn and runner processes, running turn keys, active and paused broker jobs,
@@ -1069,6 +1070,29 @@ This removes the default five-minute header timeout. A bulk call that times out,
 meets a connection reset or gets HTTP 502/503/504 is retried with backoff
 (`PUPPENCLAW_BULK_RETRY_ATTEMPTS`, default 3); every attempt keeps its own
 receipt and the item settles once.
+
+The authenticated `GET /v2/capabilities` reports what bulk dispatch applies as
+`bulkCapacity` (`features.bulkCapacity: 1`), read from the running limiter,
+transport and retry settings rather than from the environment again. It holds
+numbers and names only, never an endpoint or a credential's variable name:
+
+```json
+{"defaultLimit":60,
+ "providers":[{"providerId":"remote_qwen38_low","capacityGroup":"qwen38","limit":60,"groupLimit":60},
+              {"providerId":"remote_qwen38_none","capacityGroup":"qwen38","limit":60,"groupLimit":60}],
+ "responseTimeoutMs":1800000,
+ "retry":{"attempts":3,"baseDelayMs":1000,"maxDelayMs":30000}}
+```
+
+`providers` lists every provider in `PUPPENCLAW_MODEL_PROVIDERS` and every
+provider the bulk limits or groups name, sorted by id. `limit` is the number of
+calls the provider may have in flight; for a grouped provider it is the group's
+limit, shared with every provider of that group. Any other provider gets
+`defaultLimit` in a pool of its own. `responseTimeoutMs` is the deadline of each
+attempt, so an item whose calls never answer keeps one of its job's streams busy
+for up to `attempts` deadlines plus the backoff between them. A run principal's
+calls are further bounded by its grant's `maxConcurrency`. The values are fixed
+when the daemon starts.
 
 Worker configurations and submitted job counts have no fixed numeric ceiling;
 reuse a configuration across as many tasks as required. Requested bulk concurrency
