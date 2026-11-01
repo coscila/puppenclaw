@@ -232,6 +232,56 @@ describe("pcp/2 health and identity", () => {
     }
   });
 
+  it("reports the broker's bulk capacity behind authentication, numbers and names only", async () => {
+    for (const key of ["PUPPENCLAW_BULK_PROVIDER_CONCURRENCY", "PUPPENCLAW_BULK_RETRY_BASE_MS"]) vi.stubEnv(key, undefined);
+    const judge = { label: "Local LLM", model: "judge-model", kind: "codex-openai-compatible", baseUrl: "http://127.0.0.1:18160/v1", authTokenEnv: "QWEN38_JUDGE_KEY", reasoningProfile: "qwen-3.8" };
+    vi.stubEnv("PUPPENCLAW_MODEL_PROVIDERS", JSON.stringify([{ id: "remote_qwen38_none", ...judge }, { id: "remote_qwen38_low", ...judge }]));
+    vi.stubEnv("PUPPENCLAW_BULK_PROVIDER_GROUPS", JSON.stringify({ remote_qwen38_none: "qwen38", remote_qwen38_low: "qwen38", remote_qwen38_medium: "qwen38" }));
+    vi.stubEnv("PUPPENCLAW_BULK_GROUP_LIMITS", '{"qwen38":24}');
+    vi.stubEnv("PUPPENCLAW_BULK_PROVIDER_LIMITS", '{"remote_deepseek":7}');
+    vi.stubEnv("PUPPENCLAW_BULK_RESPONSE_TIMEOUT_MS", "600000");
+    vi.stubEnv("PUPPENCLAW_BULK_RETRY_ATTEMPTS", "2");
+    const { app } = await daemon(await createTempDir("puppenclaw-v2-bulk-capacity-"));
+    try {
+      expect((await app.inject({ method: "GET", url: "/v2/capabilities" })).statusCode).toBe(401);
+      const response = await app.inject({ method: "GET", url: "/v2/capabilities", headers: auth });
+      const body = JSON.parse(response.body) as { features: Record<string, number>; bulkCapacity: unknown };
+      expect(body.features.bulkCapacity).toBe(1);
+      // The configured providers and every provider the limits name; a grouped provider's limit is its group's.
+      expect(body.bulkCapacity).toEqual({
+        defaultLimit: 60,
+        providers: [
+          { providerId: "remote_deepseek", limit: 7 },
+          { providerId: "remote_qwen38_low", capacityGroup: "qwen38", limit: 24, groupLimit: 24 },
+          { providerId: "remote_qwen38_medium", capacityGroup: "qwen38", limit: 24, groupLimit: 24 },
+          { providerId: "remote_qwen38_none", capacityGroup: "qwen38", limit: 24, groupLimit: 24 }
+        ],
+        responseTimeoutMs: 600_000,
+        retry: { attempts: 2, baseDelayMs: 1_000, maxDelayMs: 30_000 }
+      });
+      // Neither the endpoint nor the credential's variable name of a provider configuration.
+      expect(response.body).not.toContain("127.0.0.1:18160");
+      expect(response.body).not.toContain("QWEN38_JUDGE_KEY");
+      // The open v1 capabilities document gains nothing.
+      const legacy = (await app.inject({ method: "GET", url: "/capabilities" })).body;
+      expect(JSON.parse(legacy)).not.toHaveProperty("bulkCapacity");
+      expect(legacy).not.toContain("groupLimit");
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("reports the default bulk capacity of a daemon without bulk settings", async () => {
+    for (const key of ["PUPPENCLAW_MODEL_PROVIDERS", "PUPPENCLAW_BULK_PROVIDER_CONCURRENCY", "PUPPENCLAW_BULK_PROVIDER_LIMITS", "PUPPENCLAW_BULK_PROVIDER_GROUPS", "PUPPENCLAW_BULK_GROUP_LIMITS", "PUPPENCLAW_BULK_RESPONSE_TIMEOUT_MS", "PUPPENCLAW_BULK_RETRY_ATTEMPTS", "PUPPENCLAW_BULK_RETRY_BASE_MS"]) vi.stubEnv(key, undefined);
+    const { app } = await daemon(await createTempDir("puppenclaw-v2-bulk-default-"));
+    try {
+      const body = JSON.parse((await app.inject({ method: "GET", url: "/v2/capabilities", headers: auth })).body) as Record<string, unknown>;
+      expect(body.bulkCapacity).toEqual({ defaultLimit: 60, providers: [], responseTimeoutMs: 1_800_000, retry: { attempts: 3, baseDelayMs: 1_000, maxDelayMs: 30_000 } });
+    } finally {
+      await app.close();
+    }
+  });
+
   it("stays open like every other route when no token is configured", async () => {
     const { app } = await daemon(await createTempDir("puppenclaw-v2-open-"), null);
     try {

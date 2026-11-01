@@ -5,6 +5,14 @@ export type BulkConcurrencyOptions = {
   providerGroups?: Record<string, string>;
   groupLimits?: Record<string, number>;
 };
+/**
+ * One provider's bulk capacity as the limiter applies it: `limit` permits in flight, drawn from its capacity group's
+ * one pool when it has a group (then `limit` is the group's limit, shared with every member) and from a pool of its
+ * own otherwise. Numbers and names only.
+ */
+export type BulkProviderCapacity = { providerId: string; capacityGroup?: string; limit: number; groupLimit?: number };
+/** The configured limits (pcp/2 bulkCapacity): no pool state and no provider configuration. */
+export type BulkCapacityLimits = { defaultLimit: number; providers: BulkProviderCapacity[] };
 type Waiter = { resolve: (release: () => void) => void; reject: (error: Error) => void; signal: AbortSignal; abort: () => void };
 type Pool = { active: number; queue: Waiter[] };
 const positive = (value: unknown): number => { const limit = typeof value === "number" || typeof value === "string" ? Number(value) : NaN; if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("Bulk provider concurrency must be a positive safe integer."); return limit; };
@@ -60,6 +68,20 @@ export class BulkConcurrencyLimiter {
   limit(provider: string): number {
     const group = this.group(provider);
     return group === undefined ? this.providerLimits.get(provider) ?? this.defaultLimit : this.groupLimits.get(group)!;
+  }
+  /**
+   * The limits acquire() applies, for `providers` and for every provider the limits or groups name, sorted by id.
+   * Any other provider draws `defaultLimit` permits from a pool of its own.
+   */
+  capacity(providers: Iterable<string> = []): BulkCapacityLimits {
+    const ids = new Set([...providers, ...this.providerLimits.keys(), ...this.providerGroups.keys()]);
+    return {
+      defaultLimit: this.defaultLimit,
+      providers: [...ids].sort().map((providerId) => {
+        const group = this.group(providerId), limit = this.limit(providerId);
+        return group === undefined ? { providerId, limit } : { providerId, capacityGroup: group, limit, groupLimit: this.groupLimits.get(group)! };
+      })
+    };
   }
   /** Current provider-wide permits and queued requests, without mutable pool state. */
   snapshot(provider: string): { limit: number; active: number; waiting: number } {

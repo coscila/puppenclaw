@@ -10,7 +10,7 @@ import { claudeAcpModelSelector } from "../shared/model-compatibility.js";
 import { redactSensitiveText } from "../shared/utils.js";
 import type { AdvancedOrchestration, ModelProviderConfig, SessionInfo, StartParams, SendParams, ToolResult } from "../shared/types.js";
 import { AdvancedStore, commitWindowFromEnvironment, pageOptions, type AdvancedStoreOptions, type InstrumentRecord, type ReceiptSettlement } from "./store.js";
-import { BulkConcurrencyLimiter, type BulkConcurrencyOptions } from "./concurrency.js";
+import { BulkConcurrencyLimiter, type BulkCapacityLimits, type BulkConcurrencyOptions } from "./concurrency.js";
 import { BulkResponseTransport, shapeLikeNamespaceProxy, type BulkRequestScope, type BulkRoute } from "./bulk-transport.js";
 import { EgressPolicy, proxyConnect, proxyHttp } from "./egress.js";
 import { ClaudeOAuthRelay } from "./claude-oauth-relay.js";
@@ -118,6 +118,11 @@ const verbatimAuthority = (holder: { principalId?: string; runId?: string }): bo
 /** `digests.inline`: compute submission digests on the event loop instead of the digest worker (tests and measurements). */
 export type AdvancedRuntimeOptions = { store?: AdvancedStoreOptions; transport?: BulkResponseTransport; retry?: BulkRetryOptions; digests?: { inline?: boolean } };
 /**
+ * The bulk capacity a runtime applies (pcp/2 bulkCapacity), numbers and names only: the limiter's limits, the deadline
+ * of each attempt (headers and body) and the retries of a transient failure, each attempt with a new deadline.
+ */
+export type BulkCapacity = BulkCapacityLimits & { responseTimeoutMs: number; retry: { attempts: number; baseDelayMs: number; maxDelayMs: number } };
+/**
  * A running job. `stopping`: the daemon is shutting down a principal job; what is in flight
  * returns to the queue unsettled and the job keeps its state, so restart recovery requeues it.
  */
@@ -196,6 +201,14 @@ export class AdvancedRuntime {
   }
   attach(driver: RuntimeDriver): void { this.driver = driver; }
   usePrincipals(hooks: PrincipalHooks): void { this.principals = hooks; }
+  /**
+   * What bulk dispatch applies, read from the limiter, the transport and the retry settings in use (never parsed again):
+   * the limits of `providers` and of every provider the limits name, the per-attempt deadline and the retries.
+   */
+  bulkCapacity(providers: Iterable<string> = []): BulkCapacity {
+    const { attempts, baseDelayMs, maxDelayMs } = this.retry;
+    return { ...this.bulkConcurrency.capacity(providers), responseTimeoutMs: this.bulkTransport.timeoutMs, retry: { attempts, baseDelayMs, maxDelayMs } };
+  }
   /** The daemon's worker policy settings (PUPPENCLAW_WORKER_POLICY, PUPPENCLAW_ONPREM_PROVIDERS); applied to every later admission and dispatch. */
   useWorkerPolicy(settings: WorkerPolicySettings): void { this.workerPolicy = { enabled: settings.enabled, onPremises: new Map(settings.onPremises) }; }
   /** A principal participates like a turn whose admission its grants govern; it never replaces a chat participant. */
