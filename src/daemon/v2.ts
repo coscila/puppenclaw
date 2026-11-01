@@ -3,6 +3,7 @@ import { getHeapStatistics } from "node:v8";
 import type { FastifyInstance } from "fastify";
 
 import { STRUCTURED_OUTPUT_DIALECTS } from "../advanced/response-schema.js";
+import type { BulkCapacity } from "../advanced/runtime.js";
 import type { EventLoopMonitor } from "./event-loop.js";
 import { identityEnvelope, PCP_PROTOCOL, type DaemonIdentity } from "./identity.js";
 
@@ -32,6 +33,8 @@ export type V2RouteDeps = {
   /** advancedOrchestration details (worker policy), when the daemon advertises any. */
   advancedOrchestration?: () => Record<string, unknown> | undefined;
   limits: () => Record<string, number>;
+  /** The bulk capacity the broker applies (features.bulkCapacity): limits, per-attempt deadline and retries. */
+  bulkCapacity?: () => BulkCapacity;
 };
 
 export function registerV2Routes(app: FastifyInstance, deps: V2RouteDeps): void {
@@ -62,6 +65,7 @@ export function registerV2Routes(app: FastifyInstance, deps: V2RouteDeps): void 
 
   app.get("/v2/capabilities", async () => {
     const advancedOrchestration = deps.advancedOrchestration?.();
+    const bulkCapacity = deps.bulkCapacity?.();
     return {
       ok: true,
       ...identityEnvelope(deps.identity),
@@ -70,6 +74,7 @@ export function registerV2Routes(app: FastifyInstance, deps: V2RouteDeps): void 
       features: deps.features(),
       ...(advancedOrchestration ? { advancedOrchestration } : {}),
       limits: deps.limits(),
+      ...(bulkCapacity ? { bulkCapacity } : {}),
       providers: {
         structuredOutput: STRUCTURED_OUTPUT_DIALECTS.map((dialect) => ({
           reasoningProfile: dialect.reasoningProfile,

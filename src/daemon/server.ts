@@ -1,4 +1,4 @@
-import { AdvancedRuntime } from "../advanced/runtime.js";
+import { AdvancedRuntime, type BulkCapacity } from "../advanced/runtime.js";
 import { AdvancedMaintenance, maintenanceFromEnvironment } from "../advanced/maintenance.js";
 import type { UsageReceipt } from "../advanced/types.js";
 import { PrincipalRegistry } from "../advanced/principals.js";
@@ -258,6 +258,7 @@ export async function createDaemonServer(params: {
     let maintenance: AdvancedMaintenance | undefined;
     let principals: PrincipalRegistry | undefined;
     let workerPolicy: WorkerPolicySettings | undefined;
+    let bulkCapacity: BulkCapacity | undefined;
     try {
       // The owner lease is held, so every leftover record belongs to a dead
       // daemon. Reap before reconciliation so killed runners read as orphaned.
@@ -301,6 +302,8 @@ export async function createDaemonServer(params: {
       workerPolicy = { enabled: workerPolicyEnabledFromEnvironment(), onPremises: onPremisesProvidersFromEnvironment(process.env, modelProviders) };
       advanced = await AdvancedRuntime.open(join(params.dataDir, "advanced"), undefined, { store: { warn: (code) => logger.warn(code) }, digests: { inline: submissionDigestsInlineFromEnvironment() } });
       advanced.useWorkerPolicy(workerPolicy);
+      // The broker's limits, deadline and retries are fixed for the daemon's lifetime: read once, served as they are.
+      bulkCapacity = advanced.bulkCapacity(modelProviders.keys());
       /** The usage-ledger row of a settled broker call with measured usage (ids keep it unique). */
       const brokerLedgerEntry = (receipt: UsageReceipt) => {
         if (receipt.state === "running" || receipt.usage.input === null || receipt.usage.output === null) return null;
@@ -386,6 +389,7 @@ export async function createDaemonServer(params: {
         maintenance,
         principals,
         workerPolicy,
+        bulkCapacity,
         outputRouter,
         manager,
         orchestrator,
@@ -416,6 +420,7 @@ export async function createDaemonServer(params: {
     maintenance,
     principals,
     workerPolicy,
+    bulkCapacity,
     outputRouter,
     manager,
     orchestrator,
@@ -549,6 +554,8 @@ export async function createDaemonServer(params: {
       instrumentMode: 1,
       instrumentVerbatim: 1,
       ...(workerPolicy.enabled ? { workerPolicy: 1 } : {}),
+      // bulkCapacity: the broker's limits per configured provider, the per-attempt deadline and the retries (numbers only).
+      bulkCapacity: 1,
       // Run principals need the bearer token; legacyAttemptAuthority says chat turns still carry bulk authority.
       ...(authToken.length > 0 ? { principals: 1 } : {}),
       ...(principals.legacyAttemptAuthority ? { legacyAttemptAuthority: 1 } : {})
@@ -571,7 +578,8 @@ export async function createDaemonServer(params: {
       eventPageMax: EVENT_PAGE_MAX,
       eventWaitMsMax: EVENT_WAIT_MAX_MS,
       eventInlineOutputMax: INLINE_OUTPUT_MAX_BYTES
-    })
+    }),
+    bulkCapacity: () => bulkCapacity
   });
   registerV2BrokerRoutes(app, { identity, advanced });
   registerV2PrincipalRoutes(app, { identity, principals, authenticated: authToken.length > 0 });
