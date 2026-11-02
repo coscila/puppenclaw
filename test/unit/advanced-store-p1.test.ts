@@ -48,7 +48,7 @@ function settled(itemId: string, output: unknown = `answer ${itemId}`): ItemResu
 const settlement = (jobId: string, itemId: string) => ({ receipt: receipt(jobId, itemId), event: true, persist: true, fallbackFingerprint: "unused", fallbackSettingsSha256: "unused", instrumentDigest: null });
 const count = (db: DatabaseSync, sql: string, ...params: (string | number)[]) => Number((db.prepare(sql).get(...params) as { n: number }).n);
 
-describe("P1 AdvancedStore group commit", () => {
+describe("AdvancedStore group commit", () => {
   it("commits a burst of writes as one transaction, within the window, and only then", async () => {
     const { store, dir } = await open(undefined, { commitWindowMs: 50 });
     store.createJob(job("j", Array.from({ length: 200 }, (_, index) => `i${index}`)));
@@ -147,7 +147,7 @@ describe("P1 AdvancedStore group commit", () => {
   });
 });
 
-describe("P1 broker outbox and feed", () => {
+describe("broker outbox and feed", () => {
   it("writes broker.job on creation and state changes and broker.receipt per settled item, in the contract shape", async () => {
     const { store } = await open();
     store.createJob(job("j", ["one", "two", "three"], { state: "queued" }));
@@ -175,12 +175,12 @@ describe("P1 broker outbox and feed", () => {
     expect((page.events[3]!.payload as BrokerReceiptPayload)).toMatchObject({ status: "failed", error: { code: "PROVIDER_UNREACHABLE", retryable: true } });
   });
 
-  it("names the outbox columns as the pcp/2 contract does and renames those of a pre-release store", async () => {
+  it("names the outbox columns as the pcp/2 contract does and renames snake-case columns", async () => {
     const contract = ["seq", "type", "jobId", "itemId", "payload", "createdAt"];
     const fresh = await open();
     const names = (db: DatabaseSync) => (db.prepare("PRAGMA table_info(outbox)").all() as { name: string }[]).map((column) => column.name);
     expect(names(fresh.db())).toEqual(expect.arrayContaining(contract));
-    // A store written by a pre-release build of P1 named them job_id, item_id and created_at.
+    // A store whose outbox columns are named job_id, item_id and created_at.
     const dir = await createTempDir("advanced-p1-outbox-");
     const { DatabaseSync } = await import(`node${":sqlite"}`);
     const legacy = new DatabaseSync(join(dir, "advanced.sqlite"));
@@ -297,12 +297,12 @@ describe("P1 broker outbox and feed", () => {
     expect(count(db(), "SELECT count(*) AS n FROM receipts")).toBe(0);
   });
 
-  it("converts the deferred whole jobs of a pre-release store into pending erasures without their contents", async () => {
+  it("converts jobs deferred whole in purge_deferred into pending erasures without their contents", async () => {
     const first = await open();
     first.store.createJob(job("j", ["one"], {}, () => "CONFIDENTIAL INPUT"));
     await first.store.settleItem("j", settled("one", "CONFIDENTIAL OUTPUT"), settlement("j", "one"));
     first.store.flush();
-    // A pre-release build kept a purged job whole in purge_deferred until the acknowledgement.
+    // A store that keeps a purged job whole in purge_deferred until the acknowledgement.
     first.db().exec("CREATE TABLE purge_deferred (job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE, requested_at TEXT NOT NULL) WITHOUT ROWID; INSERT INTO purge_deferred VALUES ('j', '2026-10-25T00:00:00.000Z')");
     first.store.close();
     const { store, db } = await open(first.dir);
@@ -314,7 +314,7 @@ describe("P1 broker outbox and feed", () => {
     expect(store.pendingErasures()).toEqual([]);
   });
 
-  it("requeues the unsettled items of P1 bulk jobs and relaunches only jobs whose authority survives", async () => {
+  it("requeues the unsettled items of outbox-layout bulk jobs and relaunches only jobs whose authority survives", async () => {
     const { store, dir } = await open();
     store.createJob(job("kept", ["one", "two"]));
     store.createJob(job("relaunched", ["one", "two"], { idempotencyKey: "k2", principalId: "run:study" }));
@@ -330,7 +330,7 @@ describe("P1 broker outbox and feed", () => {
     expect(states).toContainEqual(["kept", "interrupted"]);
   });
 
-  it("archives verified terminal P1 jobs on request and keeps run, study, historical, unacknowledged and recent ones", async () => {
+  it("archives verified terminal outbox-layout jobs on request and keeps run, study, historical, unacknowledged and recent ones", async () => {
     let now = new Date("2026-08-01T00:00:00.000Z");
     const { store, dir, db } = await open(undefined, { now: () => now });
     const ids = ["old", "study", "unacked", "recent", "run", "historical"];
@@ -340,7 +340,7 @@ describe("P1 broker outbox and feed", () => {
     store.updateHeader("unacked", { state: "completed", updatedAt: "2026-08-01T00:00:00.000Z" });
     store.updateHeader("unacked", { state: "failed", updatedAt: "2026-08-01T00:00:00.000Z" });
     store.setStudyRef("study", "study:census-reproduction");
-    // A job written before P1: its records reach Postgres only through the backfill, which the daemon cannot see.
+    // A job of the earlier layout: its records never passed through the feed, so the daemon cannot prove the caller holds them.
     db().exec("UPDATE jobs SET storage_version=1 WHERE id='historical'");
     now = new Date("2026-10-25T00:00:00.000Z");
     const report = await store.archive({ before: new Date("2026-09-25T00:00:00.000Z") });

@@ -365,7 +365,7 @@ describe("verbatim instruments: what the upstream answered", () => {
     expect(results.get("plain")).toMatchObject({ state: "completed", servedModel: "judge-served", systemFingerprint: "fp_verbatim", serverFingerprint: "fp_verbatim", httpStatus: 200, model: "judge-served" });
     expect(results.get("no-fingerprint")).toMatchObject({ state: "completed", servedModel: "judge-served", systemFingerprint: null, httpStatus: 200 });
     expect(results.get("no-fingerprint")!.serverFingerprint).toMatch(/^judge-served@[0-9a-f]{16}$/u);
-    // No served model: the item says so; `model` keeps the requested model as before.
+    // No served model: the item says so; `model` then holds the requested model.
     expect(results.get("no-model")).toMatchObject({ state: "completed", servedModel: null, systemFingerprint: null, model: "judge-model" });
     // brokerOutbox:2: the receipt events carry the same answer next to model and serverFingerprint.
     const events = new Map(receiptEvents(runtime, job.jobId).map((payload) => [payload.itemId, payload]));
@@ -439,7 +439,7 @@ describe("verbatim instruments: authority", () => {
     expect(up.calls).toHaveLength(1);
   });
 
-  it("never lets chat-turn attempt authority use a verbatim instrument, while policy-wrapped instruments keep today's behaviour", async () => {
+  it("never lets chat-turn attempt authority use a verbatim instrument, while policy-wrapped instruments still run under it", async () => {
     const up = await upstream({ respond: (_call, _raw, res) => reply(res, 200, { model: "judge-served", status: "completed", output_text: "T", usage: { input_tokens: 5, output_tokens: 1 } }) });
     const { runtime } = await harness({ providers: [provider(up.url)], legacy: true });
     const modelProvider = provider(up.url);
@@ -457,7 +457,7 @@ describe("verbatim instruments: authority", () => {
     expect(refused.body.error).toMatch(/verbatim instrument runs only over a run principal socket/u);
     expect(runtime.store.jobHeaders("main")).toEqual([]);
     expect(up.calls).toHaveLength(0);
-    // A policy-wrapped instrument still runs under attempt authority, wrapped as before.
+    // A policy-wrapped instrument still runs under attempt authority, wrapped in the worker policy.
     const wrapped = (await unix(socket, "/bulk/submit", { configId: "refs", idempotencyKey: "wrapped", instrumentDigest: WRAPPED, items: [{ id: "y", input: { messages: [{ role: "user", content: "entry" }], itemCount: 1 } }] })).body;
     expect((await settledJob(runtime, wrapped.jobId)).state).toBe("completed");
     expect(up.calls).toHaveLength(1);

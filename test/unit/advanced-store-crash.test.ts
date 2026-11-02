@@ -68,7 +68,7 @@ function expectAtomic(state: Snapshot, items: number): void {
   expect(state.seqs).toEqual(Array.from({ length: state.seqs.length }, (_, index) => index + 1));
 }
 
-describe("P1 AdvancedStore crash safety", () => {
+describe("AdvancedStore crash safety", () => {
   it("a SIGKILL inside a batch transaction keeps no part of that batch: result, receipt and outbox row stay together", async () => {
     const dir = await createTempDir("advanced-crash-mid-");
     const store = await AdvancedStore.open(dir); store.createJob(job("j", 100)); store.close();

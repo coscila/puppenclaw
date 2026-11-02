@@ -1,6 +1,6 @@
 /**
- * Plan P1/P2 acceptance measurement: bulk completions per second and daemon
- * event-loop lag with the group-committed store, against a mock upstream.
+ * Bulk completions per second and daemon event-loop lag with the
+ * group-committed broker store, against a mock upstream.
  *
  *   node --experimental-strip-types scripts/measure-p1.mts [--items N] [--jobs N]
  *     [--streams N] [--latency-ms N] [--output-bytes N] [--only paced|max|hooks-off|no-group-commit]
@@ -10,10 +10,10 @@
  * (one checkpoint per receipt update, /proc sampling) and the usage ledger.
  * The mock upstream runs in its own process so its work never lands on the
  * measured event loop. Reported lag uses monitorEventLoopDelay at 10 ms
- * resolution minus the resolution, as GET /v2/health does. Targets: at least
- * 200 completions/s with p99 < 50 ms; a worker-thread store host is only
- * warranted when p99 reaches 50 ms at 200 completions/s with in-thread group
- * commit. It only talks to the processes it starts.
+ * resolution minus the resolution, as GET /v2/health does. The design point is
+ * at least 200 completions/s with p99 < 50 ms; a worker-thread store host is
+ * only warranted when p99 reaches 50 ms at 200 completions/s with in-thread
+ * group commit. It only talks to the processes it starts.
  */
 import { spawn } from "node:child_process";
 import { mkdtemp } from "node:fs/promises";

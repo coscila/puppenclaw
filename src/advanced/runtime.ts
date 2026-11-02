@@ -184,9 +184,9 @@ export class AdvancedRuntime {
   private readonly pauseResumeAfter = new Map<string, string>();
   private readonly pendingContributions = new Map<string, UsageReceipt>();
   private contributionTimer: ReturnType<typeof setTimeout> | undefined;
-  /** Run principals (P3, src/advanced/principals.ts); absent means today's attempt authority only. */
+  /** Run principals (src/advanced/principals.ts); absent means chat-turn attempt authority only. */
   private principals: PrincipalHooks | undefined;
-  /** Worker policy (plan E4): whether its fields are accepted, and the providers configured as on premises. */
+  /** Worker policy: whether its fields are accepted, and the providers configured as on premises. */
   private workerPolicy: WorkerPolicySettings = DEFAULT_WORKER_POLICY;
   private constructor(readonly store: AdvancedStore, root: string, concurrency?: BulkConcurrencyOptions, options: AdvancedRuntimeOptions = {}) {
     this.bulkConcurrency = new BulkConcurrencyLimiter(concurrency);
@@ -420,8 +420,8 @@ export class AdvancedRuntime {
     attached();
     const config = this.worker(p, request.configId);
     // A bulk submission's digests (fingerprint, item digests, input blob keys) are computed on the digest worker, off the
-    // event loop. Every check from here to the job's creation then runs without another await, as before: two
-    // submissions with one key still see each other's job, and a turn that closed meanwhile admits nothing.
+    // event loop. Every check from here to the job's creation then runs without another await: two submissions
+    // with one key see each other's job, and a turn that closed meanwhile admits nothing.
     const digests = kind === "bulk" ? await this.bulkDigests(config, request as BulkSubmit) : undefined;
     if (digests) attached();
     const fingerprint = digests?.fingerprint ?? hash({ kind, config, request });
@@ -444,7 +444,7 @@ export class AdvancedRuntime {
       // A verbatim instrument bypasses the worker policy: only a run principal granted its digest (admitJob above) runs it.
       if (instrumentMessageMode(instrument) === "verbatim" && !verbatimAuthority(p)) throw new PuppenclawError("PRINCIPAL_REQUIRED", VERBATIM_PRINCIPAL_REQUIRED);
     }
-    // Worker policy (plan E4): profiles, on-premises-only evidence and pinned instruments decide what this worker may run.
+    // Worker policy: profiles, on-premises-only evidence and pinned instruments decide what this worker may run.
     const policyRefusal = workerJobRefusal(config, kind, request, this.workerPolicy, instrumentIdentity); if (policyRefusal) throw policyRefusal;
     const job: WorkerJob = { jobId: randomUUID(), kind, state: "queued", parentSessionName: p.parentSessionName, attemptId: p.attemptId,
       configRevision: p.config.revision, config, idempotencyKey: request.idempotencyKey, fingerprint, createdAt: timestamp(), updatedAt: timestamp(), request, results: [], ...(p.ownerKey ? { ownerKey: p.ownerKey } : {}), ...(resumedFromJobId ? { resumedFromJobId } : {}),
@@ -530,7 +530,7 @@ export class AdvancedRuntime {
     return { receipt, event: true, persist: false, fallbackFingerprint: fingerprint, fallbackSettingsSha256: settings };
   }
   /**
-   * Bulk execution (plan P1/P2). Running state stays in memory; each item settles in
+   * Bulk execution. Running state stays in memory; each item settles in
    * one store write together with its receipt and outbox row; the job header changes
    * only with the job state.
    */

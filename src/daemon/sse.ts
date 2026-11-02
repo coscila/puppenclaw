@@ -1,7 +1,7 @@
 import type { ServerResponse } from "node:http";
 
 /**
- * One SSE response with backpressure (plan H4).
+ * One SSE response with backpressure.
  *
  * Frames go straight to the socket while it accepts them. Once `write()`
  * reports a full buffer, events wait in this stream's own queue until `drain`;

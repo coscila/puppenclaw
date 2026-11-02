@@ -1,5 +1,5 @@
 /**
- * Child process for the crash tests of the P1 AdvancedStore (bundled with esbuild).
+ * Child process for the crash tests of the AdvancedStore (bundled with esbuild).
  *
  *   node child.js <dir> <jobId> <first> <count> <batches> <crashAt|0>
  *

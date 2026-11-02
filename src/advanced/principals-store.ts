@@ -5,7 +5,7 @@ import type { DatabaseSync as Database, StatementSync } from "node:sqlite";
 import type { PrincipalGrants, PrincipalKind, PrincipalRecord, PrincipalUsage } from "./principals-schema.js";
 
 /**
- * Durable run principals (plan P3) in their own file, `principals.sqlite`, next
+ * Durable run principals in their own file, `principals.sqlite`, next
  * to their sockets. Daemons that predate principals never open it, so a
  * rollback keeps working; advanced.sqlite is not touched.
  */

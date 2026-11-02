@@ -589,10 +589,10 @@ describe("scoped worker broker", () => {
   });
   it("recovers ambiguous jobs without automatic redispatch and keeps completed item results", async () => {
     const dir = await root(); let store = await AdvancedStore.open(dir); const now = new Date().toISOString(); const job: WorkerJob = { jobId: "job", kind: "bulk", state: "running", parentSessionName: "main", attemptId: "attempt", configRevision: 1, config: { id: "refs", assignment: "sources", agent: "codex", modelProvider: { id: "local", model: "test", kind: "codex-openai-compatible" } }, idempotencyKey: "key", fingerprint: "fingerprint", createdAt: now, updatedAt: now, request: { configId: "refs", idempotencyKey: "key", items: [{ id: "one", input: "x" }, { id: "two", input: "y" }], concurrency: 1 }, results: ["completed", "running"].map((state, i) => ({ id: ["one", "two"][i]!, state: state as "completed" | "running", providerId: "local", model: "test", promptSha256: "hash", usage: null })) };
-    // A job written by P1: its unsettled bulk item is requeued (inference is side-effect free) and
+    // A job of the outbox layout: its unsettled bulk item is requeued (inference is side-effect free) and
     // the chat-attempt job waits for an explicit resume, since its parent turn ended with the restart.
     store.putJob(job); store.close(); store = await AdvancedStore.open(dir); expect(store.recover()).toEqual([]); expect(store.job("job")!.state).toBe("interrupted"); expect(store.job("job")!.results.map((r) => r.state)).toEqual(["completed", "queued"]); expect(store.lastRecovery).toEqual({ requeued: ["job"], relaunch: [] }); expect(store.duplicate("main", "attempt", "key")!.jobId).toBe("job"); store.close();
-    // The same job as written before P1 keeps the old behaviour: ambiguous work is never replayed.
+    // The same job stored in the earlier layout is interrupted instead: ambiguous work is never replayed.
     const legacy = { ...job, jobId: "legacy", idempotencyKey: "legacy-key" };
     store = await AdvancedStore.open(dir); store.putJob(legacy); store.flush(); store.close();
     const { DatabaseSync } = await import(`node${":sqlite"}`); const raw = new DatabaseSync(join(dir, "advanced.sqlite")); raw.prepare("UPDATE jobs SET storage_version=1 WHERE id='legacy'").run(); raw.close();

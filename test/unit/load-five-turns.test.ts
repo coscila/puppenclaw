@@ -13,7 +13,7 @@ import {
 } from "../helpers.js";
 
 /**
- * Plan H4 acceptance, scaled: with 5 active turns on a production-sized store
+ * Checkpoint load, scaled: with 5 active turns on a production-sized store
  * (about 9 MB of transcripts), state.json is written once per checkpoint tick,
  * not once per turn per tick, and the event loop stays responsive. At the 30 s
  * default tick that is 2 checkpoint writes per minute (target: at most 12).

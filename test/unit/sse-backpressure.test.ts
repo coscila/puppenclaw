@@ -14,7 +14,7 @@ import {
 setFlagsFromString("--expose-gc");
 const gc = runInNewContext("gc") as () => void;
 
-/** Stall length of the memory-bound test; the plan asks for 30 s. */
+/** Stall length of the memory-bound test: 30 s by default. */
 const STALL_MS = Number(process.env.PUPPENCLAW_SSE_STALL_TEST_MS ?? 30_000);
 
 type Harness = {

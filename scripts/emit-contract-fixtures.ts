@@ -56,7 +56,7 @@ export type ContractScenario = (typeof CONTRACT_SCENARIOS)[number];
 export type ContractCapture = {
   status: unknown;
   output: unknown;
-  /** GET /session/:name?view=summary, the compact pcp/2 step-1 status view. */
+  /** GET /session/:name?view=summary, the compact pcp/2 status view. */
   summary: unknown;
 };
 

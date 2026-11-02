@@ -53,7 +53,7 @@ const normalizeBase = (value: string): string => value.replace(/\/+$/u, "");
 /**
  * Operator mapping from a registered provider base URL (typically a local
  * compatibility proxy) to the upstream behind it, for tool-free bulk calls:
- * PUPPENCLAW_BULK_DIRECT_UPSTREAMS='{"http://127.0.0.1:18160/v1":"http://upstream:18000/v1"}'.
+ * PUPPENCLAW_BULK_DIRECT_UPSTREAMS='{"http://127.0.0.1:8080/v1":"http://upstream:8000/v1"}'.
  * Agents keep using the registered URL.
  */
 export function directUpstreamsFromEnvironment(env: NodeJS.ProcessEnv = process.env): Map<string, string> {

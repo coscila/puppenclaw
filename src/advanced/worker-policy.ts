@@ -5,7 +5,7 @@ import type { AdvancedOrchestration, ModelProviderConfig, PersistedAdvancedOrche
 import type { AgentSubmit, BulkSubmit, WorkerConfig } from "./types.js";
 
 /**
- * Worker policy (plan E4, capability advancedOrchestration.workerPolicy). coscila decides a worker's capability
+ * Worker policy (capability advancedOrchestration.workerPolicy). coscila decides a worker's capability
  * profile, evidence policy and pinned instruments; the daemon enforces them wherever it decides job admission:
  *
  * - entitled-institutional and confidential-manuscript workers use on-premises providers only, as if granted
@@ -36,7 +36,7 @@ export const INSTRUMENT_NOT_PINNED = "INSTRUMENT_NOT_PINNED";
 export const WORKER_POLICY_REFUSAL_CODES: ReadonlySet<string> = new Set([CAPABILITY_PROFILE_DENIED, PROVIDER_NOT_ON_PREMISES, INSTRUMENT_REQUIRED, INSTRUMENT_NOT_PINNED]);
 
 export type WorkerPolicySettings = {
-  /** PUPPENCLAW_WORKER_POLICY (default on): off refuses every worker policy field and advertises nothing, as 426d493. */
+  /** PUPPENCLAW_WORKER_POLICY (default on): off refuses every worker policy field and advertises nothing, like a daemon without worker policies. */
   enabled: boolean;
   /** Providers configured as on premises, by id (onPremisesProvidersFromEnvironment). */
   onPremises: ReadonlyMap<string, ModelProviderConfig>;

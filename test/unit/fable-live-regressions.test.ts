@@ -15,7 +15,7 @@ async function fixture() {
   return { manager, store, workspace };
 }
 
-describe("native Fable rollout regressions", () => {
+describe("native Fable live turns", () => {
   it("does not promote a recovered native OAuth diagnostic into successful assistant output", async () => {
     const { manager, store, workspace } = await fixture();
     try {

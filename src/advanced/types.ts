@@ -31,7 +31,7 @@ export type ItemResult = { id: string; state: JobState; output?: unknown; provid
    * Bulk calls, as the upstream answered the settling call: the model its response named (null when it named none;
    * `model` then still holds the requested model), its system_fingerprint (null when it offered none;
    * `serverFingerprint` then holds the daemon's synthesized identity) and the HTTP status (absent when the call got no
-   * HTTP response). Items a daemon settled before this version recorded them for verbatim calls only.
+   * HTTP response). Items settled by older daemons may carry them for verbatim calls only.
    */
   servedModel?: string | null; systemFingerprint?: string | null; httpStatus?: number;
   /** Closed failure code of a settled item, e.g. PROVIDER_RATE_LIMITED or STRUCTURED_OUTPUT_INVALID. */
@@ -42,7 +42,7 @@ export type WorkerJob = {
   request: AgentSubmit | BulkSubmit; childSessionName?: string; resumedFromJobId?: string; results: ItemResult[]; error?: string;
   /** Earliest time a provider-limit pause may be resumed (Retry-After or a provider reset header). */
   resumeAfter?: string;
-  /** Set for jobs submitted over a principal socket (P3); parentSessionName is then `principal:<principalId>`. Absent for chat-attempt jobs. */
+  /** Set for jobs submitted over a principal socket; parentSessionName is then `principal:<principalId>`. Absent for chat-attempt jobs. */
   principalId?: string; runId?: string;
 };
 /** Job metadata stays bounded regardless of the number or size of item inputs. */
@@ -75,7 +75,7 @@ export type RuntimeParticipant = {
   sessionName: string; parentSessionName: string; attemptId: string; directory: string; provider: ModelProviderConfig;
   ownerKey?: string; permissionMode: PermissionMode; interactionMode: InteractionMode; config: AdvancedOrchestration;
   jobId?: string; admissionOpen: boolean;
-  /** A run principal (P3) instead of a chat turn: its grants, not the turn mode, carry bulk authority. */
+  /** A run principal instead of a chat turn: its grants, not the turn mode, carry bulk authority. */
   principalId?: string; runId?: string;
 };
 export type RuntimeDriver = {

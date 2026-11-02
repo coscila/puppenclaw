@@ -70,8 +70,8 @@ describe("resource proc primitives", () => {
   });
 
   it("walks ancestry only and never merges unrelated trees sharing a pgrp", () => {
-    // Regression for the pgid-collision bug: both trees share pgrp 100, but
-    // tree B is NOT a descendant of tree A's root and must stay out.
+    // Process groups can collide: both trees share pgrp 100, but tree B is
+    // NOT a descendant of tree A's root and must stay out.
     const processes = new Map<number, ProcProcess>();
     for (const entry of [
       proc({ pid: 100, ppid: 1 }),

@@ -10,10 +10,10 @@ import { createDaemonServer } from "../../src/daemon/server.js";
 import { createTempDir, makeConfig } from "../helpers.js";
 
 /**
- * Plan H4: stall the runner's stdout reader for 30 s to find the source of the
- * Codex "failed printing to stdout: EAGAIN" panics.
+ * Stalls the runner's stdout reader for 30 s, the condition behind Codex's
+ * "failed printing to stdout: EAGAIN" panics.
  *
- * Finding: initialising process.stdout in a Node process (writing to it, or
+ * Cause: initialising process.stdout in a Node process (writing to it, or
  * even importing `node:process`) sets O_NONBLOCK on its stdout pipe. The flag
  * belongs to the open file description, which a child started with inherited
  * stdio shares. libuv resets inherited stdio to blocking at spawn, so the flag
@@ -23,9 +23,9 @@ import { createTempDir, makeConfig } from "../helpers.js";
  * soon as the socket buffer (about 208 KiB) is full, i.e. whenever the daemon
  * reads the runner's stdout more slowly than the runner writes. With a
  * blocking stdout the same runner simply waits, even through a 30 s stall.
- * The daemon's side is to keep that reader moving: a slow SSE consumer no
- * longer slows it (bounded per-stream queue), and group commit removes most
- * long synchronous state writes from the event loop.
+ * The daemon's side is to keep that reader moving: a slow SSE consumer never
+ * slows it (bounded per-stream queue), and group commit keeps most long
+ * synchronous state writes off the event loop.
  */
 
 const STALL_MS = Number(process.env.PUPPENCLAW_STDOUT_STALL_TEST_MS ?? 30_000);

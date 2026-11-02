@@ -7,7 +7,7 @@ import { redactSensitiveText } from "../shared/utils.js";
 import { identityEnvelope, type DaemonIdentity } from "./identity.js";
 
 /**
- * pcp/2 run principals (plan P3, capability `principals:1`):
+ * pcp/2 run principals (capability `principals:1`):
  * PUT|GET|DELETE /v2/principals/{id}. Authenticated by the daemon-wide bearer
  * hook, and refused outright when the daemon runs without a token, like the
  * other authority-bearing routes (owner cleanup, statistics erasure). Every

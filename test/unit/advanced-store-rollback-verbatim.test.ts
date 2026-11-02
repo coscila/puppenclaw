@@ -19,9 +19,9 @@ import { installedSettingsSha256 as installedSettings815463f, instrumentBundleZo
 /**
  * Rollback safety of verbatim instrument mode. Nothing changed in the store schema: verbatim bundles keep
  * `transport` in their bundle JSON, receipts, results and receipt events gain `requestSha256` inside their JSON.
- * The store code of the P1-P3 daemon (815463f) and of the H4 daemon (cea4c29) open, read and write such a store,
- * the P1-P3 daemon refuses a verbatim bundle instead of running it policy-wrapped, and bundles that daemon
- * installed stay valid here.
+ * The store code of the daemon with the outbox and run principals (815463f) and of the daemon without an outbox
+ * (cea4c29) open, read and write such a store, the 815463f daemon refuses a verbatim bundle instead of running it
+ * policy-wrapped, and bundles that daemon installed stay valid here.
  */
 const OWNER = "owner-key-0123456789abcdef";
 const VERBATIM = "c".repeat(64);
@@ -108,7 +108,7 @@ describe("rollback safety of verbatim instrument mode", () => {
     const wrappedSettings = now.runtime.instruments().find((record) => record.digest === WRAPPED)!.settingsSha256;
     await now.close();
 
-    // The P1-P3 daemon's store code opens the store unchanged and reads every record, requestSha256 included.
+    // The 815463f daemon's store code opens the store unchanged and reads every record, requestSha256 included.
     const p3 = await Store815463f.open(root);
     const instruments = new Map(p3.instruments().map((record) => [record.digest, record]));
     expect([...instruments.keys()].sort()).toEqual([VERBATIM, WRAPPED]);
@@ -143,7 +143,7 @@ describe("rollback safety of verbatim instrument mode", () => {
     await p3.settleItem("legacy-job", { id: "one", state: "completed", output: "T", providerId: "judge", model: "judge-served", promptSha256: "a".repeat(64), usage: legacyReceipt.usage }, { receipt: legacyReceipt, event: true, persist: true, fallbackFingerprint: "fp", fallbackSettingsSha256: "s".repeat(64), instrumentDigest: null });
     p3.close();
 
-    // The H4 daemon's store code opens it too.
+    // The cea4c29 daemon's store code opens it too.
     const h4 = await StoreCea4c29.open(root);
     expect(h4.jobHeader(verbatimJob.jobId)).toMatchObject({ state: "completed", principalId: "run:census", request: { instrumentDigest: VERBATIM } });
     expect(h4.resultPage(verbatimJob.jobId).results.map((result) => result.requestSha256)).toEqual(written.results.map((result) => result.requestSha256));

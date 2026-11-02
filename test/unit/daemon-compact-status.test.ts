@@ -281,7 +281,7 @@ describe("compact status views", () => {
       const missing = await app.inject({ method: "GET", url: "/session/nope?view=summary" });
       expect(missing.statusCode).toBe(404);
       expect(JSON.parse(missing.body)).toMatchObject({ code: "NO_SESSION" });
-      // Unknown query keys stay ignored, as before.
+      // Unknown query keys are ignored.
       expect((await app.inject({ method: "GET", url: "/session/lab-quiet?format=json" })).statusCode).toBe(200);
     } finally {
       await app.close();

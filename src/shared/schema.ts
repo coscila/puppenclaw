@@ -104,7 +104,7 @@ export const modelProviderConfigZod = z
     }
   });
 /**
- * Worker policy (plan E4; capability advancedOrchestration.workerPolicy). Both lists are versioned: a value this
+ * Worker policy (capability advancedOrchestration.workerPolicy). Both lists are versioned: a value this
  * daemon does not know is refused with a typed error (UNSUPPORTED_EVIDENCE_POLICY, UNSUPPORTED_CAPABILITY_PROFILE),
  * never ignored, since ignoring a restriction would grant more than the caller asked for.
  * - Evidence policies: public-literature (published claims and public sources); entitled-institutional (licensed full
@@ -195,8 +195,8 @@ export const advancedOrchestrationZod = z.object({
 
 /**
  * The orchestration a session persists in state.json: exactly the shape every daemon since advanced orchestration
- * validates its state with (frozen; 426d493 and older refuse anything else and would stop at load). It never carries
- * the worker policy fields; persistedOrchestration() decides what of a turn's orchestration may be kept.
+ * validates its state with (frozen: daemons without worker policies refuse anything else and would stop at load). It
+ * never carries the worker policy fields; persistedOrchestration() decides what of a turn's orchestration may be kept.
  */
 export const persistedAdvancedOrchestrationZod = z.object({
   version: z.literal(1),

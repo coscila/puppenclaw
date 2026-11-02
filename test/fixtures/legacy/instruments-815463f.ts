@@ -1,4 +1,4 @@
-// Verbatim copy of src/advanced/instruments.ts at 815463f: the strict bundle schema a P1-P3 daemon parses installed
+// Verbatim copy of src/advanced/instruments.ts at 815463f: the strict bundle schema that daemon parses installed
 // instruments with. Only the import paths changed.
 import { z } from "zod";
 

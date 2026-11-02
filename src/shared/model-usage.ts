@@ -76,7 +76,7 @@ const USAGE_KEYS = [
 /**
  * Validates one `ocsl.model_usage` line and groups its threads by (role,
  * model), main groups first, each in first-seen order. Returns null for any
- * invalid line (callers then keep today's main-thread-only accounting) and for
+ * invalid line (callers then keep main-thread-only accounting) and for
  * a line without any nonzero thread usage.
  */
 export function parseOcslModelUsage(raw: unknown): ModelUsageGroup[] | null {

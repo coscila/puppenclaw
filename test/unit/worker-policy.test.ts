@@ -33,9 +33,8 @@ import type { AdvancedOrchestration, ModelProviderConfig, PersistedAdvancedOrche
 import { createTempDir, makeConfig, resolveFakeAcpxCommand } from "../helpers.js";
 
 /**
- * Worker policy (plan E4, capability advancedOrchestration.workerPolicy): the E4 worker fields coscila sends with
- * LAB_ORCHESTRATION_RECORD=v2 are accepted, refused when unknown, kept out of persisted session state, and enforced
- * where the daemon decides job admission.
+ * Worker policy (capability advancedOrchestration.workerPolicy): the worker policy fields coscila sends are accepted,
+ * refused when unknown, kept out of persisted session state, and enforced where the daemon decides job admission.
  */
 const cleanups: (() => Promise<void> | void)[] = [];
 const ENV_KEYS = ["TEST_MODEL_KEY", "PUPPENCLAW_MODEL_PROVIDERS", "PUPPENCLAW_ONPREM_PROVIDERS", "PUPPENCLAW_WORKER_POLICY"] as const;
@@ -128,7 +127,7 @@ const bundle = (overrides: Partial<InstrumentBundle> = {}): InstrumentBundle => 
 });
 
 describe("worker policy shapes", () => {
-  it("accepts the E4 worker fields coscila sends for v2 worker configs and keeps legacy configurations as they were", () => {
+  it("accepts the worker policy fields coscila sends and keeps configurations without a policy unchanged", () => {
     const parsed = v2Orchestration("http://127.0.0.1:18160/v1");
     expect(parsed.workers.map((worker) => [worker.id, worker.evidencePolicy ?? null, worker.capabilityProfile ?? null, worker.instruments?.map((pin) => pin.id) ?? null])).toEqual([
       ["w1", "entitled-institutional", "evidence-only", null], ["w2", null, "run-fixed-programs", ["citation-census@1"]], ["w3", null, "run-fixed-programs", null],
@@ -299,7 +298,7 @@ describe("worker policy on the turn socket", () => {
     expect((await settled(runtime, plain.jobId)).state).toBe("completed");
   });
 
-  it("refuses every worker policy field while PUPPENCLAW_WORKER_POLICY is off, and runs legacy configurations as before", async () => {
+  it("refuses every worker policy field while PUPPENCLAW_WORKER_POLICY is off, and runs configurations without a policy unchanged", async () => {
     await expect(turn({ enabled: false })).rejects.toMatchObject({ code: WORKER_POLICY_DISABLED });
     process.env.TEST_MODEL_KEY = "test-secret";
     const runtime = await AdvancedRuntime.open(await dataRoot(), { defaultLimit: 4 });

@@ -43,15 +43,15 @@ import {
 } from "./types.js";
 
 /**
- * Run principals (plan P3): persisted grants, a private unix socket per
- * principal that is its only identity, and the admission gate the broker
- * runtime consults for every item of a principal job.
+ * Run principals: persisted grants, a private unix socket per principal that
+ * is its only identity, and the admission gate the broker runtime consults for
+ * every item of a principal job.
  *
  * Socket layout: `<data>/principals/` (0700) holds `principals.sqlite` and one
- * random directory per socket principal (0700) with `broker.sock` (0600). The
- * data directory lies inside the daemon state root, which every lab sandbox
- * hides; a sandbox reaches a principal only when its launcher binds that
- * principal's directory (see README, "Run principals").
+ * random directory per socket principal (0700) with `broker.sock` (0600). No
+ * sandbox mounts the daemon's data directory; a sandbox reaches a principal
+ * only when its launcher binds that principal's directory (see docs/pcp2.md,
+ * "Binding a principal socket into a sandbox").
  */
 
 export const PRINCIPAL_PARENT_PREFIX = "principal:";

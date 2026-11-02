@@ -1,7 +1,7 @@
 /**
- * Verbatim instrument measurement (plan P2, decision "Instrument verbatim mode"):
- * calls and entries per second, daemon event-loop lag and per-call byte identity
- * for census-shaped verbatim calls through a run principal socket, against a mock
+ * Verbatim instrument measurement: calls and entries per second, daemon event-loop
+ * lag and per-call byte identity for verbatim calls shaped like a large instrument
+ * run (many entries per call) through a run principal socket, against a mock
  * chat-completions upstream.
  *
  *   node --experimental-strip-types scripts/measure-verbatim.mts [--calls N] [--jobs N]
