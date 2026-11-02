@@ -819,11 +819,11 @@ export const pluginManifestConfigSchema = {
       type: "integer",
       minimum: 1,
       maximum: 1440,
-      description: "Garbage-collect completed or stopped sessions after this TTL."
+      description: "Garbage-collect failed or stopped sessions idle for longer than this TTL; idle, waiting and suspended sessions are kept."
     },
     streamOutput: {
       type: "boolean",
-      description: "Capture streamed output chunks while turns run."
+      description: "Reported in daemon capabilities and site status; output is captured and streamed regardless of this value."
     },
     resourceSamplingIntervalMs: {
       type: "integer",
@@ -843,7 +843,7 @@ export const pluginManifestConfigSchema = {
     },
     codexCommand: {
       type: "string",
-      description: "Optional codex binary override."
+      description: "Optional launcher that wraps provider Codex turns as <codexCommand> --cwd <dir> -- <codex launcher> exec ...; the codex launcher itself is agentCommands.codex."
     },
     skillRoots: {
       type: "array",
