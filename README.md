@@ -3,9 +3,9 @@
 puppenclaw runs coding agents on behalf of other programs. It starts Claude Code and Codex sessions through the Agent
 Client Protocol (ACP), supervises their processes, persists every turn and serves all of it over a local HTTP API. A
 caller can dispatch a turn under a key, so that it runs at most once, stream its output and read the recorded outcome
-again later; a keyed turn that a daemon restart cut off is reported as `TURN_INTERRUPTED_RESTART` and never runs a
-second time. The same code also loads as an [OpenClaw](https://github.com/openclaw/openclaw) plugin with project and
-campaign orchestration.
+again later; a keyed turn that a daemon restart cut off never runs a second time, and once its process is gone the key
+answers `TURN_INTERRUPTED_RESTART`. The same code also loads as an [OpenClaw](https://github.com/openclaw/openclaw)
+plugin with project and campaign orchestration.
 
 For orchestrated research work, puppenclaw adds a model broker. Each orchestrated turn gets a private Unix socket over
 which its agent submits worker jobs and, where the deployment routes them there, sends its own model calls and web
