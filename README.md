@@ -311,8 +311,8 @@ out is the socket:
 - Claude Code trusts the certificate in `PUPPENCLAW_ORCHESTRATION_CLAUDE_OAUTH_CERT`, so that its token refresh passes
   through the relay;
 - the provider key variables that the agent must not hold are removed from its environment;
-- the agent can neither read the daemon's configuration file, which holds the bearer token, or its data directory, nor
-  reach the daemon's HTTP port.
+- the agent cannot read the daemon's configuration file, which holds the bearer token, or its data directory, and
+  cannot reach the daemon's HTTP port.
 
 Without this wiring an agent calls its provider and the web directly, as the daemon's user, and those calls get no
 receipt, metering, egress check or relay. This repository ships no bridge and no sandbox.
@@ -343,10 +343,10 @@ sandbox must not reach outside it:
 - Egress, for traffic sent to the socket: the proxy allows public web hosts on ports 80 and 443 only. It refuses
   (`EGRESS_DENIED`) IP literals, `localhost`, `.local` and `.internal` names, private, loopback and link-local
   addresses, the known model API hosts, the endpoints of the providers that orchestrated turns and their workers name
-  (from the first such turn until the daemon stops), daemon environment variables named like model endpoints and the
-  direct upstreams ([docs/broker.md](docs/broker.md#egress)). A provider configured only for run principals is not on
-  that list. The broker resolves DNS itself and pins the address, and a TLS server name must match the tunnel's
-  authority.
+  (from the first such turn until the daemon stops), the hosts in daemon environment variables named like model
+  endpoints and the direct upstreams ([docs/broker.md](docs/broker.md#egress)). A provider configured only for run
+  principals is not on that list. The broker resolves DNS itself and pins the address, and a TLS server name must match
+  the tunnel's authority.
 - Compute jobs run only through a launcher and Bubblewrap policy named by `PUPPENCLAW_COMPUTE_SANDBOX_WRAPPER` and
   `LAB_SANDBOX_CONFIG`. Both are absolute paths of regular files, not symlinks, outside every workspace root; the files
   and their parent directories must be owned by the daemon user and not writable by group or others. The launcher must
