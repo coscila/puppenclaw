@@ -99,7 +99,8 @@ Turns run through `POST /session/start` and `POST /session/:name/send` (or their
 - Each session keeps the outcomes of its 64 most recent keyed turns (`terminalReplayRetention`); older keys stay known
   but cannot replay. After 4,096 keys (`turnKeyRetention`) the session refuses new keys with 409
   `TURN_RECEIPT_CAPACITY_REACHED` until it is purged.
-- Errors that concern a key carry `details.turnReceipt: {turnKey, state}` with `accepted` or `replayed`.
+- Results and recorded errors of a keyed turn carry `details.turnReceipt: {turnKey, state}`: `accepted` for the request
+  that ran the turn, `replayed` for a repeat.
 
 Two opt-ins change only the response, never the turn:
 

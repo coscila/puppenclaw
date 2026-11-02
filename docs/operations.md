@@ -49,12 +49,13 @@ in place when it opens them.
 
 ## Shutdown and restart
 
-The first `SIGTERM` or `SIGINT` (or `POST /shutdown`) closes the daemon: it stops accepting requests, destroys
-connections still open after 2 s (long SSE turns would otherwise hold the store), wakes event-feed long polls, stops
-principal jobs (in-flight calls are aborted and their items return to the queue), closes the stores and releases the
-owner lease, then exits with code 0. A second signal, a failing close, or a close that outlasts
-`PUPPENCLAW_SHUTDOWN_TIMEOUT_MS` (default 20000, at least 1000) exits with code 1, so a service manager's stop request
-never hangs.
+The first `SIGTERM` or `SIGINT` closes the daemon: it stops accepting requests, destroys connections still open after
+2 s (long SSE turns would otherwise hold the store), wakes event-feed long polls, stops principal jobs (in-flight calls
+are aborted and their items return to the queue), closes the stores and releases the owner lease, then exits with code
+0. A second signal, a failing close, or a close that outlasts `PUPPENCLAW_SHUTDOWN_TIMEOUT_MS` (default 20000, at least
+1000) exits with code 1, so a service manager's stop request never hangs. `POST /shutdown`, which
+`puppenclaw-daemon stop` sends, closes the server, its stores and the lease in the same order, without the signal
+handler's connection grace and timeout.
 
 Agent process groups are detached and survive the daemon. At the next start:
 

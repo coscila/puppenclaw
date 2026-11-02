@@ -293,4 +293,5 @@ which is one reason an unauthenticated daemon belongs on loopback only.
   refuses new turns with `RECOVERY_FENCE_ACTIVE` until it is stopped).
 - `POST /recovery/reset` `{"confirm": "reset-session-state"}`: leaves read-only recovery with fresh session state and a
   new spool; without the confirmation it answers 400 `RESET_CONFIRMATION_REQUIRED`.
-- `POST /shutdown`: answers `{ok: true}` and closes the daemon as on `SIGTERM`.
+- `POST /shutdown`: answers `{ok: true}`, then closes the server, its stores and the owner lease in the same order as
+  on `SIGTERM`, without the signal handler's connection grace and timeout.
