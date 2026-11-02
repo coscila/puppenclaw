@@ -301,9 +301,9 @@ the broker store are described in [docs/broker.md](docs/broker.md).
 
 The daemon opens the socket and sets the variables listed in
 [docs/configuration.md](docs/configuration.md#variables-the-daemon-sets-for-child-processes); it does not change how
-an agent reaches the network. Jobs submitted over the socket always run through the broker. An agent's own model calls
-and web requests reach the broker only where the deployment sends them there, typically from a sandbox whose only way
-out is the socket:
+an agent reaches the network. The broker itself makes every call of a bulk job submitted over the socket. The agent of
+a turn, and the agent of each agent job, reach the broker with their own model calls and web requests only where the
+deployment sends them there, typically from a sandbox whose only way out is the socket:
 
 - the agent's model base URL points at the socket's `/native` path, through a bridge from TCP to the Unix socket for
   agents that cannot use a socket directly;
