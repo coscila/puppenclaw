@@ -261,8 +261,10 @@ Health, capabilities, the event feed, instruments, principals and bulk capacity 
 
 A turn may carry an `orchestration` object (`version: 1`) that lists worker configurations: an id, an assignment, the
 agent (`claude` or `codex`) and the model provider it runs on. Such a turn needs a `statisticsContext` and a registered
-`modelProvider`. For its duration the daemon opens a private Unix socket and passes its path to the agent as
-`PUPPENCLAW_ORCHESTRATION_SOCKET`. Over that socket the agent can:
+`modelProvider`. The daemon gives the session a private Unix socket, created at its first orchestrated turn and removed
+when the session is purged, and passes its path to the agent as `PUPPENCLAW_ORCHESTRATION_SOCKET`. The socket serves
+only while an orchestrated turn of that session is admitted; at any other time it refuses every request and CONNECT.
+Over that socket the agent can:
 
 - list its workers and their capacity (`GET /configs`);
 - submit **agent jobs** (`POST /agent/submit`), each a separate agent session that runs a task under the parent turn's
@@ -331,9 +333,10 @@ Agents, codex launchers and compute launchers run as the daemon's user, so witho
 configuration file with the bearer token and the data directory, and call the daemon's API. The daemon keeps what a
 sandbox must not reach outside it:
 
-- Broker sockets: one per turn in a `0700` directory under `/tmp` (`ocsl-model-broker-<uid>-<hash>`), principal sockets
-  in `0700` directories under `<data-dir>/principals/`, each socket `0600`. All processes of one user can open them, so
-  they separate sandboxes, which must not mount these paths, not unsandboxed processes of the same user.
+- Broker sockets: one per orchestrated session (an agent job runs in a session of its own) in a `0700` directory under
+  `/tmp` (`ocsl-model-broker-<uid>-<hash>`), principal sockets in `0700` directories under `<data-dir>/principals/`,
+  each socket `0600`. All processes of one user can open them, so they separate sandboxes, which must not mount these
+  paths, not unsandboxed processes of the same user.
 - Credentials: agent processes inherit the daemon's environment, from which the broker reads provider keys. The daemon
   replaces only an orchestrated process's own provider key variable with a placeholder, and a turn without
   orchestration gets the environment unchanged; every other key reaches the agents unless the deployment's launcher (an
