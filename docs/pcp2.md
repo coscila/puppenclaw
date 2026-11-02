@@ -365,7 +365,7 @@ A sandbox launcher that gives a process its principal socket should:
 open socket, and passes the binding only to the host-side launcher, in its controller environment:
 `PUPPENCLAW_PRINCIPAL_ID`, `PUPPENCLAW_PRINCIPAL_SOCKET_DIR` and `PUPPENCLAW_PRINCIPAL_SOCKET`. The job's own
 environment never carries it, and a job without `principalId` never gets one. `PUPPENCLAW_ORCHESTRATION_SOCKET` stays
-the variable of a chat turn's socket.
+the variable of an orchestrated session's socket.
 
 ### Jobs, usage and purge
 

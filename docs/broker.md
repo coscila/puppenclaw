@@ -24,10 +24,11 @@ model provider (`ORCHESTRATION_CONTEXT_REQUIRED` otherwise), and one session run
 reuses them; workers with a policy are never persisted, so a turn read back from state can never run them with fewer
 restrictions.
 
-For the turn, the daemon opens a Unix socket (`0600`, in a `0700` directory `/tmp/ocsl-model-broker-<uid>-<hash>`) and
-starts the agent with `PUPPENCLAW_ORCHESTRATION_SOCKET`, `PUPPENCLAW_ORCHESTRATION_NATIVE_BASE_PATH` (`/native`) and
-`PUPPENCLAW_ORCHESTRATION_ATTEMPT_ID`. Once the attempt has ended, the socket refuses work with
-`ORCHESTRATION_TURN_CLOSED`.
+At the session's first orchestrated turn, the daemon opens a Unix socket (`0600`, in a `0700` directory
+`/tmp/ocsl-model-broker-<uid>-<hash>`); later turns of the session reuse it, and purging the session removes it. The
+agent starts with `PUPPENCLAW_ORCHESTRATION_SOCKET`, `PUPPENCLAW_ORCHESTRATION_NATIVE_BASE_PATH` (`/native`) and
+`PUPPENCLAW_ORCHESTRATION_ATTEMPT_ID`. Outside an admitted attempt, requests on the socket get
+`ORCHESTRATION_TURN_CLOSED` and CONNECT tunnels are closed.
 
 The daemon only opens the socket and sets these variables. An agent's own model calls and web requests reach the
 broker only where the deployment points them at the socket
