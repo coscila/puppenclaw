@@ -1,1573 +1,365 @@
-# Puppenclaw
+# puppenclaw
 
-Puppenclaw is a native OpenClaw plugin that turns ACP-backed coding agents into a project-aware orchestration runtime.
+puppenclaw runs coding agents on behalf of other programs. It starts Claude Code and Codex sessions through the Agent
+Client Protocol (ACP), supervises their processes, persists every turn and serves all of it over a local HTTP API. A
+caller dispatches a turn, streams its output, survives a daemon restart and reads the outcome exactly once. The same
+code also loads as an [OpenClaw](https://github.com/openclaw/openclaw) plugin with project and campaign orchestration.
 
-Today it provides:
+For orchestrated research work, puppenclaw adds a model broker. The agent of a turn, and the worker jobs it launches,
+reach their models through a private Unix socket per turn. The broker holds provider API keys, meters every call and
+records a receipt for it, enforces capacity, egress and worker policies, and publishes settled jobs and receipts on an
+acknowledged event feed, from which the caller copies them into its own database.
 
-- named Claude Code or Codex ACP sessions
-- project registration and context capture
-- campaign templates for baseline work, literature review, ablations, self-improvement loops, and Codex-vs-Claude fusion runs
-- artifact capture and approval gates
-- optional daemon mode
-- `oc2oc`-aware remote control paths for mediated delegation between OpenClaw peers
+puppenclaw is the execution plane of the coscila laboratory record: coscila decides and records, puppenclaw executes and
+reports. puppenclaw does not depend on coscila; identifiers with the prefix `ocsl` (for example `ocsl_workflow_v1`)
+come from that lab.
 
-Puppenclaw does **not** yet implement a full typed orchestration transport inside `oc2oc`. The current `oc2oc` integration is conversation-mediated: remote assistants can delegate into Puppenclaw through bound and exposed `oc2oc` conversations, and Puppenclaw then runs work locally on the target node.
+What puppenclaw is not:
 
-## What Works Now
+- **Not a system of record.** It keeps in-flight state and the records a caller has not collected yet. Callers keep
+  their own copy of outcomes, usage and receipts; settled sessions are purged once they are older than
+  `sessionTtlMinutes` (by the plugin every minute, by the daemon on `POST /gc`).
+- **Not a workflow engine.** It runs what it is asked to run and reports what happened. It never re-sends a dispatched
+  prompt on its own and never decides whether a turn should continue.
+- **Not a login manager.** It does not log in to Claude or Codex. The agents use their own credentials; provider API
+  keys for broker-routed calls come from environment variables of the daemon.
+- **Not a sandbox.** It enforces socket permissions, egress rules and launcher checks, but process isolation comes from
+  the sandbox launcher a deployment installs. This repository ships none.
+- **Not a multi-tenant server.** One bearer token guards the whole API. Bind it to loopback.
 
-- Local orchestration on one OpenClaw instance
-- Daemon-backed orchestration over the local HTTP daemon
-- Claude Code / Codex ACP session management
-- Project context sync into reusable bundles
-- Campaign templates:
-  - `literature_review`
-  - `baseline_from_scratch`
-  - `ablation_campaign`
-  - `self_improvement_loop`
-  - `puppenfusion`
-  - `custom`
-- Approval gating and resume
-- Artifact listing and retention pruning
-- Research-command delegation via `orchestration.gptResearcherCommand`
-- `oc2oc`-mediated remote `/puppenclaw` command flow when the remote conversation is explicitly bound and exposed
+## Contents
 
-## What This Repo Contains
+- [Requirements](#requirements)
+- [Quick start](#quick-start)
+- [Configuration](#configuration)
+- [HTTP API](#http-api)
+- [Advanced orchestration and the broker](#advanced-orchestration-and-the-broker)
+- [Security model](#security-model)
+- [Operations](#operations)
+- [Development and tests](#development-and-tests)
+- [License](#license)
 
-This is a source repository.
+Reference documents: [configuration](docs/configuration.md), [HTTP API (v1)](docs/http-api.md),
+[pcp/2](docs/pcp2.md), [broker](docs/broker.md), [operations](docs/operations.md),
+[OpenClaw plugin](docs/openclaw-plugin.md).
 
-Checked-in source:
+## Requirements
 
-- `index.ts`
-- `src/**`
-- `test/**`
-- `skills/**`
-- `scripts/sync-manifest.mts`
-- `openclaw.plugin.json`
+- Node.js 22.13 or later (the daemon stores its state with `node:sqlite`). `.nvmrc` and CI use Node 24.18.0.
+- npm.
+- Linux. Process supervision, the boot reaper, resource sampling and compute jobs read `/proc`; compute jobs also need
+  Bubblewrap (`bwrap`).
+- `acpx`, the ACP command-line launcher, and working ACP adapters for the agents you use, already logged in on the
+  host. Without `agentCommands`, acpx starts its own adapter for the `claude` or `codex` alias.
+- The `codex` CLI for Codex sessions that run on a configured model provider (one `codex exec` per turn).
+- `openssl` on `PATH` for broker-routed Claude Code turns (the OAuth relay issues its own certificate).
+- OpenClaw `>=2026.3.0 <2027`, only for the plugin. The daemon never loads OpenClaw.
 
-Generated at build time:
+## Quick start
 
-- `dist/**`
+### Build
 
-If you install from the repo path, run `npm run build` first. `dist/` is not meant to be committed.
-
-## Prerequisites
-
-- Node `>=22.13`
-- npm
-- an OpenClaw installation on the machine where the plugin will run
-- working ACP adapter commands for the agents you plan to use
-
-Default ACP adapter commands:
-
-- Claude: `npx -y @agentclientprotocol/claude-agent-acp`
-- Codex: `npx @zed-industries/codex-acp`
-
-Puppenclaw does not log you into model providers for you. Make sure the ACP adapter you plan to use already works on that machine before blaming Puppenclaw.
-
-## How Puppenclaw launches Codex and Claude
-
-Puppenclaw launches ACP agents in two layers:
-
-- `acpxCommand`
-  - the outer ACP launcher binary
-  - example: `/absolute/path/to/acpx`
-- `agentCommands`
-  - the actual ACP adapters that `acpx` runs
-  - examples:
-    - `npx @zed-industries/codex-acp`
-    - `npx -y @agentclientprotocol/claude-agent-acp`
-
-The execution path is:
-
-```text
-/puppenclaw start -> Puppenclaw -> acpx -> codex-acp or claude-agent-acp
+```bash
+git clone https://github.com/coscila/puppenclaw.git
+cd puppenclaw
+npm ci
+npm run build
 ```
 
-Important:
+`npm run build` regenerates `openclaw.plugin.json` from the configuration schema and bundles `dist/` with tsup.
 
-- `acpxCommand` is not the agent adapter command
-- `agentCommands` are not a replacement for `acpxCommand`
-- the ACP adapters run inside the OpenClaw gateway/plugin host environment
-- that means the adapter sees the gateway's `HOME`, `PATH`, and auth files unless you override them in `agentCommands`
+### Run the daemon
 
-Preferred setup:
-
-- run OpenClaw/Puppenclaw in an isolated `HOME`
-- seed the required Codex and Claude auth into that same `HOME`
-- keep `agentCommands` as the normal ACP adapter commands
-
-Local development fallback:
-
-- wrap `agentCommands` with `env HOME=/home/your-user ...` if you intentionally want Puppenclaw to reuse your existing shell auth
-
-Example local config:
+Write a configuration file, for example `daemon.json`, and keep it private (`chmod 600`): it holds the bearer token.
 
 ```json
 {
-  "plugins": {
-    "entries": {
-      "puppenclaw": {
-        "enabled": true,
-        "config": {
-          "backend": "local",
-          "acpxCommand": "/absolute/path/to/acpx",
-          "defaultAgent": "codex",
-          "agentCommands": {
-            "codex": "npx @zed-industries/codex-acp",
-            "claude": "npx -y @agentclientprotocol/claude-agent-acp"
-          }
-        }
-      }
-    }
+  "daemonAuthToken": "<long random token>",
+  "defaultAgent": "claude",
+  "permissionMode": "approve-reads",
+  "orchestration": {
+    "defaultProjectRoot": "/srv/agent-workspaces",
+    "localWorker": { "projectRoots": ["/srv/agent-workspaces"] }
   }
 }
 ```
 
-Local development fallback example:
-
-```json
-{
-  "plugins": {
-    "entries": {
-      "puppenclaw": {
-        "enabled": true,
-        "config": {
-          "backend": "local",
-          "acpxCommand": "/absolute/path/to/acpx",
-          "agentCommands": {
-            "codex": "env HOME=/home/your-user npx @zed-industries/codex-acp",
-            "claude": "env HOME=/home/your-user npx -y @agentclientprotocol/claude-agent-acp"
-          }
-        }
-      }
-    }
-  }
-}
+```bash
+node dist/daemon/cli.js start --host 127.0.0.1 --port 18795 \
+  --data-dir /var/lib/puppenclaw --config ./daemon.json
 ```
 
-## Install From This Repo
-
-From a clean checkout:
+Without options the daemon listens on `127.0.0.1:18795`, keeps its state in `.puppenclaw-daemon/puppenclaw` under the
+working directory and runs with the default configuration, which has no bearer token. The package installs the same
+entry point as the `puppenclaw-daemon` binary.
 
 ```bash
-cd /absolute/path/to/puppenclaw
-npm install
-npm run build
-openclaw plugins install /absolute/path/to/puppenclaw
+node dist/daemon/cli.js status                       # GET /health, open even with a token
+curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:18795/v2/health
+node dist/daemon/cli.js stop --config ./daemon.json  # POST /shutdown with the configured token
 ```
 
-Then restart the OpenClaw gateway.
+Here `$TOKEN` holds the configured `daemonAuthToken`. `SIGTERM` or `SIGINT` also stops the daemon cleanly (see
+[Operations](#operations)).
 
-This path is the one a later Codex session should use when bootstrapping from source.
-
-In local plugin mode, Puppenclaw stores its runtime state under the OpenClaw plugin state directory for that gateway instance. It should not create or use a repo-local `orchestrator/` directory in the checkout.
-
-## Install From a Packed Tarball
-
-If you want a release-style artifact instead of installing from the repo path:
+### Run a first turn
 
 ```bash
-cd /absolute/path/to/puppenclaw
-npm install
-npm run build
-npm pack
-openclaw plugins install /absolute/path/to/puppenclaw/puppenclaw-openclaw-plugin-0.1.0.tgz
+curl -sS -X POST http://127.0.0.1:18795/session/start \
+  -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"agent":"claude","name":"demo","directory":"/srv/agent-workspaces/demo",
+       "task":"List the files in this directory.","turnKey":"demo-1"}'
 ```
 
-Use the actual tarball name produced by `npm pack`.
-
-## Development Verification
+The request returns when the turn has ended. Sending it again with the same `turnKey` returns the recorded result
+without running the agent a second time. To follow a turn live, use the `/stream` variant, which answers with
+server-sent events:
 
 ```bash
-cd /absolute/path/to/puppenclaw
-npm install
-npm run verify
+curl -sS -N -X POST http://127.0.0.1:18795/session/demo/send/stream \
+  -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"message":"Now count them.","turnKey":"demo-2","keyedStreaming":true}'
 ```
 
-That runs manifest sync, build, typecheck, and tests.
+### Use it as an OpenClaw plugin
+
+```bash
+openclaw plugins install /path/to/puppenclaw
+```
+
+Restart the gateway and configure the plugin under `plugins.entries.puppenclaw.config`. With `"backend": "local"` the
+plugin runs the agents itself; with `"backend": "daemon"` it talks to the daemon at `daemonUrl`. The plugin adds agent
+tools, the `/puppenclaw` command, gateway methods and campaign templates; see
+[docs/openclaw-plugin.md](docs/openclaw-plugin.md).
 
 ## Configuration
 
-Configure Puppenclaw under `plugins.entries.puppenclaw.config`.
+One JSON object configures both the plugin and the daemon (`--config`). Unknown keys are refused.
 
-Minimal local mode:
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `backend` | `local` | Plugin only: `local` runs agents in the plugin process, `daemon` talks to `daemonUrl`. |
+| `daemonUrl` | `http://127.0.0.1:18795` | Plugin only: the daemon to use. |
+| `daemonAuthToken` | unset | Bearer token. When set, the daemon requires it on every route except `GET /health` and `GET /capabilities`. |
+| `defaultAgent` | `claude` | `claude` or `codex`. |
+| `permissionMode` | `approve-reads` | `approve-reads`, `approve-all` or `deny-all`. A turn may request another mode unless this is `deny-all`. |
+| `maxSessions` | `5` | Persistent agent runtimes admitted at once; idle, unfocused ones may be suspended to admit new work. |
+| `sessionTtlMinutes` | `60` | Completed, failed or stopped sessions idle for longer are purged by garbage collection. |
+| `streamOutput` | `true` | Capture streamed output while turns run. |
+| `acpxCommand` | `acpx` | The ACP launcher. |
+| `agentCommands.claude`, `agentCommands.codex` | unset | Raw ACP adapter commands, passed to acpx as `--agent`. `agentCommands.codex` is also the launcher of the `codex` CLI for provider sessions (default `codex`). |
+| `codexCommand` | unset | Optional launcher that wraps provider Codex turns as `<codexCommand> --cwd <dir> -- <codex launcher> exec …`. |
+| `skillRoots` | `[]` | Extra directories of Claude Code skills (`<skill>/SKILL.md`). |
+| `orchestration.defaultProjectRoot`, `orchestration.localWorker.projectRoots` | unset, `[]` | Workspace roots: campaign projects resolve against them and compute jobs must run inside them. |
 
-```json
-{
-  "plugins": {
-    "entries": {
-      "puppenclaw": {
-        "enabled": true,
-        "config": {
-          "backend": "local",
-          "acpxCommand": "/absolute/path/to/acpx",
-          "defaultAgent": "codex",
-          "permissionMode": "approve-reads",
-          "maxSessions": 5,
-          "sessionTtlMinutes": 60,
-          "streamOutput": true,
-          "agentCommands": {
-            "claude": "npx -y @agentclientprotocol/claude-agent-acp",
-            "codex": "npx @zed-industries/codex-acp"
-          },
-          "mcpServers": {},
-          "orchestration": {
-            "enabled": true,
-            "maxCampaigns": 32,
-            "artifactRetentionHours": 336,
-            "allowLocalCommandExecution": true,
-            "defaultProjectRoot": "/absolute/path/to/workspaces",
-            "localWorker": {
-              "id": "local",
-              "label": "Local Worker",
-              "labels": ["local"],
-              "projectRoots": ["/absolute/path/to/workspaces"]
-            }
-          },
-          "remoteControl": {
-            "mediated": {
-              "enabled": true
-            },
-            "purePipe": {
-              "enabled": false,
-              "allowFrom": [],
-              "allowedAgents": []
-            },
-            "requireConversationBinding": true
-          }
-        }
-      }
-    }
-  }
-}
-```
+The full list, including `resourceSamplingIntervalMs`, `mcpServers`, `remoteControl` and the campaign settings, is in
+[docs/configuration.md](docs/configuration.md).
 
-Daemon mode:
+Broker, maintenance and compute settings come from environment variables of the daemon process. The most important
+ones:
 
-```json
-{
-  "plugins": {
-    "entries": {
-      "puppenclaw": {
-        "enabled": true,
-        "config": {
-          "backend": "daemon",
-          "daemonUrl": "http://127.0.0.1:18795",
-          "acpxCommand": "/absolute/path/to/acpx",
-          "defaultAgent": "codex",
-          "permissionMode": "approve-reads",
-          "streamOutput": true,
-          "agentCommands": {
-            "claude": "npx -y @agentclientprotocol/claude-agent-acp",
-            "codex": "npx @zed-industries/codex-acp"
-          },
-          "orchestration": {
-            "enabled": true,
-            "maxCampaigns": 32,
-            "artifactRetentionHours": 336,
-            "allowLocalCommandExecution": true,
-            "defaultProjectRoot": "/absolute/path/to/workspaces",
-            "localWorker": {
-              "id": "local",
-              "label": "Local Worker",
-              "labels": ["local"],
-              "projectRoots": ["/absolute/path/to/workspaces"]
-            }
-          }
-        }
-      }
-    }
-  }
-}
-```
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PUPPENCLAW_MODEL_PROVIDERS` | unset | JSON array of model provider configurations that run principals may be granted. |
+| `PUPPENCLAW_BULK_PROVIDER_CONCURRENCY` | `60` | Bulk calls in flight per provider; `PUPPENCLAW_BULK_PROVIDER_LIMITS`, `PUPPENCLAW_BULK_PROVIDER_GROUPS` and `PUPPENCLAW_BULK_GROUP_LIMITS` refine it. |
+| `PUPPENCLAW_BULK_RESPONSE_TIMEOUT_MS` | `1800000` | Deadline of each bulk call, headers and body. |
+| `PUPPENCLAW_EVENT_RETENTION_DAYS` | off | Prune acknowledged feed events older than this (at least 7). |
+| `PUPPENCLAW_SHUTDOWN_TIMEOUT_MS` | `20000` | Longest graceful shutdown before the process exits with code 1. |
+| `PUPPENCLAW_BOOT_REAPER` | `observe` | What a start does with agent process groups a crashed daemon left behind: `observe`, `on` or `off`. |
+| `PUPPENCLAW_COMPUTE_SANDBOX_WRAPPER`, `LAB_SANDBOX_CONFIG` | unset | The trusted launcher and Bubblewrap policy that compute jobs require. |
 
-For direct one-shot Codex providers, `approve-reads` runs `codex exec` with
-`--sandbox read-only` and without the bypass flag. `approve-all` retains
-`--dangerously-bypass-approvals-and-sandbox`; deployments should still confine that process with
-their outer sandbox. Codex has no exact Puppenclaw `deny-all` process flag, so Puppenclaw uses the
-read-only sandbox and adds explicit no-tool guidance to the prompt. That guidance is defense in
-depth, not a hard no-read/no-tool boundary.
+Invalid broker settings stop the daemon at startup instead of falling back. Every variable is described in
+[docs/configuration.md](docs/configuration.md#environment-variables).
 
-### Provider reasoning controls
+## HTTP API
 
-Session start and follow-up requests accept an optional `effort` value. Puppenclaw resolves that
-value against the selected provider rather than assuming that every backend uses the same scale:
+Requests and responses are JSON (turn streams use server-sent events, compute logs plain text). When
+`daemonAuthToken` is set, every route except `GET /health` and `GET /capabilities`
+requires `Authorization: Bearer <token>` and answers `401 {"ok":false,"error":"unauthorized"}` otherwise. Every
+response carries the identity headers `x-puppenclaw-protocol: 2.0`, `x-puppenclaw-boot-id` (new on every start) and
+`x-puppenclaw-spool-id` (changes only when the persisted in-flight state is replaced). Most errors answer
+`{"ok": false, "code": "...", "error": "...", "details"?: {...}}` with a status that follows the code: 400 for invalid
+input, 404 for an unknown session, 409 for conflicts, 503 when the daemon cannot serve the request now.
 
-| Provider profile | Canonical controls                               | Compatibility behavior                                                                                                            |
-| ---------------- | ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
-| Claude Code      | `low`, `medium`, `high`, `xhigh`, `max`          | Legacy `ultra` maps to `max`. `ultracode` requires a native workflow adapter exposing `ocsl_workflow_v1`; it uses xhigh plus real workflow orchestration, never a max alias. |
-| Codex            | `low`, `medium`, `high`, `xhigh`, `max`, `ultra` | The selected tier is forwarded to the runtime.                                                                                    |
-| GLM-5.2          | `none` (shown as Off), `high`, `max`             | `minimal` maps to Off; `low` and `medium` map to High; `xhigh`, `ultra`, and `ultracode` map to Max.                              |
+### Version 1 routes
 
-GLM-5.2 is detected from its model identifier. For a relay that uses an opaque model name, set
-`modelProvider.reasoningProfile` to `glm-5.2` explicitly.
+Session, campaign and usage routes answer in the tool envelope `{"content": [{"type": "text", "text": "..."}],
+"details": {...}}`, which the OpenClaw plugin shares.
 
-Provider or model support still governs whether a forwarded setting is usable. In particular,
-Claude Ultracode is not another name for Max. Puppenclaw exposes it in capability metadata but
-marks it unavailable: the current ACP boundary cannot safely represent Ultracode's approval,
-progress, background-run, and multiplexing lifecycle. A Claude Ultracode request therefore fails
-clearly instead of silently substituting Max or a prompt instruction.
+| Area | Routes |
+| --- | --- |
+| Discovery | `GET /health`, `GET /capabilities`, `GET /skills` |
+| Turns | `POST /session/start`, `POST /session/:name/send`, and their `/stream` variants (server-sent events) |
+| Session state | `GET /sessions`, `GET /session/:name`, `GET /session/:name/output`, `GET /session/:name/transcript`, `GET /session/:name/processes` |
+| Session control | `POST /session/:name/{resume,suspend,focus,unfocus,fork,purge,quiesce,quiesce/release}`, `DELETE /session/:name`, `POST /gc` |
+| Account cleanup | `POST /sessions/owner/{list,quiesce,purge}` |
+| Usage and statistics | `GET /usage`, `GET /session/:name/cost`, `GET /usage/ledger`, `GET /statistics/turns`, `POST /statistics/chats/:chatId/purge` |
+| Resources | `GET /resources`, `GET /resources/history` |
+| Worker jobs | `GET /orchestration/jobs`, `GET /orchestration/jobs/:jobId/results`, `GET /orchestration/receipts` |
+| Compute jobs | `GET /compute/capacity`, `POST /compute/jobs`, `GET /compute/jobs/:id`, `GET /compute/jobs/:id/logs`, `POST /compute/jobs/:id/cancel` |
+| Campaigns | `POST /orchestrator/{project,worker,context-sync,campaign,approve,cancel,reassessment}`, `GET /orchestrator/{status,artifacts,events,reassessment/status,reassessment/report}`, `GET /orchestrator/artifacts/:artifactId/content` |
+| Site | `GET /site/status`, `GET /site/logs` |
+| Operations | `GET /ops/idle`, `POST /recovery/reset`, `POST /shutdown` |
 
-### Codex local subagent policy
+Request bodies, query options, streaming events, lifecycle fencing, account cleanup and the error codes are described in
+[docs/http-api.md](docs/http-api.md). `GET /capabilities` lists what this daemon supports, so a client can check a
+feature before it sends a field that older daemons would refuse.
 
-A `codex-openai-compatible` model provider may carry an optional, strict
-`modelProvider.subagents` object: `{ "model": "chat", "effort": "xhigh", "maxConcurrentThreads": 6 }`
-(`maxConcurrentThreads` is an integer from 1 to 16). Other provider kinds reject it. The policy is
-persisted with the session, copied by forks, replaced by a same-id provider refresh, and part of the
-turn fingerprint only when present, so existing fingerprints stay unchanged.
+### pcp/2
 
-With a policy, the one-shot Codex turn passes it to the provider wrapper as
-`PUPPENCLAW_MODEL_PROVIDER_SUBAGENT_MODEL`, `PUPPENCLAW_MODEL_PROVIDER_SUBAGENT_EFFORT` and
-`PUPPENCLAW_MODEL_PROVIDER_SUBAGENT_MAX_THREADS`, and passes the main turn's resolved effort as
-`PUPPENCLAW_MODEL_PROVIDER_REASONING_EFFORT`. It omits the `-m` and `-c model_reasoning_effort`
-CLI overrides, because the wrapper writes the main model and effort into `config.toml` next to the
-pinned subagent roles. A session model that differs from the provider's model fails with
-`MODEL_PROVIDER_SUBAGENT_POLICY_CONFLICT`. Without a policy, arguments and environment are
-unchanged, and the daemon never forwards these variables from its own environment. Daemons that
-support the policy advertise `codexLocalSubagents: { "version": 1, "modelProviderField": "subagents",
-"cliModelOverrides": false }` on `GET /capabilities`; clients should send `subagents` only then,
-because older daemons reject the unknown field.
+pcp/2 is protocol version 2.0 of the daemon. It keeps the version 1 routes and adds an identity envelope, cheap
+authenticated health, keyed turns with compact results, and the broker's feed, instruments and principals. Every v2
+response body carries `{protocol, bootId, spoolId}`, and all v2 routes require the bearer token whenever one is set.
 
-### Config Notes
+| Feature (`/v2/capabilities`) | What it provides |
+| --- | --- |
+| `health` | `GET /v2/health`: constant cost and under 1 KB: build, uptime, active turns, stream and write backlog, event-loop lag, memory. |
+| `compactStatus`, `keyedStreaming`, `sseGap` | Opt-in compact session views, turn-scoped results, live output for keyed turns, and a `gap` event when a slow stream drops progress events. |
+| `usageLedger`, `opsIdle` | `GET /usage/ledger` with a durable cursor; `GET /ops/idle` with counts only. |
+| `eventFeed`, `brokerOutbox` (level 2) | `GET /v2/events` and `POST /v2/events/ack`: the broker's job and receipt events in sequence order, served after they are on disk, never pruned before they are acknowledged. |
+| `instrumentMode`, `instrumentVerbatim` | `PUT /v2/instruments/{digest}` and `GET /v2/instruments`: allow-listed measurement bundles that fix prompt, schema and sampling; verbatim bundles send the caller's messages byte for byte. |
+| `principals` | `PUT`, `GET` and `DELETE /v2/principals/{id}`: bulk authority with grants and budgets, exercised only through the principal's own Unix socket. Needs a bearer token. |
+| `bulkCapacity` | The bulk limits, deadline and retries the broker applies, as numbers only. |
+| `workerPolicy` | Capability profiles, evidence policies and pinned instruments per worker, enforced at admission. |
 
-- `backend`
-  - `local`: plugin process talks to ACP adapters directly
-  - `daemon`: plugin talks to a standalone Puppenclaw HTTP daemon
-- `acpxCommand`
-  - path or command used to start the ACP launcher
-  - Puppenclaw calls this first, then passes the selected adapter command through it
-- `agentCommands`
-  - per-agent ACP adapter commands
-  - use wrapper commands here when adapter auth must come from a different `HOME`
-- `orchestration.maxCampaigns`
-  - maximum number of active campaigns in `draft`, `running`, or `waiting_approval`
-- `orchestration.artifactRetentionHours`
-  - old artifacts are pruned on runtime access
-- `orchestration.defaultProjectRoot`
-  - base directory used to resolve relative `project.rootDir` values
-- `orchestration.allowLocalCommandExecution`
-  - required for `command` steps and built-in evaluation/experiment commands
-- `orchestration.gptResearcherCommand`
-  - optional shell command for `research` steps
-  - Puppenclaw sends the step prompt to stdin
-  - Puppenclaw expects dossier text on stdout
-  - environment variables exposed:
-    - `PUPPENCLAW_PROJECT_ID`
-    - `PUPPENCLAW_PROJECT_NAME`
-    - `PUPPENCLAW_PROJECT_ROOT`
-    - `PUPPENCLAW_CAMPAIGN_ID`
-    - `PUPPENCLAW_CAMPAIGN_NAME`
-    - `PUPPENCLAW_STEP_ID`
-    - `PUPPENCLAW_STEP_TITLE`
-    - `PUPPENCLAW_TASK`
+**Keyed turns.** A `turnKey` (1–128 characters of `A-Za-z0-9._:-`) on `POST /session/start` or
+`POST /session/:name/send` makes the turn durable and idempotent within its session. The daemon records the key before
+it starts the agent. Repeating the same request under the same key waits for the running turn or replays its recorded
+result; the same key with a different request is refused with `409 TURN_KEY_CONFLICT`. A key whose turn was running when
+the daemon stopped is never launched again: once the turn's process is proven gone, the key replays the error
+`TURN_INTERRUPTED_RESTART`; while it may still run, a repeat answers `409 TURN_REPLAY_UNAVAILABLE`. A session refuses a
+new key while a keyed turn is unsettled. Each session keeps the results of its last 64 keyed turns and up to 4,096
+keys; beyond that a new key is refused until the session is purged. With `"resultView": "turn"` the result carries only
+this turn's output and a compact session snapshot instead of the transcript. A keyed turn's stream carries no live
+output unless the request sets `"keyedStreaming": true`.
 
-Example research-command config:
+Health, capabilities, the event feed, instruments, principals and bulk capacity are specified in
+[docs/pcp2.md](docs/pcp2.md).
 
-```json
-{
-  "plugins": {
-    "entries": {
-      "puppenclaw": {
-        "enabled": true,
-        "config": {
-          "backend": "local",
-          "orchestration": {
-            "gptResearcherCommand": "python /absolute/path/to/research-wrapper.py"
-          }
-        }
-      }
-    }
-  }
-}
-```
+## Advanced orchestration and the broker
 
-## Running the Daemon
+A turn may carry an `orchestration` object (`version: 1`) that lists worker configurations: an id, an assignment, the
+agent (`claude` or `codex`) and the model provider it runs on. Such a turn needs a `statisticsContext` and a registered
+`modelProvider`. For its duration the daemon opens a private Unix socket and passes its path to the agent as
+`PUPPENCLAW_ORCHESTRATION_SOCKET`. Over that socket the agent can:
 
-If you use `backend: "daemon"`, start the daemon separately after the repo is built:
+- list its workers and their capacity (`GET /configs`);
+- submit **agent jobs** (`POST /agent/submit`), each a separate agent session that runs a task under the parent turn's
+  permissions;
+- submit **bulk jobs** (`POST /bulk/submit`): many tool-free model calls against an OpenAI-compatible provider, with an
+  optional JSON Schema for the answers or an installed instrument, from an approved execution turn (`execute` mode with
+  `approve-all`);
+- read, page, cancel and resume its jobs (`GET /jobs`, `GET /jobs/{id}`, `GET /jobs/{id}/results`,
+  `POST /jobs/{id}/cancel`, `POST /jobs/{id}/resume`);
+- call its own model through the recorded transport (`/native/...`) and reach public web hosts through the socket's
+  HTTP proxy and `CONNECT` tunnels.
 
-```bash
-cd /absolute/path/to/puppenclaw
-npm run build
-node dist/daemon/cli.js start --host 127.0.0.1 --port 18795 --data-dir /absolute/path/to/puppenclaw-state
-```
+For API-key providers the broker holds the key: an agent sees a placeholder in its provider's credential variable, and
+the broker adds the real key to each upstream call. Every model call gets a receipt with token usage, the model the
+upstream named, its fingerprint and digests of the request settings, which reaches the session's statistics and usage
+ledger. Each settled bulk item and each job state change is written, in the same transaction, to an outbox that callers
+read as the pcp/2 event feed. Rate limits and authentication failures pause the provider for the turn; bulk calls that
+fail transiently (502, 503, 504, timeouts, connection resets) are retried with backoff. A provider-wide limiter shares
+bulk capacity across jobs and sessions, and providers that address the same backend can share one capacity group.
 
-Check health:
+**Run principals** carry bulk authority independent of a chat turn, for example for a study run: the caller grants
+providers, instruments, concurrency, an item cap, a token budget and an expiry, and the daemon opens a socket that only
+that principal can use. **Worker policies** restrict individual workers to evidence-only bulk calls, fixed programs,
+pinned instruments or on-premises providers.
 
-```bash
-node dist/daemon/cli.js status --host 127.0.0.1 --port 18795
-```
+Socket routes, job states, receipts and their provenance fields, paging, retries, capacity groups, worker policies and
+the broker store are described in [docs/broker.md](docs/broker.md).
 
-Stop it:
+## Security model
+
+**Authentication.** Set `daemonAuthToken` for every deployment. The token is compared in constant time; only
+`GET /health` and `GET /capabilities` stay open. Without a token the daemon accepts every request from anyone who can
+reach the port, and `POST /orchestrator/campaign` can run shell commands, so an unauthenticated daemon is only safe on a
+loopback address. Routes that grant authority or erase data refuse to work without a token at all: run principals,
+account cleanup (and `ownerKey` on a turn) and statistics erasure answer `DAEMON_AUTH_REQUIRED`.
+
+**Sandbox boundary.** puppenclaw does not isolate processes itself; a deployment runs the agents in its own sandbox.
+The daemon keeps what a sandbox must not reach outside it:
+
+- Broker sockets: one per turn in a `0700` directory under `/tmp` (`ocsl-model-broker-<uid>-<hash>`), principal sockets
+  in `0700` directories under `<data-dir>/principals/`, each socket `0600`. All processes of one user can open them, so
+  they separate sandboxes, which must not mount these paths, not unsandboxed processes of the same user.
+- Credentials: provider API keys stay in the daemon's environment; turns see placeholders. The Claude OAuth relay
+  forwards only Claude Code's own token refresh to `platform.claude.com` and keeps no credential, and native Claude
+  calls with an API key are refused.
+- Egress: the socket proxy allows public web hosts on ports 80 and 443 only. Known model API hosts, every configured
+  provider endpoint and private, loopback and link-local addresses are refused (`EGRESS_DENIED`); the broker resolves
+  DNS itself and pins the address, and a TLS server name must match the tunnel's authority.
+- Compute jobs run only through a launcher and Bubblewrap policy named by `PUPPENCLAW_COMPUTE_SANDBOX_WRAPPER` and
+  `LAB_SANDBOX_CONFIG`. Both must be absolute, owned by the daemon user, not writable by group or others, not symlinks
+  and outside every workspace root; the launcher must answer the `ocsl-compute-sandbox-v1` handshake. A job's
+  environment travels on a separate file descriptor and can never select the launcher, its policy or host mounts.
+  A lab installs its own launcher; this repository ships none.
+
+**What the daemon never does:**
+
+- store or inject Claude subscription tokens: the Claude Code binary owns its login, and the broker forwards its
+  requests and keeps only an in-memory digest to recognise a renewed token;
+- put a provider credential into a receipt, feed event or turn diagnostic; error texts are redacted before they leave
+  the daemon;
+- re-send a dispatched prompt by itself, or relaunch a keyed turn that was running when it stopped;
+- prune a feed event before it is acknowledged, or erase a broker job's records ahead of the feed;
+- signal a leftover process group it cannot prove it started (pid, start time and kernel boot id must match);
+- accept a principal identity from a header, body field or environment variable: the principal's socket is its
+  identity;
+- run a verbatim instrument for anything but a run principal granted that instrument.
+
+## Operations
+
+**State.** One daemon owns a data directory at a time (`.state-owner.json` is its lease; a second daemon refuses to
+start with `STATE_ROOT_IN_USE`). Sessions, turn receipts and fences live in `state.json`; usage, statistics,
+campaigns, broker jobs, principals, compute jobs and resource samples live in SQLite files in subdirectories. The layout
+is listed in [docs/operations.md](docs/operations.md#data-directory). If `state.json` cannot be loaded, the daemon
+keeps the previous file, starts read-only and refuses every mutating request with `STATE_RECOVERY_REQUIRED` until an
+operator calls `POST /recovery/reset` with `{"confirm": "reset-session-state"}`; the reset starts a new spool.
+
+**Backups.** Stop the daemon and copy the whole data directory; the stores are written continuously, several in WAL
+mode, so a copy of a running daemon's files is not consistent. Back it up before every upgrade: stores migrate in place
+when a newer version opens them.
+
+**Shutdown.** The first `SIGTERM` or `SIGINT` stops accepting requests, ends connections still open after 2 s, wakes
+long polls, stops principal jobs so that the next start resumes them, closes the stores and releases the lease, then
+exits with code 0. A second signal, a failing close or a close that outlasts `PUPPENCLAW_SHUTDOWN_TIMEOUT_MS` exits with
+code 1. Agent process groups are detached and keep running; at the next start `PUPPENCLAW_BOOT_REAPER` decides whether
+leftover groups are only counted (`observe`, the default) or terminated (`on`).
+
+**Upgrade.** Wait until `GET /ops/idle` reports no active turns, jobs or streams, stop the daemon, back up the data
+directory, build the new version and start it. Turns that were running are reconciled at start: a turn whose process is
+gone is marked failed, a session whose process may still run stays fenced until it is gone, and keyed turns are never
+launched again. Bulk jobs of run principals resume under the same job id; other interrupted jobs wait for an explicit
+resume. Store changes are additive and covered by
+rollback tests in which earlier daemons open a store this version wrote; see
+[docs/operations.md](docs/operations.md#upgrade-and-rollback).
+
+**Maintenance.** Archiving of old broker jobs (`PUPPENCLAW_ADVANCED_ARCHIVE_DAYS`) and event retention
+(`PUPPENCLAW_EVENT_RETENTION_DAYS`) are off unless configured. Turn diagnostics, resource history and campaign
+artifacts have their own retention limits; see [docs/operations.md](docs/operations.md#retention).
+
+## Development and tests
 
 ```bash
-node dist/daemon/cli.js stop --host 127.0.0.1 --port 18795
+npm ci
+npm run verify     # manifest sync and build, tsc --noEmit, vitest run
+npm run typecheck
 ```
 
-SIGTERM and SIGINT close the daemon: it stops accepting requests, ends
-connections still open after 2 s, closes its stores and releases the state owner
-lease, then exits 0. A second signal, a failing close, or a close that outlasts
-`PUPPENCLAW_SHUTDOWN_TIMEOUT_MS` (default 20000) exits 1 at once. Runner process
-groups are detached and keep running; see the boot reaper below.
-
-### pcp/2 identity, health and opt-in compact shapes
-
-Every response carries the headers `x-puppenclaw-protocol` (`2.0`),
-`x-puppenclaw-boot-id` (new on every start) and `x-puppenclaw-spool-id` (the
-identity of the persisted in-flight state in `spool.json`; it changes only when
-that state is replaced: a fresh data directory, unreadable state, or a recovery
-reset). The routes below require the bearer token whenever `daemonAuthToken` is
-set; none of them is added to the open `/health` and `/capabilities`.
-
-- `GET /v2/health`: constant-cost and under 1 KB: `ok`, `protocol`, `bootId`,
-  `spoolId`, `build` (`PUPPENCLAW_BUILD_ID` or version plus bundle digest),
-  `activeTurns`, `backlog` (open streams, queued stream events and bytes,
-  pending state writes, `brokerErasures`: broker jobs whose erasure waits for
-  the feed acknowledgement), `eventLoop` (`monitorEventLoopDelay` p99 and max lag in
-  ms over a 30 s window) and `memory`.
-- `GET /v2/capabilities`: `features` (`health`, `opsIdle`, `usageLedger`,
-  `compactStatus`, `keyedStreaming`, `sseGap`, and the broker's `eventFeed`,
-  `brokerOutbox`, `instrumentMode`, `instrumentVerbatim`, `workerPolicy` and
-  `bulkCapacity` described below), `advancedOrchestration` (the worker policy
-  details, see "Worker policy"), `limits`, `bulkCapacity` (the bulk capacity
-  the broker applies, see below), and provider dialect limits, e.g. the
-  structured-output keywords removed for `qwen-3.8`.
-- `GET /ops/idle`: counts only, each measured at request time (active turns,
-  turn and runner processes, running turn keys, active and paused broker jobs,
-  active compute jobs, open streams). Restart survivors count only while their
-  processes may still be alive: `recoveryFencedSessions` (sessions fenced after a
-  restart whose recorded process is not proven gone; the next dispatch clears
-  the fence once it is) and `leftoverRunnerGroups` (runner groups of earlier
-  boots still running). `recoveryFencesWithoutProcess` counts fences that record
-  no process (missing turn metadata or pid): there is nothing to wait for, but
-  such a session refuses new turns (`RECOVERY_FENCE_ACTIVE`) until it is stopped.
-- `GET /session/:name?view=summary` and `GET /sessions?view=summary`: the
-  session without its transcript (plus `transcriptSummary`) and without the
-  `acpx status` probe. Where a reader needs the runtime to classify one session,
-  its summary carries it like the full view: `runtime.status: quiesced` for a
-  quiesced session (no probe), and the probe's result for a session stored as
-  `running` without an active turn (a stale record that only the runtime can
-  show is over). `transcriptLimit=N` (0–1000) keeps the newest N entries
-  in either view. `GET /session/:name/output` takes the same two options: its
-  latest output stays, its session snapshot is compacted the same way.
-- `GET /session/:name/transcript?after=SEQ&limit=N` (1–500, about 1 MB per page):
-  entries with `seq`, `total`, `next`, `hasMore`, and the session `generation`.
-- `GET /usage/ledger?afterId=SEQ&limit=N` (1–1000): ledger rows in insertion
-  order with `seq`, `next`, `hasMore`, `head` and a stable `ledgerId`; `afterId`
-  also accepts a ledger row id. An unknown row id or a seq beyond `head` (a
-  cursor of another copy of the ledger) is refused with 400
-  `INVALID_LEDGER_CURSOR`; read the ledger from its start then.
-- `POST /session/start` and `POST /session/:name/send` (and their `/stream`
-  variants) accept `"resultView": "turn"`: the result holds this turn's output
-  and signals and the same compact session snapshot a keyed replay returns,
-  never the transcript. On the stream routes, `"keyedStreaming": true` lets a
-  keyed turn stream its own live output with the same event sequence as an
-  unkeyed turn; a repeated request for a running key joins its remaining output,
-  and replays or rejected requests never see another turn's output. These
-  options are not part of the turn fingerprint.
-
-Without these options every route answers exactly as before. Opted-in bodies
-also carry `protocol`, `bootId` and `spoolId`.
-
-Each SSE stream writes straight through while the client reads. When the client
-falls behind, events wait in that stream's queue and chunks are coalesced; above
-`PUPPENCLAW_SSE_MAX_PENDING_BYTES` (default 8 MiB) further `chunk` and
-`activity` events are dropped and replaced by one `gap` event with
-`droppedEvents` and `droppedBytes`. `final`, `question`, `complete`, `error`,
-`result` and `done` are never dropped. A stalled client never slows the runner.
-
-Live-turn progress is checkpointed for all turns together every
-`PUPPENCLAW_ACTIVE_TURN_CHECKPOINT_MS` (default 30000), and session state
-writes are group-committed; status reads report the live values.
-
-Every detached runner group is recorded under `<data-dir>/runners`.
-`PUPPENCLAW_BOOT_REAPER` decides what the next start does with groups a
-crashed daemon left behind: `observe` (default) logs and counts them, `on`
-terminates those whose leader is provably the recorded process (SIGTERM, then
-SIGKILL) and asks their acpx runtimes to cancel the interrupted prompt, and
-`off` keeps no records. A group whose leader is gone is never signalled, and
-neither is one recorded during an earlier host boot (each record carries the
-kernel boot id; pids and start ticks restart at boot): its record is removed.
-`node --experimental-strip-types scripts/measure-h4.mts` measures health cost,
-state writes, event-loop lag and stalled-stream memory against a built daemon.
-
-### pcp/2 broker feed and instrument mode
-
-The advanced broker reports to coscila through an acknowledged event feed and
-runs measurement instruments that coscila installs. `GET /v2/capabilities`
-advertises each part under `features`: `eventFeed: 1`, `brokerOutbox: 2`,
-`instrumentMode: 1` and `instrumentVerbatim: 1` (limits `eventPageMax`,
-`eventWaitMsMax`, `eventInlineOutputMax`). The routes need the bearer token
-like every v2 route, and every body carries `protocol`, `bootId` and `spoolId`;
-errors add `code`, `retryable` and `error`.
-
-**Outbox.** `advanced.sqlite` holds an outbox table (`seq INTEGER PRIMARY KEY
-AUTOINCREMENT, type, jobId, itemId, payload, createdAt`, plus `receiptId`).
-Every job creation and job state change writes a `broker.job` row, and every
-item that settles after a provider call writes one `broker.receipt` row (an item
-whose retry is refused before dispatch settles with the receipt of its last
-call), in the same transaction as the change itself: a crash keeps the change and its row
-together or loses both. An item gets at most one receipt row per job; a
-duplicate completion is refused. Seqs only grow and are never reused, also
-after pruning; gaps can only appear at or below the acknowledged cursor
-(retention, erasure). A store written by a pre-release build of this version
-named the columns `job_id`, `item_id`, `created_at` and `receipt_id`; opening it
-renames them.
-
-- `GET /v2/events?after=SEQ&limit=N&waitMs=MS` (`after` default 0, `limit`
-  1-1000, default 500, `waitMs` 0-25000): `{ok, feedId, events: [{seq, type,
-  at, jobId, itemId?, payload}], next, hasMore, head, acked}` in seq order. With
-  `waitMs` the request returns as soon as an event after `after` commits, or
-  empty when the wait ends. `after` beyond `head` is refused with 400
-  `INVALID_EVENT_CURSOR`: the cursor belongs to another outbox, read from 0.
-  Events are fsynced before they are served, so a served seq survives power
-  loss. `feedId` is stored with the outbox and changes only when
-  `advanced.sqlite` is replaced; then restart from 0 (ids make that idempotent).
-- `POST /v2/events/ack {feedId, through}`: `{ok, acked}`, durable, never moves
-  backwards (an older `through` returns the current value). Another `feedId` is
-  refused with 409 `FEED_REPLACED`; a `through` beyond `head` with 400
-  `INVALID_EVENT_CURSOR`.
-- `broker.job` payload: `{jobId, ownerKey, principalId, runId, state, counts:
-  {total, queued, running, succeeded, failed, cancelled, truncated},
-  instrumentDigest, createdAt, updatedAt}` (absent values are null), plus three
-  link hints beyond these pcp/2 fields: `parentSessionName` (the chat's daemon
-  session, or `principal:<id>`), `attemptId` and, from `brokerOutbox: 2`,
-  `resumedFromJobId` (the job this one resumes, null when it resumes none; a
-  resume re-runs a job's unfinished items under their item ids in a new job, so
-  a consumer counting items per lineage follows it). coscila ties a job to its
-  chat by them and erases a purged chat's jobs by the session. Counts
-  fold item states into these categories: paused and interrupted items count as
-  failed (a resume runs them in a new job), a truncated item counts once, as
-  truncated. Items in flight when a job pauses or is cancelled settle after
-  that state change; once the job's execution has drained, one more
-  `broker.job` row with the same state carries the final counts (none when they
-  did not change).
-- `broker.receipt` payload: `{jobId, itemId, attempt, status
-  (succeeded|failed|truncated|cancelled), finishReason, usage: {input, output,
-  cacheRead, cacheWrite}, model, serverFingerprint, servedModel,
-  systemFingerprint, httpStatus, settingsSha256, requestSha256, instrumentDigest,
-  outputDigest, outputBytes, output, startedAt, endedAt, error: {code,
-  retryable} | null}` (`requestSha256` is null for agent jobs and for receipts
-  written before it existed). `model` and `serverFingerprint` can hold the
-  requested model and the daemon's synthesized identity; `servedModel`,
-  `systemFingerprint` and `httpStatus` (`brokerOutbox: 2`) say what the upstream
-  itself answered to the settling call: the model its response named, its
-  `system_fingerprint` (each null when it named none) and the HTTP status (null
-  without an HTTP response). Agent jobs and items settled by a daemon before
-  `brokerOutbox: 2` have null `servedModel` and `systemFingerprint`; their
-  `httpStatus` comes from the settling call's receipt. `output` is inline only up
-  to 16384 UTF-8 bytes; larger outputs stay in the job's result pages.
-  `outputDigest` is the sha256 of the output as a string, or of its compact JSON
-  when it is structured. Agent jobs report their single item over all its native
-  calls.
-- Erasure never runs ahead of the feed, and contents never wait for it: purging
-  a session (or an owner) erases a job whose events are all acknowledged at
-  once. A job with unacknowledged events loses its header, items, inputs and
-  acknowledged events at once, and its unacknowledged receipt events lose their
-  inline `output` (`outputDigest` and `outputBytes` stay); only its receipt rows
-  and those events wait, and go when the acknowledgement covers them. A store
-  of a pre-release build that kept such jobs whole is converted when it opens.
-  `GET /v2/health` reports how many jobs wait (`backlog.brokerErasures`), and
-  `POST /sessions/owner/purge` answers `brokerErasuresPending` for its owner:
-  the owner's data is erased only once that is 0, so a caller proving an
-  account erasure retries the purge until then (it reaches 0 once the feed has
-  acknowledged the owner's events).
-- Retention is opt-in: `PUPPENCLAW_EVENT_RETENTION_DAYS` (at least 7) prunes
-  acknowledged rows older than that, hourly. Unacknowledged rows are never
-  pruned.
-
-**Receipt provenance.** Every broker receipt (bulk, retried attempt, native
-controller or agent call) carries `serverFingerprint`: the upstream's
-`system_fingerprint` when it sends one, otherwise `<served model>@<16 hex>`
-where the hex starts the sha256 of the canonical JSON of the server identity
-headers present (`server`, `via`, `x-powered-by`, `openai-version`); it is never
-empty. `settingsSha256` is the sha256 of the canonical JSON (keys sorted by code
-point, no whitespace, numbers as JSON.stringify writes them) of exactly
-`{model, temperature, seed, reasoning, max_tokens, response_format_sha256,
-system_prompt_sha256}` as sent, missing values null. Every bulk call's receipt,
-its item result and its `broker.receipt` event also carry `requestSha256`: the
-sha256 of the same canonical JSON of the whole request body sent upstream. A
-verbatim instrument call sends exactly those canonical bytes, so there it is also
-the digest of the bytes on the wire (and equals `promptSha256`).
-
-**Instruments.** `PUT /v2/instruments/{digest}` with `{instrumentId, version,
-systemPrompt, responseSchema|null, maxOutputTokens: {perItem, minimum},
-temperature, seed|null, reasoning, itemsPerCall, requiredModelFingerprint|null,
-transport?: {messages: "policy-wrapped"|"verbatim"}}` installs a bundle and
-answers `{ok, digest, settingsSha256, transport}`; the same body again
-returns the same answer, a different body under an installed digest is refused
-with 409 `INSTRUMENT_DIGEST_CONFLICT`, an invalid one with 400
-`INVALID_INSTRUMENT`. A response schema may carry `$id` and `$schema` (draft-07
-or 2020-12); each distinct schema is compiled once, on its own validator, and
-reused by every job that names it. The digest is opaque (1-128 characters of
-`[A-Za-z0-9._:-]`): coscila's instrument registry computes it
-(ocsl-instrument-digest-v1) and the daemon only allow-lists what was
-installed. `GET /v2/instruments` lists `digests` and `instruments` (each with
-its `transport`). The allow-list lives in `advanced.sqlite` and survives
-restarts. The PUT's `settingsSha256` digests the installed settings (system
-prompt as sent, response schema, sampling, the output-token rule, items per
-call, required fingerprint, and `messages: "verbatim"` for a verbatim bundle);
-each receipt's `settingsSha256` digests one call. A verbatim bundle carries no
-response schema (400 `INVALID_INSTRUMENT`). A bundle without `transport` is
-policy-wrapped, and a policy-wrapped bundle is stored without the field whether
-the PUT spells the default out or not: both PUTs install the same instrument, and
-a daemon from before transport modes reads it unchanged.
-
-A bulk job naming `instrumentDigest` (socket `POST /bulk/submit`) runs in
-instrument mode; a digest that is not installed is refused with 400
-`INSTRUMENT_NOT_ALLOWED`, and a job `schema` next to it with 400
-`INSTRUMENT_REQUEST_CONFLICT`. Each item is a string or `{messages, itemCount}`:
-messages (user and assistant roles) are sent verbatim after the system prompt,
-which is the broker's worker policy, a blank line and the instrument's
-`systemPrompt`. Per call, `max_output_tokens = max(minimum, perItem ×
-itemCount)` (`itemCount` defaults to `itemsPerCall`, 1 for a string), and
-temperature, seed, reasoning effort and the response schema come from the
-bundle; an item that tries to set any of them fails with `INVALID_REQUEST`.
-This is the `policy-wrapped` transport.
-`finish_reason=length` (Responses `status: incomplete` with
-`max_output_tokens`) marks the item `truncated: true`: a text output is kept, a
-cut structured output fails `STRUCTURED_OUTPUT_INVALID`, and the receipt's
-status is `truncated` either way. With `requiredModelFingerprint`, an answer
-whose fingerprint and served model both differ pauses the job (`MODEL_DRIFT`)
-and keeps no output; this check comes before parsing and validation, so it also
-catches a drifted answer that is malformed, fails the schema or was cut. The
-turn socket's `GET /configs` lists the installed policy-wrapped instruments.
-
-**Verbatim instruments** (`instrumentVerbatim: 1`). A bundle with
-`transport: {messages: "verbatim"}` sends each item's messages upstream exactly
-as the executor built them, so prompts stay byte-identical to the instrument's
-own builders: no worker policy, no assignment, no added instructions. An item is
-`{messages, itemCount}`: the complete messages, system message included, and the
-number of instrument entries the call carries. It may also repeat the settings
-of the request the executor built (`model`, `max_tokens`, `temperature`,
-`seed`, `reasoning_effort`, `stream`); each must then equal what is sent. Before
-any call, principal admission or charge, the daemon refuses the item unless the
-first message is a system message equal to `systemPrompt` byte for byte and no
-other message is a system message; every message is exactly `{role, content}`
-with a string content and the role system, user or assistant, at least one of
-them a user message; `1 ≤ itemCount ≤ itemsPerCall`; a repeated `model` is the
-worker's model, `max_tokens` is `max(minimum, perItem × itemCount)`,
-`temperature`, `seed` (null when the bundle has none) and `reasoning_effort`
-(= `reasoning`) are the bundle's and `stream` is false; and no tools and no
-other field are present. A refused item settles `failed` with errorCode
-`INSTRUMENT_MESSAGE_MISMATCH` (a 400-class code, never retried) and an error
-naming the check (for the system prompt, the sha256 prefixes of both prompts,
-never their text); it makes no upstream call and has no receipt; the job's
-other items run. An accepted item goes to `/v1/chat/completions` (through the
-direct pool when its upstream is mapped, never shaped like a Responses call) as
-the canonical JSON (keys sorted by code point, no whitespace, numbers as
-JSON.stringify writes them) of exactly `{model, messages, max_tokens,
-temperature, seed, reasoning_effort, stream: false}`: the worker's model, the
-messages as submitted and the bundle's settings, `seed` only when the bundle
-sets one, and nothing else (no response format: a verbatim bundle carries no
-schema, so the answer is the model's own text). A census executor's own
-chat-completions request has exactly these keys. The receipt carries
-`requestSha256` (the sha256 of those bytes), `settingsSha256` over that
-request, `serverFingerprint` and `instrumentDigest`, so the executor proves byte
-identity per call by comparing `requestSha256` with the canonical digest of the
-request it built. The output is the first choice's message content;
-`finish_reason=length` marks the item truncated as above. The answer is
-classified as an executor calling the judge directly classifies it: a 2xx whose
-first choice carries no message with text or null content (no choices, a
-garbled body, content parts) is no answer and is asked again like a failed call
-(`NO_FINAL_MESSAGE`, retryable), an empty completion (content null or empty) is
-asked again and, once the attempts are spent, settles `completed` with the empty
-text. Each bulk item, verbatim or policy-wrapped, also records what the upstream
-itself said, and its `broker.receipt` event carries the same:
-`servedModel` (the model the response named, null when it named none; `model`
-keeps its old meaning and then holds the requested model), `systemFingerprint`
-(the response's own `system_fingerprint`, null when it offered none;
-`serverFingerprint` then holds the daemon's synthesized identity) and `httpStatus` of
-the settling call (every 4xx other than 401, 403, 404 and 429 settles
-`INVALID_REQUEST`; the status tells a request the judge refused, 400, 413 or 422,
-from a transient one such as 408). `requiredModelFingerprint` is checked against
-those two only: a response that names another model or none at all pauses the
-job (`MODEL_DRIFT`), and the requested model is never taken on trust. Only a run
-principal, one bound to a study run, whose `grants.instruments` include the
-digest runs a verbatim instrument; chat-turn attempt authority and human
-principals never do (409 `PRINCIPAL_REQUIRED`, and the turn socket does not list
-it). A daemon from before transport modes refuses a verbatim bundle, both at the
-PUT and for jobs naming one, rather than running it policy-wrapped.
-
-**Provider pauses and retries.** HTTP 429 and authentication failures (401,
-403) pause the provider for the attempt at once; a 503 does so only after the
-last retry. The paused job carries `resumeAfter` (ISO time) from `Retry-After`
-or, without it, the latest provider reset header (`x-ratelimit-reset-*`,
-`anthropic-ratelimit-*-reset`, `ratelimit-reset`); job listings and summaries
-show it. Retries use exponential backoff from `PUPPENCLAW_BULK_RETRY_BASE_MS`
-(default 1000, ±20 % jitter, at most 30 s).
-
-**Direct upstreams.** Tool-free bulk calls can bypass a local compatibility
-proxy: `PUPPENCLAW_BULK_DIRECT_UPSTREAMS` maps a registered provider base URL to
-the upstream behind it, for example
-`{"http://127.0.0.1:18160/v1":"http://upstream:18000/v1"}`. Those calls share
-one keep-alive connection pool per upstream and capacity group, sized to the
-group's concurrency limit, and are shaped exactly as the namespace proxy
-forwards a tool-free Responses request (its turn-policy markers, agent-message
-conversion, replayed-call repair and four-image limit); the model and all other
-fields pass unchanged. Agents keep using the registered URL. The mapped
-upstreams join the sandbox egress deny list.
-
-**Store.** Writes are group-committed: a batch commits as one transaction
-within `PUPPENCLAW_ADVANCED_COMMIT_WINDOW_MS` (0-50, default 50), and a batch
-that fails is replayed write by write so only the failing write is lost. Every
-read first commits pending writes. A running item lives in memory only; a job
-header changes with the job state, and item progress only moves its revision
-(at most once per batch) and its `updatedAt` (at most once a second). Owner,
-child-session and state lookups use expression indexes instead of full scans.
-Statistics and the usage ledger receive bulk receipt updates in batches (newest
-state per call, at most once a second, always before a parent turn's statistics
-settle). On restart, bulk jobs written by this version are requeued: their
-unsettled items return to `queued` and the job waits for an explicit resume
-(`interrupted`) unless its authority survives the restart, which only a run
-principal's does (see "pcp/2 run principals"): such a job relaunches under its
-own job id. Jobs written before this version and agent jobs are interrupted as
-before.
-
-Rollback: an older daemon (c36cfa2, cea4c29) opens a store written by this
-version and reads and writes it; it ignores the new tables. It cannot resume
-jobs whose inputs live only in blobs, and it writes no outbox rows: when this
-version reopens the store it emits the current state of every job, and the
-receipt of every item, that the older daemon changed. A job header the older
-daemon rewrote counts as written before this version from then on.
-
-`PUPPENCLAW_ADVANCED_ARCHIVE_DAYS` (at least 30; off by default) archives, once
-a day, terminal jobs last updated earlier than that into
-`<data-dir>/advanced/archive/advanced-archive-<time>.sqlite` with inputs
-materialized and a manifest of counts and sha256 per job; the live rows go only
-after both copies agree. Only jobs whose records provably reached Postgres
-qualify: written by this version, with every event acknowledged. Jobs written
-before this version stay (their records reach Postgres only through coscila's
-one-time backfill, and historical rows go only with the author's per-item
-approval), and so do jobs of a run principal (a run is what a study
-references), jobs with a study reference (`study_ref`) and jobs with a pending
-erasure; the report counts each kind.
-
-`node --experimental-strip-types scripts/measure-p1.mts` measures bulk
-completions per second and event-loop lag against a mock upstream, with the
-daemon's statistics and usage-ledger hooks.
-`node --experimental-strip-types scripts/measure-verbatim.mts` does the same for
-census-shaped verbatim instrument calls through a run principal socket (40
-entries of about 3 KB per call by default) and checks that every call's bytes, as
-the mock upstream hashed them, equal its receipt's `requestSha256`. A bulk
-submission's digests (the job fingerprint, each item's digest and the key of its
-stored input) are computed on a worker thread; posting the request there costs a
-structured clone of a few milliseconds, and any worker failure digests inline,
-with identical values (`PUPPENCLAW_SUBMISSION_DIGESTS=inline` digests on the
-event loop as before; the default is `worker`; any other value fails startup).
-Parsing the submission and storing its inputs stay on the event loop, so its size
-still bounds the lag it causes: with `--calls 100 --jobs 6` (13 MB per
-submission) the largest event-loop lag fell from 171-197 ms to about 92 ms; ten
-calls (1.3 MB) cost about 30 ms either way, and one call per job from 60
-submitters (`--calls 1 --jobs 800 --submitters 60`) ran at 8.8-9.2k entries/s
-instead of 7.4-8.0k. Keep verbatim submissions to tens of calls, or submit one
-call per job.
-
-### pcp/2 run principals (`principals:1`)
-
-A principal is bulk authority that the caller grants and the daemon enforces:
-a study run (`kind: "run"`, bound to its `runId`) or, later, a person
-(`kind: "human"`, stored now, no credential logic yet). `/v2/capabilities`
-advertises `features.principals: 1` only when `daemonAuthToken` is set; without
-it the routes answer 503 `DAEMON_AUTH_REQUIRED`. Every response, errors included,
-carries `protocol`, `bootId` and `spoolId`. Ids are 1–128 characters of
-`A-Za-z0-9._:-`.
-
-- `PUT /v2/principals/{id}` with `{kind, runId, ownerKey, grants: {providers,
-  instruments, maxConcurrency, maxItems, tokenBudget: {input, output},
-  expiresAt}, socket}` returns `{ok, protocol, bootId, spoolId, principalId,
-  kind, runId, grants, socketPath, createdAt, updatedAt}`. The same body returns
-  the same result. Changed grants or a changed `socket` take effect at once and
-  are audited. `kind`, `runId` and `ownerKey` never change (409
-  `PRINCIPAL_CONFLICT`), and a revoked id stays revoked (409 `PRINCIPAL_REVOKED`).
-  No response ever contains `ownerKey`.
-- `GET /v2/principals/{id}` adds `state` (`active`, `expired`, `revoked`),
-  `revokedAt`, `revision`, `usage` (admitted `items`, settled `inputTokens` and
-  `outputTokens`, `activeItems`, `remaining`), `providersUnavailable` and the last
-  50 audit entries.
-- `DELETE /v2/principals/{id}[?cancel=1]` returns `{ok, principalId, revokedAt}`
-  and is idempotent. Before it returns, the principal's socket is gone and no
-  further item is admitted (the contract allows 5 s; the test measures a few
-  ms). Items already dispatching finish, or abort with `cancel=1`. Every item
-  the principal had not admitted ends `cancelled`. A revocation that a restart
-  interrupted completes at the next start. Revocation stays possible while
-  session state awaits an operator reset; PUT does not.
-
-Grants:
-
-- `providers` name entries of `PUPPENCLAW_MODEL_PROVIDERS`, a JSON array of
-  model provider configurations (the shape of a turn's `modelProvider`). It is
-  the only source of a principal provider's endpoint, model and credential
-  variable; `authTokenEnv` names a variable of the daemon environment, never a
-  secret. A socket client can never choose one. Unset means no provider for
-  principals; an invalid value fails startup.
-- `instruments` are opaque digests. A principal with instrument grants may submit
-  only jobs that name one of them (403 `INSTRUMENT_REQUIRED`, 403
-  `INSTRUMENT_NOT_GRANTED`), and a granted digest must also be installed through
-  `PUT /v2/instruments/{digest}` (400 `INSTRUMENT_NOT_ALLOWED`): grants restrict
-  which installed instruments a principal's jobs may run, never widen the
-  allow-list.
-- `maxConcurrency` bounds the dispatching items of all the principal's jobs
-  together. The principal's slot is taken before provider capacity, so a
-  principal at its limit holds no provider permit.
-- `maxItems` caps the items the principal admits over its lifetime, exactly. An
-  item counts once per job lineage (a job and the jobs resumed from it), at its
-  first admission: a broker retry, a relaunch after a restart and a resume admit
-  it again without counting it again, and an admission that dispatched no call
-  (cancelled, provider paused, missing credential) gives its count back. The
-  counted items persist in `principals.sqlite`. `tokenBudget` caps the settled input tokens (every prompt token the provider
-  reports, cached ones included) and output tokens. Calls already dispatching,
-  at most `maxConcurrency` of them, can overshoot a token budget. Reaching either
-  pauses the job with `error: "budget_exhausted"`. The budget refills only when
-  the caller raises it with a PUT; until then `POST /jobs/{id}/resume` on the
-  socket answers 409 `BUDGET_EXHAUSTED`, afterwards it continues the remaining
-  items as a new job.
-- Expiry pauses jobs with `principal_expired` and a withdrawn provider or
-  instrument grant with `grant_withdrawn`; each resumes explicitly once its cause
-  is gone. An item refused at admission was never dispatched: it settles
-  `paused` with the refusal's code (for example `BUDGET_EXHAUSTED`) and no receipt.
-- A daemon shutdown or crash pauses nothing. Admission stops, calls in flight are
-  aborted and their items return to the queue unsettled (each aborted call keeps
-  its transport receipt, but no `broker.receipt` event), and the job keeps its
-  state. The next start requeues it and relaunches it under the same job id while
-  its principal is live and still admits it (grants, budget, expiry, unchanged
-  worker configuration); otherwise it waits as `interrupted` for an explicit
-  resume. Every item therefore settles, and is reported, exactly once per job.
-- `POST /jobs/{id}/resume` continues a job's unfinished items as a new job of
-  its lineage. Resuming a job that was resumed before answers that earlier
-  resume's job and changes nothing else: it clears no provider pause, so a
-  client may walk a long lineage to its tail without letting other work dispatch
-  into a provider that is still limited. A job whose worker configuration changed
-  since it was submitted (a provider's endpoint, model, credential variable or
-  label in `PUPPENCLAW_MODEL_PROVIDERS`) cannot resume into a new job (409
-  `WORKER_CONFIG_CHANGED`); submit it again under another idempotency key. The
-  answer of an earlier resume comes first, so after such a change a client still
-  walks the lineage to the job that settled its items. A
-  submission whose idempotency key already holds other work (another worker
-  configuration or request) is refused with 409 `WORKER_KEY_CONFLICT`, whose
-  body names that job (`jobId`, always one of the caller's own), so the client
-  can read what the key holds.
-
-The socket is the identity:
-
-- `socket: true` opens `<data-dir>/principals/<random>/broker.sock`: the
-  directory is 0700, the socket 0600, and `principals.sqlite` (records, usage,
-  counted items, audit) lies next to them. The data directory is inside the daemon state root
-  (`PUPPENCLAW_STATE_ROOT`), which the lab sandbox policy hides from every
-  sandbox and never binds. All lab and daemon processes share one user, so this
-  separates sandboxes, not unsandboxed processes.
-- The socket serves the turn socket's worker routes for the principal's own jobs
-  only: `GET /configs`, `POST /bulk/submit`, `GET /jobs`, `GET /jobs/{id}`,
-  `GET /jobs/{id}/results` and `POST /jobs/{id}/cancel|resume`, all with
-  `?view=summary` where the turn socket has it. `GET /configs` returns
-  `authorization.principalId` (also as `attemptId`), `runId`, `state`,
-  `instruments` and `publicLiteratureAllowed` (true for an active run principal),
-  the principal's grants and usage, `instrumentMode: 1` and
-  `instrumentVerbatim: 1` with `instruments` (the installed instruments it is
-  granted, verbatim ones included, each with its `transport`), and one bulk
-  worker per granted, configured provider, whose `id` is the provider id. Its
-  `revision` changes only when that worker list changes, never on budget changes.
-  Agent workers, native model routes, proxying and CONNECT are refused. No
-  header, body field or environment variable names a principal.
-- Principals and sockets persist: a restart reopens each socket at the same path
-  in the same directory; only the socket file is replaced. The daemon reopens
-  the sockets after broker recovery has requeued the jobs that were running, so
-  no job can be submitted while recovery would still launch it a second time.
-
-How a sandbox gets its principal socket (the lab launcher does this; plan R5/E4):
-
-- Bind the principal's directory read-only, for example
-  `--ro-bind <dir> /run/ocsl/principal`, and point the client at
-  `/run/ocsl/principal/broker.sock` (coscila-review's census commands read it
-  from `OCSL_BROKER_SOCKET` or `--broker-socket`; `PUPPENCLAW_ORCHESTRATION_SOCKET`
-  stays the chat turn's socket). Bind the directory, not the socket file, so
-  the socket a restart re-creates stays reachable. Validate the directory first:
-  inside the state root, owned by the daemon user, mode 0700, not a symlink, a
-  0600 socket inside.
-- `POST /compute/jobs` accepts `principalId`. The daemon refuses it unless that
-  principal is live with an open socket, and passes the binding only to the
-  host-side launcher, in its controller environment: `PUPPENCLAW_PRINCIPAL_ID`,
-  `PUPPENCLAW_PRINCIPAL_SOCKET_DIR` and `PUPPENCLAW_PRINCIPAL_SOCKET`. The job's
-  own environment never carries it, and a job without `principalId` never gets
-  one.
-- Revocation, or a PUT with `socket: false`, removes the socket and its
-  directory, so a bound sandbox then reaches nothing.
-
-Principal jobs live in `advanced.sqlite` like turn jobs, with
-`parentSessionName` `principal:<id>`, the principal id as `attemptId`, and
-`principalId` and `runId` fields. Their usage reaches the caller through the
-broker receipts, not the turn usage ledger. An account purge
-(`/sessions/owner/purge`) revokes the owner's principals with `cancel` before
-it erases their jobs, and then erases their records to tombstones: the id,
-kind, timestamps and revocation stay (the id remains unusable), the owner key,
-run binding, grants, usage, counted items and audit go. Daemons from before principals never open
-`principals.sqlite` and read the added job fields unchanged.
-
-`PUPPENCLAW_LEGACY_ATTEMPT_AUTHORITY` keeps today's turn authority:
-
-- `on` (the default, `features.legacyAttemptAuthority: 1`): a turn in execute and
-  approve-all mode may submit bulk work over its turn socket and reports
-  `publicLiteratureAllowed: true`, as before.
-- `off`: only principal sockets carry bulk authority. A turn socket answers bulk
-  submissions with 409 `PRINCIPAL_REQUIRED` and reports
-  `publicLiteratureAllowed: false` and `bulkAvailable: false`. Turn processes
-  still receive `PUPPENCLAW_ORCHESTRATION_ATTEMPT_ID` as an identifier, because
-  the deployed sandbox wrappers validate it, but it grants nothing. The egress
-  deny list built from endpoint-like variable names stays active in both modes:
-  it only denies, never grants.
-- Any other value fails startup.
-
-
-### Worker policy (`advancedOrchestration.workerPolicy`)
-
-A turn's advanced orchestration may give each worker a policy that coscila
-decides and the daemon enforces wherever it admits jobs (plan E4):
-
-- `evidencePolicy`: `public-literature`, `entitled-institutional` (licensed full
-  text under the institution's entitlement) or `confidential-manuscript` (an
-  unpublished manuscript of which only identifiers may leave);
-- `capabilityProfile`: `code-authoring` (Claude workers only), `evidence-only`
-  (bulk calls on supplied evidence, no agent, tools or programs) or
-  `run-fixed-programs` (only the programs it is given: a Claude worker as an
-  agent, any other through pinned-instrument bulk calls only);
-- `instruments`: 1-16 pinned instruments `{id: "name@version", digest: <sha256
-  hex>}` with unique ids and digests, for evidence-only and run-fixed-programs
-  workers.
-
-The daemon advertises it as `advancedOrchestration.workerPolicy: 1` in
-`/capabilities` and as `features.workerPolicy: 1` in `/v2/capabilities`, whose
-`advancedOrchestration` adds `evidencePolicies`, `capabilityProfiles`,
-`onPremisesProviders` and `identifierOnlyEgress: "coscila"`. coscila sends these
-fields only to a daemon that advertises it. Both lists are versioned: an unknown
-evidence policy is refused with 400 `UNSUPPORTED_EVIDENCE_POLICY`, an unknown
-profile with 400 `UNSUPPORTED_CAPABILITY_PROFILE`, never ignored. Coscila's
-contract rules are checked again (400 `INVALID_WORKER_POLICY`): an
-entitled-institutional or confidential-manuscript worker is evidence-only,
-pinned instruments belong to an evidence-only or run-fixed-programs worker, and
-code-authoring needs agent `claude`.
-
-On the turn socket:
-
-- An entitled-institutional or confidential-manuscript worker uses on-premises
-  providers only, as if granted `model:onprem-only`: its bulk submissions are
-  refused with 403 `PROVIDER_NOT_ON_PREMISES` before any call, `GET /configs`
-  reports it with `bulkAvailable: false`, and an item still queued when the
-  configuration changes is refused at dispatch (failed, the same code, no call).
-- No agent job for an evidence-only worker, nor for a run-fixed-programs or
-  code-authoring worker that is not Claude (403 `CAPABILITY_PROFILE_DENIED`).
-  coscila's sandbox wrapper refuses these too, when its profiles are enforced.
-- A worker with pinned instruments submits bulk work under one of them only
-  (403 `INSTRUMENT_REQUIRED`, 403 `INSTRUMENT_NOT_PINNED`); a run-fixed-programs
-  worker that is not Claude and pins none has no bulk calls either
-  (`INSTRUMENT_REQUIRED`, `bulkAvailable: false`). coscila pins the registry's
-  `name@version` and registry digest, while the daemon allow-lists the broker
-  digest derived from it, so a pin matches an installed bundle whose
-  `instrumentId` (or `instrumentId@version`) is the pin's id, or whose digest
-  equals the pin's digest; the daemon cannot recompute a registry digest.
-- `GET /configs` lists `capabilityProfile` and `instruments` only for workers
-  that have them; a worker without policy is listed and admitted exactly as
-  before.
-
-On premises is decided from the daemon's own provider configuration, never from
-the URL a turn sends (the lab's loopback proxies forward to external services
-too). `PUPPENCLAW_ONPREM_PROVIDERS` is a JSON array of provider ids, each
-configured in `PUPPENCLAW_MODEL_PROVIDERS` with a `baseUrl`, for example
-`["remote_qwen38_none","remote_qwen38_low"]`. A worker's provider is on premises
-when its id is listed and it names the configured kind and endpoint (model,
-label and credential variable may differ). Unset means no provider is on
-premises, so restricted evidence is refused; an invalid value or an id that
-`PUPPENCLAW_MODEL_PROVIDERS` does not configure fails startup.
-
-Identifier-only egress for confidential-manuscript evidence stays with coscila:
-the daemon's egress proxy allows or denies hosts and tunnels TLS it cannot read.
-On the daemon's side such a worker is evidence-only, so it gets no agent job and
-with it no egress tunnel, and its bulk calls go to an on-premises provider only.
-
-A session persists only the workers without a policy, in the frozen shape every
-earlier daemon loads (`state.json` never holds a worker policy field; a turn
-whose workers all have one leaves no orchestration there). A later turn that
-sends no orchestration falls back to what was persisted, so it can never run a
-policy worker with fewer restrictions. Run principals are unaffected: their
-workers come from their grants and carry no policy, and their grants carry no
-evidence policy yet.
-
-`PUPPENCLAW_WORKER_POLICY`: `on` (default) as above; `off` advertises nothing
-and refuses any worker policy field with 400 `WORKER_POLICY_DISABLED`, before any
-session state changes, while orchestrations without one run as before. Any
-other value fails startup. Rollback: a daemon from before worker policy loads
-the state this version writes, and opens `advanced.sqlite`, where a job's stored
-worker configuration keeps its policy fields; it does not enforce them, and a
-resume under its own configuration (coscila withholds the fields from it) is
-refused with `WORKER_CONFIG_CHANGED`.
-
-Advanced worker jobs store each result in its own SQLite row and each distinct
-input once, as a blob keyed by the sha256 of its JSON (a resumed job reuses the
-inputs of its predecessor). Existing job records migrate transactionally at
-startup; completed items and idempotency keys survive the migration. Back up the
-daemon state before updating it. Inputs are kept for as long as their jobs: a
-one-item verbatim job of 40 entries stores about 120 KB, so every 10,000 such
-jobs add about 1.2 GB to `advanced.sqlite`. Jobs of a run principal are never
-archived and no run-scoped purge exists yet: plan the data volume for a large
-study run. See "pcp/2 broker feed and instrument mode"
-above for the store's group commit, recovery and rollback behaviour.
-
-For large runs, use `GET /orchestration/jobs?session=NAME&view=summary&after=0&limit=100`
-and `GET /orchestration/jobs/JOB/results?session=NAME&after=0&limit=100`. The scoped
-worker socket exposes the same routes without the `/orchestration` prefix or
-`session` parameter. A single job also supports `GET /jobs/JOB?view=summary`;
-submission routes accept `?view=summary`. Legacy routes retain full responses.
-Summary pages omit prompts and results; result pages contain the latest state of
-each changed item. Both return a durable numeric `nextCursor` and `hasMore`.
-Limits are 1–1000. Consumers upsert by job/item id, retain the returned cursor, and
-continue until `hasMore` is false. An item updated between pages can appear again;
-these pages are a changed-state feed, not an event log. Export settled jobs for a
-stable complete result set. Summary polling does not acknowledge results or
-suppress the managed continuation. Reading the final results page acknowledges
-a settled job; legacy full-result reads retain that behavior. Health metadata
-reads never hydrate item contents.
-
-Bulk dispatch shares a provider-wide concurrency limit across jobs and sessions
-in this daemon. `PUPPENCLAW_BULK_PROVIDER_CONCURRENCY` sets the default (60);
-`PUPPENCLAW_BULK_PROVIDER_LIMITS` accepts per-provider overrides, for example
-`{"remote_qwen38_xhigh":40}`. Values may be any positive safe integer. Configured
-worker listings report the effective `bulkConcurrencyLimit`. This bounds bulk
-inference only; it does not cap native controller requests. Cancellation drains
-queued leases as well as active requests. Chunk submissions below the existing
-64 MiB request limit and keep scientific checkpoints in the workspace database.
-A browser reconnect does not replace the approved worker attempt; explicit stop
-and actual attempt closure still cancel its work. Interrupted jobs need explicit
-resume, which retains completed items.
-
-Profiles that address the same physical backend must share a capacity group.
-The operator configures `PUPPENCLAW_BULK_PROVIDER_GROUPS` as a JSON mapping of
-provider IDs to group names, for example:
-
-```json
-{"remote_qwen38_none":"qwen38","remote_qwen38_low":"qwen38","remote_qwen38_medium":"qwen38","remote_qwen38_xhigh":"qwen38"}
-```
-
-Each group uses the lowest effective member limit (including the default for
-members without an override). `PUPPENCLAW_BULK_GROUP_LIMITS`, for example
-`{"qwen38":60}`, explicitly overrides that group limit. Unmapped providers keep
-their existing independent limits. Mappings are flat names, not recursive
-aliases; a group and an ungrouped provider with the same name remain independent.
-Invalid mappings and limits for groups without members fail startup. Changes
-take effect when the daemon restarts. Provider identity, reasoning settings,
-receipts and per-attempt quota pauses remain unchanged. Each study should also
-enforce its own aggregate budget across all worker roles.
-
-The worker `configs` response also reports provider-wide `capacity` with each
-provider's `limit`, admitted `active` calls, and `waiting` requests. Grouped
-providers include `capacityGroup` and report the same shared counters; do not
-sum those duplicate counters. This metadata is outside the pinned scientific
-worker configurations. A job item
-can be running while waiting for a permit; it is not evidence of an upstream
-inference slot. Bulk responses use a separate transport with a 30-minute total
-deadline after admission, covering both headers and body. Set
-`PUPPENCLAW_BULK_RESPONSE_TIMEOUT_MS` to a positive integer up to 86400000
-(24 hours) to tune that deadline. Expiry records `BULK_RESPONSE_TIMEOUT`;
-cancellation remains immediate and native controller transport is unchanged.
-This removes the default five-minute header timeout. A bulk call that times out,
-meets a connection reset or gets HTTP 502/503/504 is retried with backoff
-(`PUPPENCLAW_BULK_RETRY_ATTEMPTS`, default 3); every attempt keeps its own
-receipt and the item settles once.
-
-The authenticated `GET /v2/capabilities` reports what bulk dispatch applies as
-`bulkCapacity` (`features.bulkCapacity: 1`), read from the running limiter,
-transport and retry settings rather than from the environment again. It holds
-numbers and names only, never an endpoint or a credential's variable name:
-
-```json
-{"defaultLimit":60,
- "providers":[{"providerId":"remote_qwen38_low","capacityGroup":"qwen38","limit":60,"groupLimit":60},
-              {"providerId":"remote_qwen38_none","capacityGroup":"qwen38","limit":60,"groupLimit":60}],
- "responseTimeoutMs":1800000,
- "retry":{"attempts":3,"baseDelayMs":1000,"maxDelayMs":30000}}
-```
-
-`providers` lists every provider in `PUPPENCLAW_MODEL_PROVIDERS` and every
-provider the bulk limits or groups name, sorted by id. `limit` is the number of
-calls the provider may have in flight; for a grouped provider it is the group's
-limit, shared with every provider of that group. Any other provider gets
-`defaultLimit` in a pool of its own. `responseTimeoutMs` is the deadline of each
-attempt, so an item whose calls never answer keeps one of its job's streams busy
-for up to `attempts` deadlines plus the backoff between them. A run principal's
-calls are further bounded by its grant's `maxConcurrency`. The values are fixed
-when the daemon starts.
-
-Worker configurations and submitted job counts have no fixed numeric ceiling;
-reuse a configuration across as many tasks as required. Requested bulk concurrency
-is still bounded by the configured provider-wide capacity. Persistent native
-harnesses use the separate positive-integer `maxSessions` admission setting
-(default 5), without a hardcoded 100-session ceiling. Idle unfocused sessions may
-be suspended to admit new work; retained history and one-shot Codex sessions do
-not consume that capacity. If every persistent slot is active or focused, further
-native admission returns `MAX_SESSIONS_REACHED`; it does not silently exceed the
-configured limit or imply unlimited hardware or provider throughput.
-
-The authenticated daemon API exposes a fenced lifecycle for callers that must
-stop work or remove a session workspace without allowing a delayed dispatch to
-reopen it:
-
-1. `POST /session/:name/quiesce` durably fences new mutations, drains the
-   active turn when one exists, closes the runtime, and returns a positive
-   `details.quiescenceEpoch` with `details.runtimeClosed: true`.
-   Quiescing an as-yet unknown session name is valid and fences a racing first
-   start.
-2. `POST /session/:name/purge` removes the tracked session while retaining an
-   externally acquired fence.
-3. An authenticated `POST /session/start` or `POST /session/:name/send` may
-   resume work by supplying that exact positive `lifecycleEpoch`. Entering the
-   turn atomically releases a matching active reservation. Once a session name
-   has lifecycle history, every later start or send must carry its latest
-   epoch; missing and stale epochs remain rejected even after release or daemon
-   restart.
-4. `POST /session/:name/quiesce/release` with `{ "epoch": <epoch> }` explicitly
-   releases that exact fence without starting a turn. Repeated release of the
-   latest epoch is idempotent; stale epochs are rejected and the per-name
-   lifecycle history remains.
-
-External epoch reservations and their latest epoch per session name are stored
-independently from the session, so a daemon restart, purge, or retried cleanup
-cannot silently reopen an externally fenced mutation window. Puppenclaw's own
-purge and TTL-GC operations use transient reservations: they still fence
-concurrent mutations and survive an interrupted purge, but do not create new
-per-name lifecycle history or make an ordinary session name require an epoch.
-An external quiescence request that encounters an interrupted transient purge
-atomically adopts that reservation as the external lifecycle fence.
-Session status reports an active external fence as stopped and its runtime as
-`quiesced`. Legacy clients remain compatible for names that have no external
-lifecycle history. `lifecycleEpoch` is confined to the authenticated daemon
-boundary and is deliberately absent from the OpenClaw plugin command and tool
-schemas. Capability discovery advertises these semantics under
-`sessionQuiescence.version: 2`.
-
-Account deletion can fence and clean every daemon session associated with an
-opaque owner selector. The selector is accepted only when daemon bearer
-authentication is configured and is never returned by session or cleanup
-responses. Supply the same 16–128 character `ownerKey` on each authenticated
-`POST /session/start` for the account. Then use
-`POST /sessions/owner/list` with `{ "ownerKey": "..." }`, followed by
-`POST /sessions/owner/quiesce` and `POST /sessions/owner/purge` with
-`{ "ownerKey": "...", "operationKey": "...", "sessionNames": [...] }`. Reuse
-one operation key for idempotent retries. `sessionNames` is an optional,
-authoritative backfill for sessions created before owner selectors existed: the
-daemon atomically binds only present, previously unowned sessions (or names it
-already bound to that owner), rejects conflicting ownership, and fails closed
-when absence cannot be proved by a durable prior binding. Owner claims survive
-purge so retries can prove that a named legacy session was already removed. The
-first cleanup call installs a durable account-wide creation fence; successful
-purge is reported only after no owned session remains, and the purge answer's
-`brokerErasuresPending` counts the owner's broker jobs whose erasure still waits
-for the event feed acknowledgement (see "pcp/2 broker feed"). Ambiguous survivors
-return `OWNER_CLEANUP_INCOMPLETE` with
-`recoveryRequired: true` while retaining the fence. Sessions created by legacy
-callers without an owner selector remain unowned and must still be reconciled
-or purged individually. Capability discovery advertises this contract under
-`sessionOwnerCleanup.version: 1`.
-
-## Conversation statistics
-
-Controller-owned start/send requests can attach
-`statisticsContext: { version: 1, chatId, attemptId }` when
-`conversationStatistics.version === 1` is advertised. Requests without this
-context are intentionally untracked; session names never infer attribution.
-The context is included in durable request fingerprints, so replaying the same
-turn key cannot charge an attempt twice. Agent-facing plugin tools cannot set it.
-
-Authenticated `GET /statistics/turns?cursor=0&limit=100` returns a durable
-`details` envelope with `daemonId`, `nextCursor`, `hasMore`, and latest-value
-`turns`. Every checkpoint and settlement advances a global revision. Consumers
-upsert by daemon and turn ID, never sum revisions, and rescan after a daemon ID
-change. Recovery preserves the last checkpoint and marks interruption; it does
-not extrapolate through downtime.
-
-Runtime is monotonic active runner elapsed time, not summed child wall time.
-Token input includes cache reads/writes; cache and reasoning counts are subsets,
-not additions to total. Null means unobserved, never measured zero. Failed and
-cancelled attempts retain observed partial usage. CPU uses cumulative kernel
-counters for verified host process ancestry, baselines reused runtimes, excludes
-managed compute trees, and is always labelled sampled partial coverage. It does
-not measure remote model CPU/GPU use or reconstruct missed short-lived children.
-Managed compute exposes its separately measured cumulative job-tree CPU.
-
-Permanent chat deletion must call authenticated
-`POST /statistics/chats/:chatId/purge` after verified runtime teardown. Its
-`details` proof is `{ version: 1, chatId, purged: true, removedTurns }`.
-Live attempts reject erasure. The operation is idempotent, keeps the global
-revision monotonic, and fences delayed writes with a non-plaintext chat digest.
-Ordinary session purge, model rotation, and TTL cleanup preserve statistics.
-
-## OpenClaw Usage Surfaces
-
-Puppenclaw exposes three main surfaces:
-
-1. Agent tools
-
-- `puppenclaw_project_create`
-- `puppenclaw_worker_register`
-- `puppenclaw_context_sync`
-- `puppenclaw_campaign_start`
-- `puppenclaw_campaign_status`
-- `puppenclaw_artifacts`
-- `puppenclaw_campaign_approve`
-- `puppenclaw_campaign_cancel`
-- `puppenclaw_reassessment_start`
-- `puppenclaw_reassessment_status`
-- `puppenclaw_reassessment_report`
-
-2. Raw ACP session tools
-
-- `puppenclaw_start`
-- `puppenclaw_send`
-- `puppenclaw_status`
-- `puppenclaw_stop`
-- `puppenclaw_resume`
-- `puppenclaw_fork`
-- `puppenclaw_cost`
-
-3. `/puppenclaw` command
-
-- mirrors the same behavior for deterministic command-style control
-
-Gateway methods:
-
-- `puppenclaw.projectCreate`
-- `puppenclaw.workerRegister`
-- `puppenclaw.contextSync`
-- `puppenclaw.campaignRun`
-- `puppenclaw.campaignStatus`
-- `puppenclaw.artifacts`
-- `puppenclaw.campaignApprove`
-- `puppenclaw.campaignCancel`
-- `puppenclaw.reassessmentStart`
-- `puppenclaw.reassessmentStatus`
-- `puppenclaw.reassessmentReport`
-
-## Quick Start: Local Orchestration
-
-These are the exact steps a future Codex session can follow.
-
-1. Create and install the plugin
-
-```bash
-cd /absolute/path/to/puppenclaw
-npm install
-npm run build
-openclaw plugins install /absolute/path/to/puppenclaw
-```
-
-2. Restart the gateway
-
-3. Configure the plugin in OpenClaw with at least:
-
-- `backend`
-- `defaultAgent`
-- `agentCommands`
-- `orchestration.defaultProjectRoot`
-
-4. In an OpenClaw conversation, create the project
-
-```text
-/puppenclaw project {"name":"demo-project","rootDir":"demo-project","description":"Main repo"}
-```
-
-Because `rootDir` is relative here, Puppenclaw resolves it under `orchestration.defaultProjectRoot`.
-
-5. Register or confirm the local worker
-
-```text
-/puppenclaw worker {"id":"local","label":"Local Worker","labels":["local"],"projectRoots":["/absolute/path/to/workspaces"]}
-```
-
-6. Sync context
-
-```text
-/puppenclaw sync {"projectId":"demo-project","includeFiles":["AGENTS.md","README.md"],"memoryText":"Use npm, run tests, keep code terse."}
-```
-
-7. Run a baseline campaign
-
-```text
-/puppenclaw campaign {"projectId":"demo-project","workerId":"local","name":"baseline","template":"baseline_from_scratch","task":"Implement the first working baseline for this repo.","evaluationCommand":"npm test"}
-```
-
-Or run a fusion campaign that gives Codex and Claude the same sealed input bundle, cross-reviews both outputs, and performs a final merge pass:
-
-```text
-/puppenclaw campaign {"projectId":"demo-project","workerId":"local","name":"fusion-pass","template":"puppenfusion","task":"Implement the feature end to end.","evaluationCommand":"npm test","fusionPreferredAgent":"codex"}
-```
-
-Or reassess older Puppenclaw, Codex, and Claude Code sessions with a newer model. Puppenclaw imports matching project history, creates a new branch/worktree, asks the target model to patch only concrete old-model mistakes, runs validation, and stores a report. The base branch is never merged automatically.
-
-```text
-/puppenclaw reassess {"projectId":"demo-project","workerId":"local","targetModel":"gpt-new","providers":["puppenclaw","codex","claude"],"validationCommand":"npm test"}
-```
-
-8. Inspect status
-
-```text
-/puppenclaw campaign-status {"projectId":"demo-project"}
-```
-
-9. Inspect artifacts
-
-```text
-/puppenclaw artifacts {"projectId":"demo-project"}
-```
-
-10. If the campaign paused for approval, resume it
-
-```text
-/puppenclaw approve {"campaignId":"camp-..."}
-```
-
-## Campaign Templates
-
-### `literature_review`
-
-Use for citation-conscious research or landscape mapping.
-
-Behavior:
-
-- by default, runs as an ACP `research` step
-- if `orchestration.gptResearcherCommand` is configured, Puppenclaw runs that command instead and stores stdout as a `research-dossier` artifact
-
-### `baseline_from_scratch`
-
-Use for:
-
-- plan
-- implement
-- optionally evaluate with `evaluationCommand`
-
-### `ablation_campaign`
-
-Use when you already know the concrete experiment commands.
-
-Example:
-
-```text
-/puppenclaw campaign {"projectId":"demo-project","workerId":"local","name":"ablation-1","template":"ablation_campaign","task":"Compare prompt variants.","experimentCommands":["python run_a.py","python run_b.py"]}
-```
-
-### `self_improvement_loop`
-
-Repeats:
-
-- planning
-- implementation
-- optional evaluation
-- review
-
-Control loop size with `iterations`.
-
-### `puppenfusion`
-
-Use when you want both Codex and Claude to work from the same sealed project brief, then fuse the results into a stronger final implementation.
-
-Behavior:
-
-- requires a clean git worktree at campaign start
-- creates separate local-only worktrees for the Codex candidate, the Claude candidate, and the final merged candidate
-- gives both planning and implementation runs the same sealed bundle:
-  - task
-  - scope and non-scope
-  - constraints
-  - validation plan
-  - synced project context
-  - exact base commit
-- runs a planning round first:
-  - Codex produces a structured plan review
-  - Claude produces a structured plan review
-  - OpenClaw synthesizes one canonical fusion plan
-- pauses for approval after the synthesized fusion plan and before implementation starts
-- requires both implementation runs to emit a structured implementation memo
-- records a structured candidate handoff artifact for each backend with commit and validation metadata
-- runs fresh cross-review sessions:
-  - Codex reviews the Claude candidate
-  - Claude reviews the Codex candidate
-- synthesizes a fusion dossier from both memos and both peer reviews
-- optionally sends that dossier to an external arbiter command if configured
-- attempts automatic local git integration first, without PRs or manual merging
-- only falls back to one final resolver merge pass with the fixed `fusionPreferredAgent` when automatic integration reports a conflict or unresolved path
-
-Use `fusionPreferredAgent` to choose which backend performs the final merge run. If omitted, Puppenclaw falls back to the project's `fusionPreferredAgent`, then `defaultAgent`, then the plugin default agent.
-
-Example:
-
-```text
-/puppenclaw campaign {"projectId":"demo-project","workerId":"local","name":"feature-fusion","template":"puppenfusion","task":"Implement the feature end to end.","evaluationCommand":"npm test","fusionPreferredAgent":"claude","useExternalArbiter":true}
-```
-
-### `custom`
-
-Use only when the built-in templates are not the right fit.
-
-Example:
-
-```text
-/puppenclaw campaign {"projectId":"demo-project","workerId":"local","name":"custom-run","template":"custom","steps":[{"title":"Design","kind":"plan","executor":"acp","instruction":"Design the next phase."},{"title":"Run tests","kind":"eval","executor":"command","command":"npm test"}]}
-```
-
-## Raw ACP Session Control
-
-Raw sessions still exist and are useful for admin or debugging work.
-
-Examples:
-
-```text
-/puppenclaw start {"agent":"codex","name":"api-refactor","directory":".","task":"Implement the server side."}
-/puppenclaw send {"name":"api-refactor","message":"Continue and run tests.","stream":true}
-/puppenclaw status {}
-/puppenclaw stop {"name":"api-refactor"}
-```
-
-Use the orchestration surface first when the work is project-shaped. Use raw sessions when the operator explicitly wants direct ACP control.
-
-Session HTTP/SSE results expose provider failures without forwarding raw credential diagnostics. `PROVIDER_AUTHENTICATION_REQUIRED` is terminal and non-retryable until an operator refreshes the provider login; `PROVIDER_CONNECTION_FAILED` is retryable. `PROVIDER_AUTHENTICATION_BUSY` identifies temporary Claude credential refresh contention and is also retryable; it does not imply that the login is invalid. Definitive token rejection remains terminal. Retryability does not replay a dispatched research turn automatically, because partial work may already exist. A provider-rejected model turn is a terminal session result rather than an HTTP request failure: JSON returns 200 with the failed session, safe message, code, and retryability, while SSE emits the same typed `error` followed by that terminal `result`. Initial keyed execution and every keyed replay preserve this exact shape. The code and `retryable` flag are also retained in session status, active-turn metadata, and durable turn receipts. `/capabilities` advertises this as `providerFailureContracts` version 2.
-
-## ACP Verification
-
-Before blaming Puppenclaw, prove the ACP stack from the same `HOME` and `cwd`
-that the gateway will use.
-
-1. Verify `acpx` itself exists:
-
-```bash
-/absolute/path/to/acpx --help
-```
-
-2. Verify the adapter can create a session from the same environment:
-
-```bash
-HOME=/path/to/openclaw-home /absolute/path/to/acpx --format json --json-strict --cwd /absolute/path/to/project codex sessions new --name smoke-test
-HOME=/path/to/openclaw-home /absolute/path/to/acpx --format json --json-strict --cwd /absolute/path/to/project claude sessions new --name smoke-test
-```
-
-3. Verify the adapter can answer a prompt from the same environment:
-
-```bash
-HOME=/path/to/openclaw-home printf '%s' 'Reply with exactly OK and stop.' | /absolute/path/to/acpx --format json --json-strict --cwd /absolute/path/to/project --approve-reads --non-interactive-permissions deny codex prompt --session smoke-test --file -
-HOME=/path/to/openclaw-home printf '%s' 'Reply with exactly OK and stop.' | /absolute/path/to/acpx --format json --json-strict --cwd /absolute/path/to/project --approve-reads --non-interactive-permissions deny claude prompt --session smoke-test --file -
-```
-
-4. Only after those succeed, run `/puppenclaw start`.
-
-If your OpenClaw gateway uses an isolated `HOME`, run these checks with that
-same `HOME`, not your normal shell profile.
-
-## oc2oc Integration
-
-Current state:
-
-- Puppenclaw recognizes `oc2oc` as a remote channel
-- mediated remote control is supported
-- deterministic pure-pipe control is supported only when explicitly enabled and exposed
-- full typed Puppenclaw-over-`oc2oc` orchestration transport is not yet implemented
-
-Remote control safety gates:
-
-- `remoteControl.requireConversationBinding`
-- `/puppenclaw bind`
-- `/puppenclaw expose {"agents":["codex"],"allowPurePipe":true}`
-
-Example remote setup flow inside an `oc2oc` conversation:
-
-```text
-/puppenclaw bind
-/puppenclaw expose {"agents":["codex"],"allowPurePipe":true}
-/puppenclaw campaign {"projectId":"remote-project","workerId":"local","name":"baseline","template":"baseline_from_scratch","task":"Implement the worker baseline.","evaluationCommand":"npm test"}
-```
-
-## Troubleshooting
-
-### `Project root does not exist`
-
-- Check `orchestration.defaultProjectRoot`
-- Check whether `rootDir` was meant to be absolute or relative
-
-### `Worker ... is not allowed to operate on ...`
-
-- Expand `worker.projectRoots`
-- Register the worker again with the correct allowed roots
-
-### `Worker ... does not support command execution`
-
-- Either enable `orchestration.allowLocalCommandExecution`
-- Or register the worker with `executors: ["acp", "command"]`
-- Or use a campaign that does not rely on command steps
-
-### `Puppenclaw daemon is unreachable`
-
-- Start the daemon
-- Verify `daemonUrl`
-- Run `node dist/daemon/cli.js status --host ... --port ...`
-
-### ACP adapter starts fail
-
-- `spawn acpx ENOENT`
-  - `acpx` is not installed or `acpxCommand` is wrong
-- `Authentication required`
-  - the ACP adapter cannot see valid auth from the gateway/plugin `HOME`
-  - either seed auth into that `HOME` or wrap `agentCommands` with an explicit `HOME=...`
-- `acpx exited with code 4`
-  - rerun the same `acpx` command manually with the same `HOME` and `cwd` as the gateway
-  - treat it as an adapter/runtime error until the direct `acpx` test succeeds
-- `No acpx session found`
-  - the ACP session was never created or is not visible from the current `HOME`
-- In all cases, verify the configured `agentCommands` work outside Puppenclaw from the same environment the gateway uses
-
-### Missing final answers and interrupted turns
-
-Assistant progress, tool output, and terminal answers are separate. A Codex
-one-shot turn uses its final-message file, or an explicitly final JSON message
-with confirmed turn completion. Commentary alone produces a failed
-`NO_FINAL_MESSAGE` status, never a replay of the previous answer. Native terminal
-failures and unexpected process signals also fail; a user stop remains cancelled
-in statistics. Inspect both `activeTurn.exitCode` and `activeTurn.signal`.
-
-ACPX reconnect banners do not authorize replay. Persisted replies require a
-current-submission identity and observed completion. An automatic retry is limited
-to one explicitly rejected, undispatched queue request; missing acknowledgements
-and partial work are not automatically resubmitted.
-
-Claude planning turns have one narrow exception to ACPX's nonzero-exit handling:
-exit 5 can mean the read-only boundary selected "No, keep planning" when the
-agent requested to leave plan mode. A fresh answer, a correlated `end_turn`, and
-a final permission exchange holding the plan expose it for user approval.
-Earlier tool denials are accounted for and reported separately; when other tools
-requested permission, the actual offered plan is required. Every permission must
-have a matched decision, and exit 5 requires that none were approved. Missing
-evidence, errors, signals, later tool requests, and `deny-all` remain failures.
-The actual exit code stays in diagnostics; the exception neither approves the
-plan nor retries a denied tool or resubmits the prompt.
-
-On Linux, one-shot diagnostic summaries are stored in the controller's
-`<data-dir>/diagnostics/` directory, using hashed session/turn identifiers and
-owner-only permissions. They retain event metadata, redacted runtime stderr, real
-exit/signal information, and final-file metadata—not credentials, reasoning, or
-raw tool/request payloads. Keep this directory outside every agent mount.
-Records are periodically flushed and limited to 1 MiB per turn, ten turns per
-session, seven days, and 128 MiB globally. Session purge erases its diagnostics.
-Diagnostic persistence failure does not interrupt scientific work.
-
-## Development
-
-```bash
-npm install
-npm run build
-npm run verify
-```
-
-Useful source files:
-
-- `src/orchestrator/runtime.ts`
-- `src/orchestrator/store.ts`
-- `src/plugin/service.ts`
-- `src/plugin/tools.ts`
-- `src/plugin/commands.ts`
-- `src/plugin/gateway-methods.ts`
+The tests run the real daemon, stores and broker against fake agents (`test/fixtures/fake-acpx*`), mock upstreams and
+temporary data directories; they need no provider account and no OpenClaw gateway. A few opt-in tests are skipped
+unless their environment is present. `test/fixtures/contract/` holds the daemon's session status and output envelopes
+as committed fixtures; `scripts/emit-contract-fixtures.ts` regenerates them and a unit test fails when the emitted shape
+drifts. The scripts in `scripts/measure-*.mts` measure health cost, event-loop lag and bulk throughput against a daemon
+or runtime they start themselves.
+
+GitHub Actions runs the commit guard and `npm ci`, build, lint, typecheck and tests on pushes to `main` and `dev` and
+on pull requests. Source layout: `src/daemon` (HTTP server and pcp/2), `src/manager` (agent sessions through acpx and
+Codex), `src/advanced` (broker, principals, worker policy), `src/compute`, `src/statistics`, `src/resources`,
+`src/orchestrator` (campaigns), `src/plugin` (OpenClaw plugin) and `skills/` (agent skills shipped with the plugin).
 
 ## License
 
-MIT
+MIT; see [LICENSE](LICENSE).
