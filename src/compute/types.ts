@@ -26,7 +26,7 @@ export const computeJobSpecZod = z.object({
   /** Optional owning chat session so detached jobs can be attributed to it. */
   sessionName: z.string().trim().min(1).max(200).optional(),
   /**
-   * Optional run principal (P3) whose socket directory the launcher binds into
+   * Optional run principal whose socket directory the launcher binds into
    * the sandbox. Only the authenticated submitter names it; the binding reaches
    * the host-side launcher through the controller environment, never the job's.
    */

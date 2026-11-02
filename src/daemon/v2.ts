@@ -8,7 +8,7 @@ import type { EventLoopMonitor } from "./event-loop.js";
 import { identityEnvelope, PCP_PROTOCOL, type DaemonIdentity } from "./identity.js";
 
 /**
- * pcp/2 step 1 routes (plan H4). Both are authenticated by the daemon-wide
+ * pcp/2 health and capabilities. Both are authenticated by the daemon-wide
  * bearer hook (they are not in its open-route list) and cost O(1): no store
  * scans, no subprocesses, no transcripts.
  */

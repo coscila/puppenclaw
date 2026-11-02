@@ -5,14 +5,14 @@ import type { SessionInfo, SessionTranscriptEntry, ToolResult } from "./types.js
 import { redactSensitiveText } from "./utils.js";
 
 /**
- * Compact response shapes (plan H4, capability `compactStatus`). Every shape
- * here is opt-in per request; without the opt-in a route answers exactly as
- * before, so labs that predate pcp/2 keep working.
+ * Compact response shapes (capability `compactStatus`). Every shape here is
+ * opt-in per request; without the opt-in a route answers with its version 1
+ * shape, so clients that do not know pcp/2 keep working.
  */
 
 export const MAX_TRANSCRIPT_LIMIT = 1_000;
 
-/** Query of GET /session/:name and GET /sessions. Unknown keys are ignored as before. */
+/** Query of GET /session/:name and GET /sessions. Unknown keys are ignored. */
 export const statusViewQueryZod = z.object({
   view: z.enum(["full", "summary"]).optional(),
   transcriptLimit: z.coerce.number().int().min(0).max(MAX_TRANSCRIPT_LIMIT).optional()

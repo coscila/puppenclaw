@@ -26,13 +26,13 @@ const TERMINAL_JOB_STATES = ["completed", "failed", "cancelled", "interrupted"];
 
 /**
  * Storage era of a job row. 0: whole job in the payload (migrated at open);
- * 1: item rows written before P1; 2: written by P1 (inputs as blobs, outbox).
- * Recovery requeues bulk items of era-2 jobs only. An older daemon that
+ * 1: item rows with inline inputs, no outbox; 2: inputs as blobs, every change
+ * in the outbox. Recovery requeues bulk items of era-2 jobs only. An older daemon that
  * rewrites a header sets 1, which only makes recovery more conservative.
  */
 export const P1_STORAGE_VERSION = 2;
 
-/** Default group-commit window (plan P1: at most 50 ms per batch). */
+/** Default group-commit window: a write waits at most 50 ms for its batch to commit. */
 export const DEFAULT_COMMIT_WINDOW_MS = 50;
 const DEFAULT_MAX_BATCH = 512;
 /** A job header's updatedAt follows item progress at most this often. */
@@ -72,9 +72,8 @@ export type FeedPage = { feedId: string; events: BrokerEvent[]; next: number; ha
 export type StoreStats = { batches: number; mutations: number; fallbacks: number; failedMutations: number; duplicateSettlements: number };
 export type InstrumentRecord = { digest: string; bundle: Record<string, unknown>; settingsSha256: string; installedAt: string };
 /**
- * skipped.historical: written before P1 (their records reach Postgres only through the one-time backfill, which the
- * daemon cannot see; historical rows go only with the author's per-item approval); skipped.run: jobs of a run
- * principal (a run is what a study references).
+ * skipped.historical: jobs stored before the outbox layout (their records never passed through the feed, so the daemon
+ * cannot prove that the caller holds them); skipped.run: jobs of a run principal (a run is what a study references).
  */
 export type ArchiveReport = { file: string | null; jobs: number; items: number; receipts: number; skipped: { studyRef: number; run: number; historical: number; unacknowledged: number }; manifest: string | null };
 
@@ -96,7 +95,7 @@ export class InstrumentConflictError extends Error {
 }
 
 /**
- * Durable item rows, dispatch receipts and the broker outbox (plan P1).
+ * Durable item rows, dispatch receipts and the broker outbox.
  * - Writes are group-committed: every write joins a batch that commits as one
  *   transaction within commitWindowMs; a failing batch is replayed write by
  *   write so one bad write cannot take the others down.
@@ -163,9 +162,9 @@ export class AdvancedStore {
       if (!columns("jobs").includes("revision")) db.exec("ALTER TABLE jobs ADD COLUMN revision INTEGER NOT NULL DEFAULT 0");
       if (!columns("jobs").includes("storage_version")) db.exec("ALTER TABLE jobs ADD COLUMN storage_version INTEGER NOT NULL DEFAULT 0");
       if (!columns("receipts").includes("job_id")) db.exec("ALTER TABLE receipts ADD COLUMN job_id TEXT; ALTER TABLE receipts ADD COLUMN item_id TEXT; UPDATE receipts SET job_id=json_extract(payload,'$.jobId'), item_id=json_extract(payload,'$.itemId')");
-      // P1 (additive only: older daemons name their columns on insert, and job_items keeps its seven columns).
+      // Additive only: older daemons name their columns on insert, and job_items keeps its seven columns.
       if (!columns("jobs").includes("study_ref")) db.exec("ALTER TABLE jobs ADD COLUMN study_ref TEXT");
-      // The outbox columns are the pcp/2 contract names (jobId, itemId, createdAt); a pre-release store named them in snake case.
+      // The outbox columns are the pcp/2 contract names (jobId, itemId, createdAt); snake-case columns are renamed.
       if (columns("outbox").includes("job_id")) db.exec("ALTER TABLE outbox RENAME COLUMN job_id TO jobId; ALTER TABLE outbox RENAME COLUMN item_id TO itemId; ALTER TABLE outbox RENAME COLUMN created_at TO createdAt; ALTER TABLE outbox RENAME COLUMN receipt_id TO receiptId");
       db.exec("COMMIT");
     } catch (error) { db.exec("ROLLBACK"); db.close(); throw error; }
@@ -198,15 +197,15 @@ export class AdvancedStore {
     };
     index("CREATE INDEX IF NOT EXISTS items_truncated ON job_items(job_id,state) WHERE json_extract(result,'$.truncated')=1");
     const sequence = () => Number((db.prepare("SELECT value FROM change_sequence WHERE id=1").get() as { value: number }).value);
-    // A new outbox starts at the current revision: history before P1 reaches Postgres
-    // through the one-time backfill, not through the feed.
+    // A new outbox starts at the current revision: changes made before the store had an
+    // outbox are not replayed into the feed.
     db.prepare("INSERT OR IGNORE INTO outbox_meta (id, feed_id, acked, synced_revision) VALUES (1, ?, 0, ?)").run(randomUUID(), sequence());
     options.onConnection?.(db);
     const store = new AdvancedStore(db, root, options, indexes);
     store.catchUp();
     // Each migration is atomic. Old idempotency keys and completed results are retained.
     for (const row of db.prepare("SELECT payload FROM jobs WHERE storage_version=0").all() as { payload: string }[]) store.applyNow((batch) => store.writeJob(JSON.parse(row.payload) as WorkerJob, batch, {}));
-    // A pre-release store deferred whole jobs (purge_deferred): erase their content now and track them like any other.
+    // Jobs deferred whole in purge_deferred lose their content now and are tracked like any other pending erasure.
     if (db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='purge_deferred'").get() !== undefined) {
       store.applyNow(() => {
         for (const row of db.prepare("SELECT job_id FROM purge_deferred").all() as { job_id: string }[]) store.deferErasure(row.job_id);
@@ -602,11 +601,12 @@ export class AdvancedStore {
   // ---------------------------------------------------------------- recovery
 
   /**
-   * Restart recovery. Bulk jobs written by P1 are requeued: their unsettled items
-   * return to queued (side-effect-free inference may run again) and the job is
+   * Restart recovery. Bulk jobs of the outbox layout are requeued: their unsettled
+   * items return to queued (side-effect-free inference may run again) and the job is
    * relaunched when `relaunch` says its authority survived the restart, otherwise
-   * it waits for an explicit resume. Jobs from before P1 and agent jobs are
-   * interrupted exactly as before. Returns child sessions to quiesce.
+   * it waits for an explicit resume. Jobs of an earlier layout and agent jobs are
+   * interrupted, since their work cannot be proven unambiguous. Returns child
+   * sessions to quiesce.
    */
   recover(options: { relaunch?: (job: WorkerJobHeader) => boolean } = {}): string[] {
     this.flushPending();
@@ -911,9 +911,9 @@ export class AdvancedStore {
    * new SQLite file under <root>/archive with their items (inputs materialized) and
    * receipts. Each job is copied, then counted and digested (sha256 over its canonical
    * rows) in both files, and deleted from the live store only when both agree. Only jobs
-   * whose records provably reached Postgres qualify: written by P1 (every change and
-   * receipt went to the outbox) with every event acknowledged. Jobs written before P1,
-   * jobs of a run principal (runs are what studies reference), jobs with a study
+   * whose records provably reached the caller qualify: stored with the outbox layout
+   * (every change and receipt went to the outbox) with every event acknowledged. Jobs of
+   * an earlier layout, jobs of a run principal (runs are what studies reference), jobs with a study
    * reference and jobs with a pending erasure stay.
    */
   async archive(options: { before: Date; maxJobs?: number }): Promise<ArchiveReport> {

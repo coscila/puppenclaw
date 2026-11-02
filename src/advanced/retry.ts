@@ -1,5 +1,5 @@
 /**
- * Broker retries for bulk item calls (plan P2): 502, 503 and 504 responses and
+ * Broker retries for bulk item calls: 502, 503 and 504 responses and
  * transport failures (connection resets, refused or unreachable upstreams,
  * timeouts) are retried with exponential backoff and jitter. Each attempt is a
  * new provider request with its own receipt row; the item settles once, with

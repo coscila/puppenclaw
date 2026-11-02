@@ -11,7 +11,7 @@ import { redactSensitiveText } from "../shared/utils.js";
 import { identityEnvelope, type DaemonIdentity } from "./identity.js";
 
 /**
- * pcp/2 broker routes (capabilities eventFeed:1, brokerOutbox:1, instrumentMode:1).
+ * pcp/2 broker routes (capabilities eventFeed, brokerOutbox, instrumentMode).
  * All are authenticated by the daemon-wide bearer hook, and every body carries
  * the identity envelope {protocol, bootId, spoolId}.
  *

@@ -104,7 +104,7 @@ export const modelProviderConfigZod = z
     }
   });
 /**
- * Worker policy (plan E4; capability advancedOrchestration.workerPolicy). Both lists are versioned: a value this
+ * Worker policy (capability advancedOrchestration.workerPolicy). Both lists are versioned: a value this
  * daemon does not know is refused with a typed error (UNSUPPORTED_EVIDENCE_POLICY, UNSUPPORTED_CAPABILITY_PROFILE),
  * never ignored, since ignoring a restriction would grant more than the caller asked for.
  * - Evidence policies: public-literature (published claims and public sources); entitled-institutional (licensed full
@@ -195,8 +195,8 @@ export const advancedOrchestrationZod = z.object({
 
 /**
  * The orchestration a session persists in state.json: exactly the shape every daemon since advanced orchestration
- * validates its state with (frozen; 426d493 and older refuse anything else and would stop at load). It never carries
- * the worker policy fields; persistedOrchestration() decides what of a turn's orchestration may be kept.
+ * validates its state with (frozen: daemons without worker policies refuse anything else and would stop at load). It
+ * never carries the worker policy fields; persistedOrchestration() decides what of a turn's orchestration may be kept.
  */
 export const persistedAdvancedOrchestrationZod = z.object({
   version: z.literal(1),
@@ -819,11 +819,11 @@ export const pluginManifestConfigSchema = {
       type: "integer",
       minimum: 1,
       maximum: 1440,
-      description: "Garbage-collect completed or stopped sessions after this TTL."
+      description: "Garbage-collect failed or stopped sessions idle for longer than this TTL; idle, waiting and suspended sessions are kept."
     },
     streamOutput: {
       type: "boolean",
-      description: "Capture streamed output chunks while turns run."
+      description: "Reported in daemon capabilities and site status; output is captured and streamed regardless of this value."
     },
     resourceSamplingIntervalMs: {
       type: "integer",
@@ -843,7 +843,7 @@ export const pluginManifestConfigSchema = {
     },
     codexCommand: {
       type: "string",
-      description: "Optional codex binary override."
+      description: "Optional launcher that wraps provider Codex turns as <codexCommand> --cwd <dir> -- <codex launcher> exec ...; the codex launcher itself is agentCommands.codex."
     },
     skillRoots: {
       type: "array",

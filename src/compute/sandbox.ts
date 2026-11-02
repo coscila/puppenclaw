@@ -20,7 +20,7 @@ function trustedFile(value: string | undefined, label: string): string {
 }
 
 /**
- * The principal socket binding a compute launcher receives (P3): the principal
+ * The principal socket binding a compute launcher receives: the principal
  * id, its private socket directory (bind the directory, so a socket the daemon
  * reopens after a restart stays reachable) and the socket path inside it.
  */

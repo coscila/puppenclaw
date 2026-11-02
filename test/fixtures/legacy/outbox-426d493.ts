@@ -1,4 +1,4 @@
-// Verbatim copy of src/advanced/outbox.ts at 426d493 (the P1-P3 + verbatim daemon); only the type import path changed.
+// Verbatim copy of src/advanced/outbox.ts at 426d493 (outbox, run principals, verbatim instruments); only the type import path changed.
 import { createHash } from "node:crypto";
 
 import type { ItemResult, JobState, UsageReceipt, WorkerJobHeader } from "../../../src/advanced/types.js";

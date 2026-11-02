@@ -1,4 +1,4 @@
-// Verbatim copy of src/advanced/store.ts at 815463f (the P1-P3 daemon). Only the import paths changed: outbox and
+// Verbatim copy of src/advanced/store.ts at 815463f (outbox and run principals). Only the import paths changed: outbox and
 // fingerprint resolve to their 815463f copies beside this file, types to the current module (types only).
 // The rollback tests open stores written by later code with this exact code path.
 import { createHash, randomUUID } from "node:crypto";

@@ -16,7 +16,7 @@ import {
  * by a crashed daemon let the next boot find runner groups that outlived it.
  *
  * Boot reaper modes (`PUPPENCLAW_BOOT_REAPER`):
- * - `off`: no registry files, no boot scan (the behaviour before the registry).
+ * - `off`: no registry files, no boot scan.
  * - `observe` (default): track and report leftover groups at boot; signal nothing.
  * - `on`: terminate leftover groups whose leader is still the recorded process
  *   (pid plus /proc start ticks), SIGTERM first and SIGKILL after a grace period.

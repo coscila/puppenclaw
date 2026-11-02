@@ -1,5 +1,5 @@
-// Verbatim copy of src/advanced/store.ts at cea4c29 (the H4 daemon; c36cfa2 differs only in its pragmas).
-// Only the type import path changed. The rollback tests open P1 stores with this exact code path.
+// Verbatim copy of src/advanced/store.ts at cea4c29 (without an outbox; c36cfa2 differs only in its pragmas).
+// Only the type import path changed. The rollback tests open outbox stores with this exact code path.
 import { chmod, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { DatabaseSync as Database } from "node:sqlite";

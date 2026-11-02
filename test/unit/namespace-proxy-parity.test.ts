@@ -11,8 +11,8 @@ import { shapeLikeNamespaceProxy } from "../../src/advanced/bulk-transport.js";
  * Differential check of the direct bulk route against the namespace proxy it
  * bypasses: the same payloads go through the real proxy and through
  * shapeLikeNamespaceProxy, and the upstream must receive identical requests.
- * Opt-in, because the proxy lives in the lab repository:
- *   PUPPENCLAW_NAMESPACE_PROXY_SCRIPT=/path/to/qwen38-namespace-proxy.py npx vitest run test/unit/namespace-proxy-parity.test.ts
+ * Opt-in, because this repository does not ship the proxy; the variable names its script:
+ *   PUPPENCLAW_NAMESPACE_PROXY_SCRIPT=/path/to/namespace-proxy.py npx vitest run test/unit/namespace-proxy-parity.test.ts
  */
 const script = process.env.PUPPENCLAW_NAMESPACE_PROXY_SCRIPT;
 const received: { body: unknown; headers: IncomingHttpHeaders; url: string | undefined }[] = [];

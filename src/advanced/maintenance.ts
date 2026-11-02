@@ -5,9 +5,9 @@ import type { AdvancedStore, ArchiveReport } from "./store.js";
  * - PUPPENCLAW_ADVANCED_ARCHIVE_DAYS (an integer of at least 30): once a day,
  *   terminal jobs last updated more than that many days ago move to a verified
  *   archive file (counts and sha256 checked before the live rows go). Only jobs
- *   written by P1 with every event acknowledged qualify; jobs from before P1,
- *   jobs of a run principal, jobs with a study reference and jobs with a pending
- *   erasure stay.
+ *   stored with the outbox layout and with every event acknowledged qualify; jobs
+ *   of an earlier layout, jobs of a run principal, jobs with a study reference and
+ *   jobs with a pending erasure stay.
  * - PUPPENCLAW_EVENT_RETENTION_DAYS (an integer of at least 7): once an hour,
  *   acknowledged outbox rows older than that are deleted. Rows after the
  *   acknowledged cursor are never deleted.

@@ -9,9 +9,10 @@ import { AdvancedStore as LegacyStore } from "../fixtures/legacy/advanced-store-
 import { createTempDir } from "../helpers.js";
 
 /**
- * Rollback safety of the P1 schema: the store code of the H4 daemon (cea4c29,
- * same schema code as the deployed c36cfa2) opens, reads and writes a store that
- * P1 wrote, and P1 reopens what the older daemon left, catching the feed up.
+ * Rollback safety of the outbox schema: the store code of the daemon without an
+ * outbox (cea4c29, the same schema code as c36cfa2) opens, reads and writes a
+ * store this version wrote, and this version reopens what the older daemon left,
+ * catching the feed up.
  */
 const cleanups: (() => void)[] = [];
 afterEach(() => { while (cleanups.length) cleanups.pop()!(); });
@@ -32,8 +33,8 @@ function receipt(jobId: string, itemId: string): UsageReceipt {
     createdAt: "2026-10-25T00:00:01.000Z", updatedAt: "2026-10-25T00:00:02.000Z", attempt: 1, serverFingerprint: "fp", settingsSha256: "s".repeat(64) };
 }
 
-describe("rollback safety of the P1 AdvancedStore", () => {
-  it("keeps a job the older daemon wrote out of the archive, however old: its records reach Postgres only through the backfill", async () => {
+describe("rollback safety of the outbox AdvancedStore", () => {
+  it("keeps a job the older daemon wrote out of the archive, however old: its records never passed through the feed", async () => {
     const dir = await createTempDir("advanced-legacy-archive-");
     const legacy = await LegacyStore.open(dir);
     legacy.putJob(job("historical", { state: "completed", updatedAt: "2026-08-25T00:00:00.000Z", results: ["one", "two"].map((item) => ({ id: item, state: "completed" as const, output: `answer ${item}`, providerId: "local", model: "served", promptSha256: item, usage: null })) }));
@@ -48,7 +49,7 @@ describe("rollback safety of the P1 AdvancedStore", () => {
     expect(p1.jobReceipts("historical")).toHaveLength(1);
   });
 
-  it("lets the cea4c29 store code open a store with a pending erasure, and P1 completes it afterwards", async () => {
+  it("lets the cea4c29 store code open a store with a pending erasure, and this version completes it afterwards", async () => {
     const dir = await createTempDir("advanced-legacy-erasure-");
     const p1 = await AdvancedStore.open(dir);
     p1.createJob(job("purged"));
@@ -69,9 +70,9 @@ describe("rollback safety of the P1 AdvancedStore", () => {
   });
 
 
-  it("lets the cea4c29 store code open, read and write a P1 store, and P1 reads what it wrote", async () => {
+  it("lets the cea4c29 store code open, read and write an outbox store, and this version reads what it wrote", async () => {
     const dir = await createTempDir("advanced-legacy-");
-    // P1 writes: blob inputs, a settled item with receipt and outbox rows, an instrument, a deferred erasure.
+    // This version writes blob inputs, a settled item with receipt and outbox rows, an instrument, a deferred erasure.
     const p1 = await AdvancedStore.open(dir);
     p1.createJob(job("p1-job"));
     await p1.settleItem("p1-job", { id: "one", state: "completed", output: "answer", providerId: "local", model: "served", promptSha256: "a".repeat(64), usage: receipt("p1-job", "one").usage, attempts: 1 },
@@ -98,7 +99,7 @@ describe("rollback safety of the P1 AdvancedStore", () => {
     legacy.putReceipt(legacyReceipt);
     legacy.close();
 
-    // P1 again: the store opens, inline and blob inputs both hydrate, and the feed catches up on the older daemon's changes.
+    // This version again: the store opens, inline and blob inputs both hydrate, and the feed catches up on the older daemon's changes.
     const again = await AdvancedStore.open(dir);
     cleanups.push(() => again.close());
     expect(again.feedId).toBe(feedId);
@@ -111,7 +112,7 @@ describe("rollback safety of the P1 AdvancedStore", () => {
     const receipts = caughtUp.filter((event) => event.type === "broker.receipt").map((event) => event.payload as BrokerReceiptPayload);
     expect(receipts.map((payload) => [payload.jobId, payload.itemId, payload.status, payload.output])).toEqual([["legacy-job", "one", "succeeded", "legacy answer"]]);
     expect(receipts[0]!.serverFingerprint).not.toBe(""); expect(receipts[0]!.settingsSha256).toMatch(/^[0-9a-f]{64}$/u);
-    // The older daemon rewrote the P1 job's header: it now counts as pre-P1, so recovery never requeues it.
+    // The older daemon rewrote the job's header: it now counts as an earlier-layout job, so recovery never requeues it.
     expect(again.storageVersion("p1-job")).toBe(1);
     expect(again.storageVersion("legacy-job")).toBe(1);
   });
@@ -125,7 +126,7 @@ describe("rollback safety of the P1 AdvancedStore", () => {
     legacy.close();
     const store = await AdvancedStore.open(dir);
     cleanups.push(() => store.close());
-    // History before P1 reaches Postgres through the backfill, so a first P1 open emits nothing for it.
+    // Changes made before the store had an outbox are not replayed, so the first open with an outbox emits nothing for them.
     expect(store.events(0, 10).events).toEqual([]);
     store.recover();
     expect(store.job("old")!.results.map((result) => result.state)).toEqual(["interrupted", "interrupted"]);

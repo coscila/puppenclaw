@@ -16,7 +16,7 @@ function job(id: string, updatedAt: string): WorkerJob {
 }
 
 describe("opt-in advanced store maintenance", () => {
-  it("stays off by default and refuses settings below the plan's floors", () => {
+  it("stays off by default and refuses settings below their floors", () => {
     expect(maintenanceFromEnvironment({})).toEqual({ archiveAfterDays: null, eventRetentionDays: null });
     expect(maintenanceFromEnvironment({ PUPPENCLAW_ADVANCED_ARCHIVE_DAYS: "30", PUPPENCLAW_EVENT_RETENTION_DAYS: "7" })).toEqual({ archiveAfterDays: 30, eventRetentionDays: 7 });
     for (const env of [{ PUPPENCLAW_ADVANCED_ARCHIVE_DAYS: "29" }, { PUPPENCLAW_EVENT_RETENTION_DAYS: "6" }, { PUPPENCLAW_EVENT_RETENTION_DAYS: "7.5" }, { PUPPENCLAW_ADVANCED_ARCHIVE_DAYS: "soon" }]) {

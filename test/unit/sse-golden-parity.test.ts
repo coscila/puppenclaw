@@ -13,8 +13,8 @@ import {
 } from "../helpers.js";
 
 /**
- * Golden SSE sequences of the session stream routes (plan H4: golden parity
- * tests before keyed turns may stream). Each event is reduced to its kind and
+ * Golden SSE sequences of the session stream routes: keyed streaming must emit
+ * the same events as an unkeyed turn. Each event is reduced to its kind and
  * visible text; the result event to its output.
  */
 
@@ -147,7 +147,7 @@ describe("golden SSE sequences", () => {
     }
   });
 
-  it("a keyed turn without the keyedStreaming opt-in keeps today's result-only stream", async () => {
+  it("a keyed turn without the keyedStreaming opt-in keeps a result-only stream", async () => {
     const { app, workspace } = await daemon("stream");
     try {
       const response = await app.inject({

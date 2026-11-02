@@ -1,5 +1,6 @@
 /**
- * Plan H4 acceptance measurements against a real daemon process.
+ * Health, state-write, event-loop and stalled-stream measurements against a
+ * real daemon process.
  *
  *   npm run build && node --experimental-strip-types scripts/measure-h4.mts \
  *     [--window-ms N] [--stall-ms N] [--stall-rate BYTES_PER_S] [--only load|stall]

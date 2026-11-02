@@ -1011,7 +1011,7 @@ describe("AcpxSessionManager", () => {
       await expect(readArgs(3)).rejects.toMatchObject({ code: "ENOENT" });
       expect(store.getSession("codex-subagent-policy-luna")).toMatchObject({ state: "failed" });
 
-      // Dropping the policy restores today's CLI overrides and removes every
+      // Dropping the policy restores the -m and -c CLI overrides and removes every
       // policy variable, including inherited ones.
       await manager.send({
         name: "codex-subagent-policy",
@@ -1571,7 +1571,7 @@ describe("AcpxSessionManager", () => {
     const stateDir = join(workspaceDir, ".fake-acpx-state");
     const modelSettingPath = join(stateDir, "late-reject-demo.model.setting");
 
-    // Adapter accepts: explicit model behaves as before.
+    // Adapter accepts: the explicit model is applied.
     await manager.start({
       agent: "claude",
       name: "late-reject-demo",
@@ -1583,8 +1583,8 @@ describe("AcpxSessionManager", () => {
     expect(await readFile(modelSettingPath, "utf8")).toBe("claude-opus-4-8\n");
 
     // Arm rejection AFTER the model was applied. The follow-up turn skips the
-    // redundant set (commit 871eb43), so the armed rejection must not fire: an
-    // intentionally skipped set is not an error.
+    // redundant set, so the armed rejection must not fire: an intentionally
+    // skipped set is not an error.
     await writeFile(join(stateDir, "reject-model-set"), "armed\n", "utf8");
     await unlink(modelSettingPath);
     await manager.send({
@@ -1648,7 +1648,7 @@ describe("AcpxSessionManager", () => {
       readFile(join(stateDir, "no-model-pin-demo.model.setting"), "utf8")
     ).rejects.toMatchObject({ code: "ENOENT" });
 
-    // The literal "default" selector keeps today's warn-and-continue path:
+    // The literal "default" selector keeps the warn-and-continue path:
     // running the adapter default IS the requested outcome.
     await manager.start({
       agent: "claude",

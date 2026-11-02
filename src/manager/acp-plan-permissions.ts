@@ -266,7 +266,7 @@ function isKeepPlanningRequest(params: JsonRecord | undefined): boolean {
   const tool = record(params?.toolCall);
   if (!tool || tool.kind !== "switch_mode" || identifier(tool.toolCallId) === undefined) return false;
   const toolName = record(record(tool._meta)?.claudeCode)?.toolName;
-  // Top-level ExitPlanMode requests lack toolName in the deployed adapter;
+  // Top-level ExitPlanMode requests carry no toolName in current Claude adapters;
   // if an adapter supplies it, contradictory identity cannot qualify.
   if (toolName !== undefined && toolName !== "ExitPlanMode") return false;
   const options = params?.options;

@@ -1537,8 +1537,8 @@ export class AcpxSessionManager implements ISessionManager {
   }
 
   /**
-   * One ledger row per (role, model) of the turn. The main row keeps today's
-   * provider/model derivation; subagent rows keep the session provider, name
+   * One ledger row per (role, model) of the turn. The main row keeps the
+   * session's provider/model derivation; subagent rows keep the session provider, name
    * the model that actually ran and say whether they were local model workers
    * (then they ran on the local model, not on that provider). All rows share
    * turnId and timestamp.
@@ -2732,7 +2732,7 @@ export class AcpxSessionManager implements ISessionManager {
    * Serves per-session cost for a session that is no longer in the registry
    * straight from the durable usage ledger. The payload mirrors the
    * live-session shape field for field — per-turn `history` entries keep their
-   * ledger ids, so downstream reconciliation dedupes exactly as before — with
+   * ledger ids, so downstream reconciliation dedupes them like a live session's — with
    * two documented deviations: `lastCall` is always null (the context-window
    * snapshot lives only on the registry record) and provider/model are taken
    * from the most recent ledger turn instead of the session record. The

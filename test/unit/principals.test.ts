@@ -805,7 +805,7 @@ describe("legacy attempt authority", () => {
     expect(() => legacyAttemptAuthorityFromEnvironment({ PUPPENCLAW_LEGACY_ATTEMPT_AUTHORITY: "maybe" })).toThrow(/on or off/);
   });
 
-  it("on: an approved execution turn keeps today's bulk authority and public-literature approval", async () => {
+  it("on: an approved execution turn keeps bulk authority and public-literature approval", async () => {
     const { socket, runtime } = await chat({ legacy: true });
     const configs = (await unix(socket, "/configs")).body;
     expect(configs.authorization).toMatchObject({ publicLiteratureAllowed: true, attemptId: "attempt" });
@@ -823,7 +823,7 @@ describe("legacy attempt authority", () => {
     expect(configs.workers[0].bulkAvailable).toBe(false);
     process.env.PUPPENCLAW_ORCHESTRATION_ATTEMPT_ID = "attempt";
     expect(await unix(socket, "/bulk/submit", { body: { configId: "refs", idempotencyKey: "refused", items: items("x", 1) }, headers: { "x-puppenclaw-principal": "run:a" } })).toMatchObject({ status: 409, body: { code: "PRINCIPAL_REQUIRED" } });
-    // The variable stays an identifier the deployed sandbox wrappers expect, never authority.
+    // The variable stays an identifier that sandbox wrappers may expect, never authority.
     expect(runtime.environment("main").PUPPENCLAW_ORCHESTRATION_ATTEMPT_ID).toBe("attempt");
     const principalSocket = (await registry.put("run:a", runBody())).socketPath!;
     const job = await unix(principalSocket, "/bulk/submit", { body: { configId: "judge", idempotencyKey: "granted", items: items("p", 1) } });

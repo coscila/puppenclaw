@@ -116,7 +116,7 @@ describe("statistics recorder per-model usage", () => {
     input: 101000, output: 5050, cacheRead: 80600, cacheWrite: 100, reasoning: 4010, total: 106050
   };
 
-  it("keeps today's row without a line (no models field)", async () => {
+  it("records a turn without a models field when no line arrives", async () => {
     const { store, recorder } = await recorderFor("plain");
     recorder.observeEvent("plain", { type: "turn.completed", usage: { input_tokens: 1000, cached_input_tokens: 600, output_tokens: 50 } }, "codex");
     await recorder.settle("plain", "completed");
@@ -333,7 +333,7 @@ describe("Codex one-shot turns with the ocsl.model_usage line", () => {
     }
   });
 
-  it.each(["none", "invalid"])("keeps today's main-thread accounting when no valid line arrives (%s)", async (scenario) => {
+  it.each(["none", "invalid"])("keeps main-thread accounting when no valid line arrives (%s)", async (scenario) => {
     const setup = await runnerSetup();
     try {
       const result = await setup.start(scenario);

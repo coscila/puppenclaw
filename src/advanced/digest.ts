@@ -2,10 +2,10 @@ import { createHash } from "node:crypto";
 import { Worker } from "node:worker_threads";
 
 /**
- * Submission digests (job fingerprint, item digests, input blob digests). A census-sized bulk submission (a hundred
- * calls, about 13 MB) took about 70 ms of these on the event loop; SubmissionDigester computes them on a worker thread
- * instead, where posting the request costs a structured clone of a few milliseconds. The values are exactly the ones
- * computed inline (submissionDigests), so stored fingerprints, item digests and blob keys do not change.
+ * Submission digests (job fingerprint, item digests, input blob digests). For a large bulk submission (a hundred calls,
+ * about 13 MB) they cost about 70 ms of event-loop time; SubmissionDigester computes them on a worker thread instead,
+ * where posting the request costs a structured clone of a few milliseconds. The values are exactly the ones computed
+ * inline (submissionDigests), so stored fingerprints, item digests and blob keys are the same either way.
  */
 
 /**
@@ -61,7 +61,7 @@ parentPort.on("message", (message) => {
 
 /**
  * PUPPENCLAW_SUBMISSION_DIGESTS: `worker` (default) digests bulk submissions on the digest worker; `inline` digests
- * them on the event loop, as before. Either gives the same values. Any other value fails startup.
+ * them on the event loop. Either gives the same values. Any other value fails startup.
  */
 export function submissionDigestsInlineFromEnvironment(env: NodeJS.ProcessEnv = process.env): boolean {
   const raw = env.PUPPENCLAW_SUBMISSION_DIGESTS?.trim().toLowerCase() ?? "";
@@ -70,7 +70,7 @@ export function submissionDigestsInlineFromEnvironment(env: NodeJS.ProcessEnv = 
   throw new Error("PUPPENCLAW_SUBMISSION_DIGESTS must be worker or inline.");
 }
 
-/** A worker that fails this often stays off: submissions are then digested inline, as before. */
+/** A worker that fails this often stays off: submissions are then digested inline. */
 const MAX_WORKER_FAILURES = 3;
 type Pending = { resolve: (value: SubmissionDigests) => void; fallback: () => void };
 

@@ -63,7 +63,7 @@ const bundle = (overrides: Partial<InstrumentBundle> = {}): InstrumentBundle => 
 });
 const DIGEST = "e12996191d4e4ad18fe7f21921ff7a3b3f98889031dc5975fff31074c17b9a52";
 
-describe("P2 instrument mode", () => {
+describe("instrument mode", () => {
   it("takes the system prompt, output budget, sampling and schema from the installed bundle and sends the messages verbatim", async () => {
     const up = await upstream((_body, res) => reply(res, answer('{"labels":["T"]}')));
     const { runtime, socket } = await setup(up.url);
@@ -180,7 +180,7 @@ describe("P2 instrument mode", () => {
   });
 });
 
-describe("P2 receipts, retries and the pooled upstream", () => {
+describe("bulk receipts, retries and the pooled upstream", () => {
   it("gives every receipt a non-empty serverFingerprint and settingsSha256: bulk, retried, native and agent", async () => {
     let calls = 0;
     const up = await upstream((_body, res) => { calls += 1; if (calls === 2) reply(res, { error: { type: "bad_gateway" } }, 502); else reply(res, answer("ok", calls === 1 ? { system_fingerprint: "fp_qwen" } : {}), 200, { server: "uvicorn" }); });
@@ -300,7 +300,7 @@ describe("P2 receipts, retries and the pooled upstream", () => {
   });
 });
 
-describe("P2 receipt hooks", () => {
+describe("bulk receipt hooks", () => {
   it("delivers bulk receipt updates in batches, newest state per call, and flushes them before the parent turn closes", async () => {
     const up = await upstream((_body, res) => reply(res, answer("ok")));
     const { runtime, socket } = await setup(up.url);

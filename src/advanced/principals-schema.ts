@@ -6,7 +6,7 @@ import type { ModelProviderConfig } from "../shared/types.js";
 import type { AgentSubmit, BulkSubmit, RuntimeParticipant, UsageReceipt, WorkerConfig, WorkerJobHeader } from "./types.js";
 
 /**
- * pcp/2 run principals (plan P3, capability `principals:1`). coscila grants;
+ * pcp/2 run principals (capability `principals:1`). coscila grants;
  * the daemon enforces. A principal's authority is its grants, and the only way
  * to act as a principal is its own unix socket: no header, body field or
  * environment variable names a principal.
@@ -143,7 +143,7 @@ export type PrincipalHooks = {
   observeReceipt(receipt: UsageReceipt): void;
 };
 
-/** The instrument a job names (P2 stores it with the bulk request), if any. */
+/** The instrument a job names (stored with its bulk request), if any. */
 export function jobInstrumentDigest(job: Pick<WorkerJobHeader, "request"> & { instrumentDigest?: unknown }): string | undefined {
   const top = job.instrumentDigest;
   if (typeof top === "string" && top.length > 0) return top;
@@ -152,8 +152,8 @@ export function jobInstrumentDigest(job: Pick<WorkerJobHeader, "request"> & { in
 }
 
 /**
- * PUPPENCLAW_LEGACY_ATTEMPT_AUTHORITY: `on` (default) keeps today's chat-turn
- * bulk authority; `off` leaves bulk authority to principals only. Any other
+ * PUPPENCLAW_LEGACY_ATTEMPT_AUTHORITY: `on` (default) keeps the chat-turn bulk
+ * authority of approved execution turns; `off` leaves bulk authority to principals only. Any other
  * value fails startup, like the other broker settings.
  */
 export function legacyAttemptAuthorityFromEnvironment(env: NodeJS.ProcessEnv = process.env): boolean {

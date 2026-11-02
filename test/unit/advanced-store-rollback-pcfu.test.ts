@@ -21,8 +21,8 @@ import { SessionStore as SessionStore426d493 } from "../fixtures/legacy/session-
 import { createStoreAndRouter, createTempDir, makeConfig } from "../helpers.js";
 
 /**
- * Rollback safety of this version (brokerOutbox:2, worker policy, off-loop digests) against the daemon it replaces,
- * 426d493: nothing changed in any store schema. advanced.sqlite gains fields inside JSON only (job configs with worker
+ * Rollback safety of this version (brokerOutbox:2, worker policy, off-loop digests) against the store code of
+ * 426d493, a daemon with verbatim instruments but without these features: nothing changed in any store schema. advanced.sqlite gains fields inside JSON only (job configs with worker
  * policy fields, item results and outbox payloads with resumedFromJobId and the upstream's answer), which 426d493's
  * store code opens, reads and writes. state.json never holds a worker policy field: a session persists only the
  * workers without one, in the frozen shape 426d493's session store loads. principals.sqlite is untouched.
@@ -137,7 +137,7 @@ describe("rollback to 426d493: advanced.sqlite", () => {
     const root = join(dataDir, "advanced");
     const fresh = await AdvancedStore.open(root);
     fresh.close();
-    // The H4 daemon (no outbox) writes a resumed job and settles its item with a receipt that recorded an HTTP status.
+    // The daemon without an outbox (cea4c29) writes a resumed job and settles its item with a receipt that recorded an HTTP status.
     const h4 = await StoreCea4c29.open(root);
     h4.putJob({ ...legacyJob("resumed-job", { resumedFromJobId: "first-job" }) });
     h4.putReceipt(legacyReceipt("resumed-job"));

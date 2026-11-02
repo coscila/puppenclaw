@@ -91,7 +91,7 @@ import {
 } from "../shared/session-views.js";
 
 /**
- * Per-request opt-ins of the pcp/2 step-1 shapes (capability `compactStatus`).
+ * Per-request opt-ins of the pcp/2 compact shapes (capability `compactStatus`).
  * They change only the response, never the turn, so they are not part of the
  * keyed-turn fingerprint.
  */
@@ -175,10 +175,10 @@ export async function createDaemonServer(params: {
   // SECURITY: When config.daemonAuthToken is a non-empty string, every route
   // except GET /health and GET /capabilities requires
   // `Authorization: Bearer <token>` and replies 401 otherwise. When no token
-  // is configured the daemon is fully open (unchanged legacy behavior): it is
-  // then only safe on a loopback bind. Running with `--host 0.0.0.0` (or any
-  // non-loopback bind) WITHOUT a token is unsafe — POST /orchestrator/campaign
-  // can execute arbitrary shell commands.
+  // is configured the daemon is fully open: it is then only safe on a loopback
+  // bind. Running with `--host 0.0.0.0` (or any non-loopback bind) WITHOUT a
+  // token is unsafe — POST /orchestrator/campaign can execute arbitrary shell
+  // commands.
   const authToken = params.config.daemonAuthToken?.trim() ?? "";
   if (authToken.length > 0) {
     const expectedHeader = Buffer.from(`Bearer ${authToken}`, "utf8");
@@ -344,7 +344,7 @@ export async function createDaemonServer(params: {
           usageLedger!.appendMany(receipts.flatMap((receipt) => brokerLedgerEntry(receipt) ?? []));
         },
       });
-      // Run principals (P3) reattach before broker recovery, so recovered principal
+      // Run principals reattach before broker recovery, so recovered principal
       // work finds its participant; their sockets reopen at the same paths only after
       // recovery, so no job is submitted while recovery still requeues the running ones.
       principals = await PrincipalRegistry.open({
@@ -442,7 +442,7 @@ export async function createDaemonServer(params: {
   app.get("/capabilities", async () => ({
     ok: true,
     version: 1,
-    // workerPolicy (plan E4): worker capability profiles, pinned instruments and every evidence policy are accepted and
+    // workerPolicy: worker capability profiles, pinned instruments and every evidence policy are accepted and
     // enforced; coscila sends them only to a daemon that advertises it (off with PUPPENCLAW_WORKER_POLICY=off).
     advancedOrchestration: { version: 1, durableJobs: true, recordedTransport: true, namespaceRequired: true, workerJoinContinuation: true, incrementalResults: true, aggregateBulkConcurrency: true, nativeClaudeOAuthRefresh: 1, nativeClaudeSafetyClassifier: 1, ...(workerPolicy.enabled ? { workerPolicy: 1 } : {}) },
     sessionStart: true,
@@ -584,10 +584,10 @@ export async function createDaemonServer(params: {
   registerV2BrokerRoutes(app, { identity, advanced });
   registerV2PrincipalRoutes(app, { identity, principals, authenticated: authToken.length > 0 });
 
-  // Deploy idle check (plan H2): counts only, no names or identifiers. The ops
-  // CLI decides what blocks a deploy; the daemon only reports. Every count is
-  // measured now: restart survivors (fenced sessions, leftover runner groups)
-  // count only while their processes may still be alive. Fences that record
+  // Idle check for restarts and deploys: counts only, no names or identifiers.
+  // The caller decides what blocks a restart; the daemon only reports. Every
+  // count is measured now: restart survivors (fenced sessions, leftover runner
+  // groups) count only while their processes may still be alive. Fences that record
   // no process are reported apart: nothing to wait for, but their sessions
   // refuse new turns until they are stopped.
   app.get("/ops/idle", async () => {
@@ -921,7 +921,7 @@ export async function createDaemonServer(params: {
     }
   });
 
-  // Usage feed (plan H4): one cursor-paged call replaces one /cost call per session.
+  // Usage feed: one cursor-paged call instead of one /cost call per session.
   app.get("/usage/ledger", async (request, reply) => {
     const query = usageLedgerQueryZod.parse(request.query ?? {});
     let after = 0;

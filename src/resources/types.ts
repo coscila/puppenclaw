@@ -2,7 +2,7 @@ import { z } from "zod";
 
 // ---------------------------------------------------------------------------
 // Daemon API payloads. These field names are a frozen contract with the
-// oc-science-lab web app (it builds against `response.details`). Do not rename.
+// coscila web app (it builds against `response.details`). Do not rename.
 // ---------------------------------------------------------------------------
 
 /**

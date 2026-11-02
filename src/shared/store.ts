@@ -1432,7 +1432,7 @@ export class SessionStore {
    * once. Each caller resolves only after the write that contains its change.
    * If anything in a batch fails (a mutator throws, validation fails, or the
    * write fails), the batch is discarded and every mutation is retried alone,
-   * exactly as before group commit, so one bad mutation never affects another.
+   * so one bad mutation never affects another.
    * Mutators must therefore be pure functions of the state they are given.
    */
   private async mutate<T>(mutator: (state: StoredState) => T): Promise<T> {
