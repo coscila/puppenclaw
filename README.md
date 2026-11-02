@@ -2,13 +2,17 @@
 
 puppenclaw runs coding agents on behalf of other programs. It starts Claude Code and Codex sessions through the Agent
 Client Protocol (ACP), supervises their processes, persists every turn and serves all of it over a local HTTP API. A
-caller dispatches a turn, streams its output, survives a daemon restart and reads the outcome exactly once. The same
-code also loads as an [OpenClaw](https://github.com/openclaw/openclaw) plugin with project and campaign orchestration.
+caller can dispatch a turn under a key, so that it runs at most once, stream its output and read the recorded outcome
+again later; a keyed turn that a daemon restart cut off is reported as `TURN_INTERRUPTED_RESTART` and never runs a
+second time. The same code also loads as an [OpenClaw](https://github.com/openclaw/openclaw) plugin with project and
+campaign orchestration.
 
-For orchestrated research work, puppenclaw adds a model broker. The agent of a turn, and the worker jobs it launches,
-reach their models through a private Unix socket per turn. The broker holds provider API keys, meters every call and
+For orchestrated research work, puppenclaw adds a model broker. Each orchestrated turn gets a private Unix socket over
+which its agent submits worker jobs and, where the deployment routes them there, sends its own model calls and web
+requests. The broker calls providers with API keys from the daemon's environment, meters every call it makes and
 records a receipt for it, enforces capacity, egress and worker policies, and publishes settled jobs and receipts on an
-acknowledged event feed, from which the caller copies them into its own database.
+acknowledged event feed, from which the caller copies them into its own database. Routing an agent's own traffic into
+the socket is the job of the deployment's sandbox (see [What a deployment provides](#what-a-deployment-provides)).
 
 puppenclaw is the execution plane of the coscila laboratory record: coscila decides and records, puppenclaw executes and
 reports. puppenclaw does not depend on coscila; identifiers with the prefix `ocsl` (for example `ocsl_workflow_v1`)
@@ -17,14 +21,20 @@ come from that lab.
 What puppenclaw is not:
 
 - **Not a system of record.** It keeps in-flight state and the records a caller has not collected yet. Callers keep
-  their own copy of outcomes, usage and receipts; settled sessions are purged once they are older than
-  `sessionTtlMinutes` (by the plugin every minute, by the daemon on `POST /gc`).
+  their own copy of outcomes, usage and receipts. Failed and stopped sessions are purged once they have been idle for
+  longer than `sessionTtlMinutes` (by the plugin every minute, by the daemon on `POST /gc`); every other session stays
+  until a caller stops or purges it.
 - **Not a workflow engine.** It runs what it is asked to run and reports what happened. It never re-sends a dispatched
-  prompt on its own and never decides whether a turn should continue.
+  turn prompt and never starts a turn on its own. Its one continuation happens inside an orchestrated turn: when the
+  agent finishes while its worker jobs still run, the daemon waits for them and continues the same turn with a
+  notification that lists the settled jobs, so that the agent integrates their results. Bulk model calls of the broker
+  are retried when they fail transiently, and a run principal's unsettled items run again after a restart (see
+  [docs/broker.md](docs/broker.md#provider-pauses-and-retries)).
 - **Not a login manager.** It does not log in to Claude or Codex. The agents use their own credentials; provider API
   keys for broker-routed calls come from environment variables of the daemon.
-- **Not a sandbox.** It enforces socket permissions, egress rules and launcher checks, but process isolation comes from
-  the sandbox launcher a deployment installs. This repository ships none.
+- **Not a sandbox.** It sets socket permissions, applies egress rules to the traffic that reaches its broker socket and
+  checks the compute launcher, but process isolation, and routing an agent's traffic into the socket, come from the
+  sandbox a deployment installs. This repository ships none.
 - **Not a multi-tenant server.** One bearer token guards the whole API. Bind it to loopback.
 
 ## Contents
@@ -41,7 +51,8 @@ What puppenclaw is not:
 
 Reference documents: [configuration](docs/configuration.md), [HTTP API (v1)](docs/http-api.md),
 [pcp/2](docs/pcp2.md), [broker](docs/broker.md), [operations](docs/operations.md),
-[OpenClaw plugin](docs/openclaw-plugin.md).
+[OpenClaw plugin](docs/openclaw-plugin.md). They are part of the repository; the npm package includes this README but
+not `docs/`.
 
 ## Requirements
 
@@ -49,8 +60,9 @@ Reference documents: [configuration](docs/configuration.md), [HTTP API (v1)](doc
 - npm.
 - Linux. Process supervision, the boot reaper, resource sampling and compute jobs read `/proc`; compute jobs also need
   Bubblewrap (`bwrap`).
-- `acpx`, the ACP command-line launcher, and working ACP adapters for the agents you use, already logged in on the
-  host. Without `agentCommands`, acpx starts its own adapter for the `claude` or `codex` alias.
+- `acpx`, the ACP command-line client (npm package `acpx`), and working ACP adapters for the agents you use, such as
+  `@agentclientprotocol/claude-agent-acp` and `@zed-industries/codex-acp`, logged in on the host. Without
+  `agentCommands`, acpx starts its own adapter for the `claude` or `codex` alias.
 - The `codex` CLI for Codex sessions that run on a configured model provider (one `codex exec` per turn).
 - `openssl` on `PATH` for broker-routed Claude Code turns (the OAuth relay issues its own certificate).
 - OpenClaw `>=2026.3.0 <2027`, only for the plugin. The daemon never loads OpenClaw.
@@ -91,7 +103,9 @@ node dist/daemon/cli.js start --host 127.0.0.1 --port 18795 \
 
 Without options the daemon listens on `127.0.0.1:18795`, keeps its state in `.puppenclaw-daemon/puppenclaw` under the
 working directory and runs with the default configuration, which has no bearer token. The package installs the same
-entry point as the `puppenclaw-daemon` binary.
+entry point as the `puppenclaw-daemon` binary. The subcommand comes first: the first argument is always read as the
+command, and anything but `status` or `stop` in that place, `--help` included, starts the daemon; an option given
+before the subcommand is not applied.
 
 ```bash
 node dist/daemon/cli.js status                       # GET /health, open even with a token
@@ -104,7 +118,10 @@ Here `$TOKEN` holds the configured `daemonAuthToken`. `SIGTERM` or `SIGINT` also
 
 ### Run a first turn
 
+The session directory must exist before the first turn:
+
 ```bash
+mkdir -p /srv/agent-workspaces/demo
 curl -sS -X POST http://127.0.0.1:18795/session/start \
   -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
   -d '{"agent":"claude","name":"demo","directory":"/srv/agent-workspaces/demo",
@@ -144,8 +161,8 @@ One JSON object configures both the plugin and the daemon (`--config`). Unknown 
 | `defaultAgent` | `claude` | `claude` or `codex`. |
 | `permissionMode` | `approve-reads` | `approve-reads`, `approve-all` or `deny-all`. A turn may request another mode unless this is `deny-all`. |
 | `maxSessions` | `5` | Persistent agent runtimes admitted at once; idle, unfocused ones may be suspended to admit new work. |
-| `sessionTtlMinutes` | `60` | Completed, failed or stopped sessions idle for longer are purged by garbage collection. |
-| `streamOutput` | `true` | Capture streamed output while turns run. |
+| `sessionTtlMinutes` | `60` | Failed or stopped sessions idle for longer are purged by garbage collection; idle, waiting and suspended sessions are kept. |
+| `streamOutput` | `true` | Accepted and reported in `GET /capabilities`; output is captured and streamed whatever its value. |
 | `acpxCommand` | `acpx` | The ACP launcher. |
 | `agentCommands.claude`, `agentCommands.codex` | unset | Raw ACP adapter commands, passed to acpx as `--agent`. `agentCommands.codex` is also the launcher of the `codex` CLI for provider sessions (default `codex`). |
 | `codexCommand` | unset | Optional launcher that wraps provider Codex turns as `<codexCommand> --cwd <dir> -- <codex launcher> exec …`. |
@@ -178,8 +195,10 @@ Requests and responses are JSON (turn streams use server-sent events, compute lo
 requires `Authorization: Bearer <token>` and answers `401 {"ok":false,"error":"unauthorized"}` otherwise. Every
 response carries the identity headers `x-puppenclaw-protocol: 2.0`, `x-puppenclaw-boot-id` (new on every start) and
 `x-puppenclaw-spool-id` (changes only when the persisted in-flight state is replaced). Most errors answer
-`{"ok": false, "code": "...", "error": "...", "details"?: {...}}` with a status that follows the code: 400 for invalid
-input, 404 for an unknown session, 409 for conflicts, 503 when the daemon cannot serve the request now.
+`{"ok": false, "code": "...", "error": "...", "details"?: {...}}` with a status set by the code: 400 for invalid input,
+404 for an unknown session, 409 for conflicts, 503 when the daemon cannot serve the request now. A code without an
+assigned status answers 500, `UNSUPPORTED_REASONING_MODE` and a malformed JSON body among them; the status table and
+its exceptions are in [docs/http-api.md](docs/http-api.md#conventions).
 
 ### Version 1 routes
 
@@ -209,7 +228,8 @@ feature before it sends a field that older daemons would refuse.
 
 pcp/2 is protocol version 2.0 of the daemon. It keeps the version 1 routes and adds an identity envelope, cheap
 authenticated health, keyed turns with compact results, and the broker's feed, instruments and principals. Every v2
-response body carries `{protocol, bootId, spoolId}`, and all v2 routes require the bearer token whenever one is set.
+response body carries `{protocol, bootId, spoolId}`, except the `401` of the bearer check, and all v2 routes require
+the bearer token whenever one is set.
 
 | Feature (`/v2/capabilities`) | What it provides |
 | --- | --- |
@@ -219,7 +239,7 @@ response body carries `{protocol, bootId, spoolId}`, and all v2 routes require t
 | `eventFeed`, `brokerOutbox` (level 2) | `GET /v2/events` and `POST /v2/events/ack`: the broker's job and receipt events in sequence order, served after they are on disk, never pruned before they are acknowledged. |
 | `instrumentMode`, `instrumentVerbatim` | `PUT /v2/instruments/{digest}` and `GET /v2/instruments`: allow-listed measurement bundles that fix prompt, schema and sampling; verbatim bundles send the caller's messages byte for byte. |
 | `principals` | `PUT`, `GET` and `DELETE /v2/principals/{id}`: bulk authority with grants and budgets, exercised only through the principal's own Unix socket. Needs a bearer token. |
-| `bulkCapacity` | The bulk limits, deadline and retries the broker applies, as numbers only. |
+| `bulkCapacity` | The bulk limits per provider and capacity group, the deadline and the retries the broker applies; never an endpoint or a credential variable. |
 | `workerPolicy` | Capability profiles, evidence policies and pinned instruments per worker, enforced at admission. |
 
 **Keyed turns.** A `turnKey` (1–128 characters of `A-Za-z0-9._:-`) on `POST /session/start` or
@@ -229,9 +249,10 @@ result; the same key with a different request is refused with `409 TURN_KEY_CONF
 the daemon stopped is never launched again: once the turn's process is proven gone, the key replays the error
 `TURN_INTERRUPTED_RESTART`; while it may still run, a repeat answers `409 TURN_REPLAY_UNAVAILABLE`. A session refuses a
 new key while a keyed turn is unsettled. Each session keeps the results of its last 64 keyed turns and up to 4,096
-keys; beyond that a new key is refused until the session is purged. With `"resultView": "turn"` the result carries only
-this turn's output and a compact session snapshot instead of the transcript. A keyed turn's stream carries no live
-output unless the request sets `"keyedStreaming": true`.
+keys; beyond that a new key is refused until the session is purged. A keyed turn's result, on the first answer and on
+every replay, carries this turn's output and a compact session snapshot, never the transcript; `"resultView": "turn"`
+gives unkeyed results the same compact shape and adds `protocol`, `bootId` and `spoolId`. A keyed turn's stream
+carries no live output unless the request sets `"keyedStreaming": true`.
 
 Health, capabilities, the event feed, instruments, principals and bulk capacity are specified in
 [docs/pcp2.md](docs/pcp2.md).
@@ -254,13 +275,19 @@ agent (`claude` or `codex`) and the model provider it runs on. Such a turn needs
 - call its own model through the recorded transport (`/native/...`) and reach public web hosts through the socket's
   HTTP proxy and `CONNECT` tunnels.
 
-For API-key providers the broker holds the key: an agent sees a placeholder in its provider's credential variable, and
-the broker adds the real key to each upstream call. Every model call gets a receipt with token usage, the model the
-upstream named, its fingerprint and digests of the request settings, which reaches the session's statistics and usage
-ledger. Each settled bulk item and each job state change is written, in the same transaction, to an outbox that callers
-read as the pcp/2 event feed. Rate limits and authentication failures pause the provider for the turn; bulk calls that
-fail transiently (502, 503, 504, timeouts, connection resets) are retried with backoff. A provider-wide limiter shares
-bulk capacity across jobs and sessions, and providers that address the same backend can share one capacity group.
+The broker reads API keys from the daemon's environment (the provider's `authTokenEnv`) and adds them to the upstream
+calls it makes. In the environment of an orchestrated turn's agent, and of each agent job, the daemon replaces only that
+process's own provider key variable with a placeholder (not for `claude-code` providers, which use Claude Code's own
+login). Every other variable of the daemon's environment, the keys of worker and run principal providers included,
+reaches the agent unchanged unless the deployment removes it (see [Security model](#security-model)).
+
+Every model call that passes through the broker gets a receipt with token usage, the model the upstream named, its
+fingerprint and digests of the request settings, which reaches the session's statistics and usage ledger. Each settled
+bulk item and each job state change is written, in the same transaction, to an outbox that callers read as the pcp/2
+event feed. Rate limits and authentication failures pause the provider for the turn; bulk calls that fail transiently
+(502, 503, 504, timeouts, connection resets) are retried with backoff, each attempt a new provider request. A
+provider-wide limiter shares bulk capacity across jobs and sessions, and providers that address the same backend can
+share one capacity group.
 
 **Run principals** carry bulk authority independent of a chat turn, for example for a study run: the caller grants
 providers, instruments, concurrency, an item cap, a token budget and an expiry, and the daemon opens a socket that only
@@ -270,31 +297,62 @@ pinned instruments or on-premises providers.
 Socket routes, job states, receipts and their provenance fields, paging, retries, capacity groups, worker policies and
 the broker store are described in [docs/broker.md](docs/broker.md).
 
+### What a deployment provides
+
+The daemon opens the socket and sets the variables listed in
+[docs/configuration.md](docs/configuration.md#variables-the-daemon-sets-for-child-processes); it does not change how
+an agent reaches the network. Jobs submitted over the socket always run through the broker. An agent's own model calls
+and web requests reach the broker only where the deployment sends them there, typically from a sandbox whose only way
+out is the socket:
+
+- the agent's model base URL points at the socket's `/native` path, through a bridge from TCP to the Unix socket for
+  agents that cannot use a socket directly;
+- its HTTP and HTTPS proxy is the socket (absolute `http://` requests and `CONNECT` tunnels);
+- Claude Code trusts the certificate in `PUPPENCLAW_ORCHESTRATION_CLAUDE_OAUTH_CERT`, so that its token refresh passes
+  through the relay;
+- the provider key variables that the agent must not hold are removed from its environment;
+- the agent can neither read the daemon's configuration file, which holds the bearer token, or its data directory, nor
+  reach the daemon's HTTP port.
+
+Without this wiring an agent calls its provider and the web directly, as the daemon's user, and those calls get no
+receipt, metering, egress check or relay. This repository ships no bridge and no sandbox.
+
 ## Security model
 
 **Authentication.** Set `daemonAuthToken` for every deployment. The token is compared in constant time; only
 `GET /health` and `GET /capabilities` stay open. Without a token the daemon accepts every request from anyone who can
-reach the port, and `POST /orchestrator/campaign` can run shell commands, so an unauthenticated daemon is only safe on a
-loopback address. Routes that grant authority or erase data refuse to work without a token at all: run principals,
-account cleanup (and `ownerKey` on a turn) and statistics erasure answer `DAEMON_AUTH_REQUIRED`.
+reach the port, session purge, garbage collection and recovery reset included, and `POST /orchestrator/campaign` can
+run shell commands, so an unauthenticated daemon is only safe on a loopback address, where every local process can
+still call it. Three groups of routes refuse to work without a token at all: run principals, account cleanup (and
+`ownerKey` on a turn) and statistics erasure answer `DAEMON_AUTH_REQUIRED`.
 
 **Sandbox boundary.** puppenclaw does not isolate processes itself; a deployment runs the agents in its own sandbox.
-The daemon keeps what a sandbox must not reach outside it:
+Agents, codex launchers and compute launchers run as the daemon's user, so without a sandbox an agent can read the
+configuration file with the bearer token and the data directory, and call the daemon's API. The daemon keeps what a
+sandbox must not reach outside it:
 
 - Broker sockets: one per turn in a `0700` directory under `/tmp` (`ocsl-model-broker-<uid>-<hash>`), principal sockets
   in `0700` directories under `<data-dir>/principals/`, each socket `0600`. All processes of one user can open them, so
   they separate sandboxes, which must not mount these paths, not unsandboxed processes of the same user.
-- Credentials: provider API keys stay in the daemon's environment; turns see placeholders. The Claude OAuth relay
-  forwards only Claude Code's own token refresh to `platform.claude.com` and keeps no credential, and native Claude
-  calls with an API key are refused.
-- Egress: the socket proxy allows public web hosts on ports 80 and 443 only. Known model API hosts, every configured
-  provider endpoint and private, loopback and link-local addresses are refused (`EGRESS_DENIED`); the broker resolves
-  DNS itself and pins the address, and a TLS server name must match the tunnel's authority.
+- Credentials: agent processes inherit the daemon's environment, from which the broker reads provider keys. The daemon
+  replaces only an orchestrated process's own provider key variable with a placeholder, and a turn without
+  orchestration gets the environment unchanged; every other key reaches the agents unless the deployment's launcher (an
+  `acpxCommand` or `codexCommand` wrapper, or its sandbox) removes it. The Claude OAuth relay forwards only Claude
+  Code's own token refresh to `platform.claude.com` and keeps no credential, and native Claude calls with an API key are
+  refused.
+- Egress, for traffic sent to the socket: the proxy allows public web hosts on ports 80 and 443 only. It refuses
+  (`EGRESS_DENIED`) IP literals, `localhost`, `.local` and `.internal` names, private, loopback and link-local
+  addresses, the known model API hosts, the endpoints of the providers that orchestrated turns and their workers name
+  (from the first such turn until the daemon stops), daemon environment variables named like model endpoints and the
+  direct upstreams ([docs/broker.md](docs/broker.md#egress)). A provider configured only for run principals is not on
+  that list. The broker resolves DNS itself and pins the address, and a TLS server name must match the tunnel's
+  authority.
 - Compute jobs run only through a launcher and Bubblewrap policy named by `PUPPENCLAW_COMPUTE_SANDBOX_WRAPPER` and
-  `LAB_SANDBOX_CONFIG`. Both must be absolute, owned by the daemon user, not writable by group or others, not symlinks
-  and outside every workspace root; the launcher must answer the `ocsl-compute-sandbox-v1` handshake. A job's
-  environment travels on a separate file descriptor and can never select the launcher, its policy or host mounts.
-  A lab installs its own launcher; this repository ships none.
+  `LAB_SANDBOX_CONFIG`. Both are absolute paths of regular files, not symlinks, outside every workspace root; the files
+  and their parent directories must be owned by the daemon user and not writable by group or others. The launcher must
+  answer the `ocsl-compute-sandbox-v1` handshake. A job's environment travels on a separate file descriptor and can
+  never select the launcher, its policy or host mounts. A lab installs its own launcher; this repository ships none.
+  The interface a launcher implements is described in [docs/operations.md](docs/operations.md#compute-launcher).
 
 **What the daemon never does:**
 
@@ -302,9 +360,11 @@ The daemon keeps what a sandbox must not reach outside it:
   requests and keeps only an in-memory digest to recognise a renewed token;
 - put a provider credential into a receipt, feed event or turn diagnostic; error texts are redacted before they leave
   the daemon;
-- re-send a dispatched prompt by itself, or relaunch a keyed turn that was running when it stopped;
+- re-send a dispatched turn prompt by itself, or relaunch a keyed turn that was running when it stopped (bulk model
+  calls are retried and resumed as [docs/broker.md](docs/broker.md#provider-pauses-and-retries) describes);
 - prune a feed event before it is acknowledged, or erase a broker job's records ahead of the feed;
-- signal a leftover process group it cannot prove it started (pid, start time and kernel boot id must match);
+- signal a leftover process group it cannot prove it started (pid and start time must match, and the kernel boot id
+  too when the record carries one);
 - accept a principal identity from a header, body field or environment variable: the principal's socket is its
   identity;
 - run a verbatim instrument for anything but a run principal granted that instrument.

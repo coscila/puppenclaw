@@ -1,8 +1,9 @@
 # Advanced orchestration and the broker
 
-A turn can launch worker jobs and route all model traffic through puppenclaw's broker. The broker meters and receipts
-every call, holds API keys, enforces capacity, egress and worker policies, and reports settled work on the pcp/2 event
-feed ([pcp2.md](pcp2.md#event-feed)). Run principals ([pcp2.md](pcp2.md#run-principals)) use the same broker without a
+A turn can launch worker jobs and route its model traffic through puppenclaw's broker. The broker meters and receipts
+every call that passes through it, adds API keys from the daemon's environment to the upstream calls it makes, enforces
+capacity, egress and worker policies, and reports settled work on the pcp/2 event feed
+([pcp2.md](pcp2.md#event-feed)). Run principals ([pcp2.md](pcp2.md#run-principals)) use the same broker without a
 chat turn.
 
 ## Orchestrated turns
@@ -27,6 +28,12 @@ For the turn, the daemon opens a Unix socket (`0600`, in a `0700` directory `/tm
 starts the agent with `PUPPENCLAW_ORCHESTRATION_SOCKET`, `PUPPENCLAW_ORCHESTRATION_NATIVE_BASE_PATH` (`/native`) and
 `PUPPENCLAW_ORCHESTRATION_ATTEMPT_ID`. Once the attempt has ended, the socket refuses work with
 `ORCHESTRATION_TURN_CLOSED`.
+
+The daemon only opens the socket and sets these variables. An agent's own model calls and web requests reach the
+broker only where the deployment points them at the socket
+([What a deployment provides](../README.md#what-a-deployment-provides)). The agent inherits the daemon's environment;
+for providers other than `claude-code`, only the variable named by its own provider's `authTokenEnv` holds a
+placeholder instead of the key.
 
 When the agent finishes while its worker jobs are still running, the daemon waits for them and continues the same turn
 with a lifecycle notification that lists the settled jobs, so the agent integrates their results before the turn ends.
@@ -98,11 +105,21 @@ reach the real endpoint through the socket, verified by a certificate the relay 
 
 Absolute `http://` requests and `CONNECT` tunnels reach public web hosts on ports 80 and 443. The broker resolves DNS
 itself, follows CNAMEs, pins the address it connects to, and refuses (`EGRESS_DENIED`) IP literals, `localhost`,
-`.local` and `.internal` names, private, loopback, link-local and other non-public addresses, and every model endpoint:
-the known API hosts, the providers of the turn and its workers, variables of the daemon environment whose names look
-like model endpoints, and the direct upstreams. A TLS tunnel must present a ClientHello whose server name matches the
-`CONNECT` authority; encrypted ClientHellos are refused. The egress proxy can tell hosts apart but cannot read TLS
-contents.
+`.local` and `.internal` names, private, loopback, link-local and other non-public addresses, and every host on its
+deny list, also when reached through a CNAME or a shared address:
+
+- the known API hosts `api.anthropic.com`, `platform.claude.com`, `api.openai.com`, `chatgpt.com` and
+  `api.langdock.com`;
+- the base URL of each orchestrated turn's provider (`https://api.anthropic.com` when it has none) and of its
+  workers' providers;
+- the values of daemon environment variables whose names contain `LANGDOCK`, `QWEN`, `PAIS`, `ANTHROPIC` or `OPENAI`
+  and end in `BASE_URL`, `API_URL` or `ENDPOINT`;
+- the direct upstreams.
+
+Provider hosts join the list when the first orchestrated turn that names them is admitted and stay on it until the
+daemon stops. A provider configured only in `PUPPENCLAW_MODEL_PROVIDERS`, for run principals, is not on the list. A TLS
+tunnel must present a ClientHello whose server name matches the `CONNECT` authority; encrypted ClientHellos are
+refused. The egress proxy can tell hosts apart but cannot read TLS contents.
 
 ## Provider pauses and retries
 

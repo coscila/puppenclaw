@@ -8,7 +8,8 @@ is set; none of them is open like `GET /health`.
 ## Identity
 
 Every HTTP response, version 1 included, carries three headers, and every `/v2/*` body carries the same values as
-`{protocol: {major: 2, minor: 0}, bootId, spoolId}`:
+`{protocol: {major: 2, minor: 0}, bootId, spoolId}`. The one exception is the `401 {"ok": false, "error":
+"unauthorized"}` of the bearer check, which answers before any route and carries the headers only.
 
 | Header | Meaning |
 | --- | --- |
@@ -54,7 +55,7 @@ under 1 KB:
 | `workerPolicy` | 1 | Worker policies are accepted and enforced (absent with `PUPPENCLAW_WORKER_POLICY=off`). |
 | `bulkCapacity` | 1 | The `bulkCapacity` object below. |
 | `principals` | 1 | Run principals; advertised only when a bearer token is configured. |
-| `legacyAttemptAuthority` | 1 | Chat turns still carry bulk authority (`PUPPENCLAW_LEGACY_ATTEMPT_AUTHORITY=on`). |
+| `legacyAttemptAuthority` | 1 | Chat turns carry bulk authority (`PUPPENCLAW_LEGACY_ATTEMPT_AUTHORITY=on`). |
 
 `limits` holds `turnKeyMax` (128), `ledgerPageMax` (1000), `transcriptLimitMax` (1000), `transcriptPageMax` (500),
 `sseMaxPendingBytes`, `eventPageMax` (1000), `eventWaitMsMax` (25000) and `eventInlineOutputMax` (16384).
@@ -285,9 +286,15 @@ characters of `A-Za-z0-9._:-`.
 
 - `PUT /v2/principals/{id}` with `{kind, runId, ownerKey, grants: {providers, instruments, maxConcurrency, maxItems,
   tokenBudget: {input, output}, expiresAt}, socket}` returns `{principalId, kind, runId, grants, socketPath, createdAt,
-  updatedAt}`. The same body returns the same result. Changed grants or a changed `socket` take effect at once and are
-  audited. `kind`, `runId` and `ownerKey` never change (409 `PRINCIPAL_CONFLICT`), and a revoked id stays revoked (409
-  `PRINCIPAL_REVOKED`). No response contains `ownerKey`.
+  updatedAt}`. `kind`, `ownerKey` (16–128 characters), `grants.providers` (up to 64) and `grants.maxConcurrency`
+  (1–100,000) are required, and `runId` is required for `kind: "run"` and absent for `"human"`. The others default to
+  no limit (`maxItems`, `tokenBudget` and its two fields, `expiresAt`: null), no instruments and `socket: false`. With
+  `socket: true` the data directory path must leave room for a Unix socket path (`<data-dir>/principals/<16 hex
+  characters>/broker.sock` within 107 bytes, so a data directory of at most 67 bytes); otherwise the PUT answers 503
+  `PRINCIPAL_SOCKET_UNAVAILABLE`. An invalid body answers 400 `INVALID_PRINCIPAL`. The same body returns the same
+  result. Changed grants or a changed `socket` take effect at once and are audited. `kind`, `runId` and `ownerKey`
+  never change (409 `PRINCIPAL_CONFLICT`), and a revoked id stays revoked (409 `PRINCIPAL_REVOKED`). No response
+  contains `ownerKey`.
 - `GET /v2/principals/{id}` adds `state` (`active`, `expired`, `revoked`), `revokedAt`, `revision`, `usage` (admitted
   `items`, settled `inputTokens` and `outputTokens`, `activeItems`, `remaining`), `providersUnavailable` and the last 50
   audit entries.

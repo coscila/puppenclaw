@@ -7,7 +7,7 @@ specific to one deployment: providers, broker limits, maintenance and the comput
 
 ## Configuration object
 
-Every level is strict: an unknown key fails validation.
+Every level is strict, so an unknown key fails validation; only the entries of `mcpServers` keep any field.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
@@ -17,8 +17,8 @@ Every level is strict: an unknown key fails validation.
 | `defaultAgent` | `claude` or `codex` | `claude` | Agent of sessions that name none. |
 | `maxSessions` | positive integer | `5` | Persistent agent runtimes admitted at once. Idle, unfocused runtimes may be suspended to admit new work; retained history and one-shot Codex sessions do not count. When every slot is active or focused, a new runtime is refused with `MAX_SESSIONS_REACHED`. |
 | `permissionMode` | `approve-reads`, `approve-all`, `deny-all` | `approve-reads` | Permission policy of agent tools. A turn may request another mode unless this is `deny-all`. |
-| `sessionTtlMinutes` | 1–1440 | `60` | Garbage collection purges completed, failed or stopped sessions idle for longer than this (the plugin every minute, the daemon on `POST /gc`). Sessions with a running turn are never collected. |
-| `streamOutput` | boolean | `true` | Capture streamed output while turns run. |
+| `sessionTtlMinutes` | 1–1440 | `60` | Garbage collection purges failed and stopped sessions idle for longer than this (the plugin every minute, the daemon on `POST /gc`). Idle, waiting and suspended sessions are never collected, nor is a session with a running turn. |
+| `streamOutput` | boolean | `true` | Accepted and reported as `streamOutput` in `GET /capabilities` and in site status; output capture and streaming do not depend on it. |
 | `resourceSamplingIntervalMs` | 5000–600000 | `30000` | Interval of the daemon's `/proc` resource samples. |
 | `resourceRetentionDays` | 1–90 | `7` | Days of resource history kept in `resources/resources.sqlite`. |
 | `acpxCommand` | string | `acpx` | The ACP launcher. |
@@ -31,7 +31,7 @@ Every level is strict: an unknown key fails validation.
 | `remoteControl.purePipe.enabled` | boolean | `false` | Allow deterministic `/puppenclaw` control from remote `oc2oc` conversations that were bound and exposed (see [the plugin guide](openclaw-plugin.md#oc2oc-remote-control)). |
 | `remoteControl.mediated.enabled`, `remoteControl.purePipe.allowFrom`, `remoteControl.purePipe.allowedAgents`, `remoteControl.requireConversationBinding` | | `true`, `[]`, `[]`, `true` | Accepted by the schema; the current code does not read them. Agents and verbs are exposed per binding with `/puppenclaw expose`, and pure-pipe control always requires a bound conversation. |
 | `orchestration.enabled` | boolean | `true` | Enable projects and campaigns. |
-| `orchestration.maxCampaigns` | 1–500 | `32` | Campaigns that may be active (`draft`, `running`, `waiting_approval`) at once. |
+| `orchestration.maxCampaigns` | 1–500 | `32` | Campaigns that may be active (`draft`, `running`, `waiting_approval`, `cancelling`, `recovery_required`) at once. |
 | `orchestration.artifactRetentionHours` | 1–8760 | `336` | Artifacts of finished campaigns older than this are pruned when the runtime is used; artifacts of running or waiting campaigns are kept. |
 | `orchestration.allowLocalCommandExecution` | boolean | `true` | Allow `command` steps and the built-in evaluation and experiment commands. |
 | `orchestration.defaultProjectRoot` | string | unset | Base directory for relative project `rootDir` values; also a workspace root for compute jobs. |
@@ -51,9 +51,11 @@ caller -> puppenclaw -> acpx -> claude-agent-acp or codex-acp
 ```
 
 `acpxCommand` is the launcher; `agentCommands` only replaces the adapter that acpx starts. The adapters run with the
-daemon's (or the OpenClaw gateway's) `HOME`, `PATH` and credentials. Run puppenclaw under a dedicated `HOME` that
-holds the agents' logins, or wrap an adapter command with `env HOME=… ` when it should use another account. Before
-blaming puppenclaw for a failing agent, run the same acpx command by hand with the same `HOME` and working directory;
+daemon's (or the OpenClaw gateway's) `HOME`, `PATH` and credentials: every agent process, and every codex launcher,
+inherits the daemon's whole environment plus the variables
+[listed below](#variables-the-daemon-sets-for-child-processes). Run puppenclaw under a dedicated `HOME` that holds the
+agents' logins, or wrap an adapter command with `env HOME=… ` when it should use another account. Before blaming
+puppenclaw for a failing agent, run the same acpx command by hand with the same `HOME` and working directory;
 [the plugin guide](openclaw-plugin.md#acp-verification) lists the commands.
 
 A Codex session with a `modelProvider` runs `codex exec --json` once per turn instead (through `codexCommand` when
@@ -62,7 +64,9 @@ with `--dangerously-bypass-approvals-and-sandbox`, which a deployment must confi
 deny-all flag: `deny-all` uses the read-only sandbox and adds an instruction not to use tools, which is a safeguard,
 not a hard boundary. The turn process receives the provider's settings as `PUPPENCLAW_MODEL_PROVIDER_*` variables
 ([below](#variables-the-daemon-sets-for-child-processes)), so the codex launcher can be a wrapper that configures Codex
-for that provider; this repository ships no such wrapper.
+for that provider; this repository ships no such wrapper. Codex writes its final message to a file under
+`.puppenclaw/tmp/` in the session directory, which the daemon reads and deletes when the turn ends; the directory itself
+stays.
 
 ### Model providers
 
@@ -155,7 +159,7 @@ Settings marked *fails startup* stop the daemon when their value is invalid; the
 | --- | --- |
 | Turns of a session with a model provider | `PUPPENCLAW_MODEL_PROVIDER_ID`, `_MODEL`, `_LABEL`, `_KIND`, `_BASE_URL`, `_AUTH_TOKEN_ENV`, `_WIRE_API`, `_REASONING_PROFILE`, and with a subagent policy `_SUBAGENT_MODEL`, `_SUBAGENT_EFFORT`, `_SUBAGENT_MAX_THREADS`, `_REASONING_EFFORT` |
 | Provider Codex turns | `PUPPENCLAW_CODEX_TURN_POLICY` (`default`, `plan-no-tools`, `plan-read-tools`, `execute-tools`, `deny-all-no-tools`), derived from the turn's interaction and permission mode only, and `PUPPENCLAW_DIRECT_CODEX_AGENT_COMMAND` |
-| Orchestrated turns and agent jobs | `PUPPENCLAW_ORCHESTRATION_SOCKET`, `PUPPENCLAW_ORCHESTRATION_NATIVE_BASE_PATH` (`/native`), `PUPPENCLAW_ORCHESTRATION_ATTEMPT_ID`, `PUPPENCLAW_ORCHESTRATION_JOB_ID` (agent jobs), for Claude Code `PUPPENCLAW_ORCHESTRATION_CLAUDE_OAUTH_CERT` and `ANTHROPIC_DEFAULT_HAIKU_MODEL`, for API-key providers the provider's `authTokenEnv` set to a placeholder |
+| Orchestrated turns and agent jobs | `PUPPENCLAW_ORCHESTRATION_SOCKET`, `PUPPENCLAW_ORCHESTRATION_NATIVE_BASE_PATH` (`/native`), `PUPPENCLAW_ORCHESTRATION_ATTEMPT_ID`, `PUPPENCLAW_ORCHESTRATION_JOB_ID` (agent jobs), for Claude Code `PUPPENCLAW_ORCHESTRATION_CLAUDE_OAUTH_CERT` and `ANTHROPIC_DEFAULT_HAIKU_MODEL`, for other providers that process's own provider `authTokenEnv` set to a placeholder; every other variable of the daemon environment, other providers' keys included, passes through |
 | Campaign `research` commands | `PUPPENCLAW_PROJECT_ID`, `PUPPENCLAW_PROJECT_NAME`, `PUPPENCLAW_PROJECT_ROOT`, `PUPPENCLAW_CAMPAIGN_ID`, `PUPPENCLAW_CAMPAIGN_NAME`, `PUPPENCLAW_STEP_ID`, `PUPPENCLAW_STEP_TITLE`, `PUPPENCLAW_TASK` |
 | Compute launcher | `LAB_SANDBOX_CONFIG`, and for a job that names a principal `PUPPENCLAW_PRINCIPAL_ID`, `PUPPENCLAW_PRINCIPAL_SOCKET_DIR`, `PUPPENCLAW_PRINCIPAL_SOCKET`; the job's own environment arrives on file descriptor 3 |
 

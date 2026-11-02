@@ -77,7 +77,9 @@ dedicated `HOME` that holds the agents' logins, or wrap an adapter command, for 
 `puppenclaw.reassessmentStart`, `puppenclaw.reassessmentStatus`, `puppenclaw.reassessmentReport`,
 `puppenclaw.usageCost`.
 
-Tools cannot set the daemon-only fields `lifecycleEpoch` and `statisticsContext`.
+The session tools and the `start` and `send` commands cannot set `permissionMode`, `interactionMode`, `ownerKey`,
+`turnKey`, `lifecycleEpoch` or `statisticsContext`, and a send cannot set `modelProvider` or `modelProviderId`; those
+fields belong to the daemon API.
 
 ## Local orchestration, step by step
 
@@ -124,8 +126,8 @@ Tools cannot set the daemon-only fields `lifecycleEpoch` and `statisticsContext`
 A `research` command receives the step prompt on stdin, must print the dossier on stdout and sees
 `PUPPENCLAW_PROJECT_ID`, `PUPPENCLAW_PROJECT_NAME`, `PUPPENCLAW_PROJECT_ROOT`, `PUPPENCLAW_CAMPAIGN_ID`,
 `PUPPENCLAW_CAMPAIGN_NAME`, `PUPPENCLAW_STEP_ID`, `PUPPENCLAW_STEP_TITLE` and `PUPPENCLAW_TASK`. `command` steps and the
-evaluation and experiment commands need `orchestration.allowLocalCommandExecution` (or a worker registered with
-`executors: ["acp", "command"]`).
+evaluation and experiment commands need `orchestration.allowLocalCommandExecution` and a worker whose `executors`
+include `command` (the built-in worker has it while that option is on).
 
 ### puppenfusion
 
@@ -200,8 +202,8 @@ target node; there is no typed puppenclaw transport inside `oc2oc` beyond these 
 | `Project root does not exist` | `orchestration.defaultProjectRoot`, and whether `rootDir` was meant to be absolute or relative. |
 | `Worker ... is not allowed to operate on ...` | The worker's `projectRoots`; register it again with the right roots. |
 | `Worker ... does not support command execution` | Enable `orchestration.allowLocalCommandExecution`, register the worker with `executors: ["acp", "command"]`, or use a campaign without command steps. |
-| `Puppenclaw daemon is unreachable` | Start the daemon, check `daemonUrl`, run `node dist/daemon/cli.js status --host … --port …`. |
-| `spawn acpx ENOENT` | acpx is not installed or `acpxCommand` is wrong. |
+| `Orchestrator daemon is unreachable at <url>` | Start the daemon, check `daemonUrl`, run `node dist/daemon/cli.js status --host … --port …`. |
+| `spawn acpx ENOENT` | acpx is not installed, `acpxCommand` is wrong, or the session directory does not exist. |
 | `Authentication required` | The adapter sees no valid login in the gateway's `HOME`; log in there or wrap the adapter with `env HOME=…`. |
 | `acpx exited with code 4` | Run the same acpx command by hand with the gateway's `HOME` and working directory; it is an adapter error until that works. |
 | `No acpx session found` | The ACP session was never created, or is not visible from the current `HOME`. |

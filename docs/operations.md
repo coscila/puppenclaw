@@ -114,7 +114,7 @@ marked with a study reference, jobs from an earlier layout and jobs with unackno
 | --- | --- |
 | Feed events | Kept; `PUPPENCLAW_EVENT_RETENTION_DAYS` (7–36500) deletes acknowledged events older than that, hourly. Unacknowledged events are never deleted. |
 | Broker jobs | Kept until the session or owner is purged, or archived (see above). |
-| Sessions | Purged by garbage collection after `sessionTtlMinutes` once completed, failed or stopped; purge removes transcript, diagnostics and broker jobs. |
+| Sessions | Failed and stopped sessions are purged by garbage collection once idle for longer than `sessionTtlMinutes`; idle, waiting and suspended sessions stay until they are stopped or purged. A purge removes transcript, diagnostics and broker jobs. |
 | Keyed-turn receipts | 64 outcomes and 4,096 keys per session, until the session is purged. |
 | Usage ledger | Never deleted. |
 | Statistics | Kept through session purge and garbage collection; removed by `POST /statistics/chats/:chatId/purge`. |
@@ -134,6 +134,35 @@ periodically and bounded as listed above. A failure to write diagnostics never i
 `GET /ops/idle` reports counts only and measures each at request time; it is the check for a safe restart.
 `GET /v2/health` is the cheap liveness probe (event-loop lag, backlog, memory); `GET /health` is the open probe used by
 `puppenclaw-daemon status`. `GET /resources` and `GET /resources/history` show host and per-session resource use.
+
+## Compute launcher
+
+Compute jobs (`POST /compute/jobs`, executor `bubblewrap-local`) run only through a launcher that the deployment
+provides; this repository ships none. `PUPPENCLAW_COMPUTE_SANDBOX_WRAPPER` names the launcher, a Node script that the
+daemon runs with its own Node, and `LAB_SANDBOX_CONFIG` names its policy.
+
+- **Files.** Both are absolute paths of regular files that are their own real paths (no symlinks), owned by the daemon
+  user and not writable by group or others. Their parent directories must be owned by the daemon user and not writable
+  by group or others either, and neither file may lie inside a workspace root of the policy.
+- **Policy.** A JSON object, optionally under a `sandbox` key, with `mode: "bubblewrap"`, an absolute `workspaceRoot` and
+  optionally `legacyWorkspaceRoots`, a list of further absolute workspace roots.
+- **Handshake.** When the daemon reports capacity and before it accepts a job, it runs
+  `node <launcher> --compute-protocol` with a 3 s timeout; the launcher must exit with 0 and print
+  `ocsl-compute-sandbox-v1`. `bubblewrap-local` is also available only when `bwrap` runs on the host and the daemon has
+  workspace roots.
+- **Invocation.** A detached supervisor runs `node <launcher> --compute-env-fd 3 --cwd <cwd> -- <command...>` in the
+  job's working directory. The launcher's standard output and error go to the job's log files, and its exit code
+  decides the job's state: 0 is `succeeded`, anything else `failed`.
+- **Job environment.** File descriptor 3 carries the job's environment as one JSON object of strings: at most 256
+  names matching `[A-Za-z_][A-Za-z0-9_]*` (up to 128 characters), values up to 16 KiB, 64 KiB in all, with
+  `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS` and `MKL_NUM_THREADS` set to the job's `cpuCores` unless the job sets them.
+  The launcher gives the sandboxed command this environment instead of its own.
+- **Launcher environment.** The launcher itself inherits the daemon's environment, with `LAB_SANDBOX_CONFIG` set to the
+  checked policy path and, for a job that names a principal, `PUPPENCLAW_PRINCIPAL_ID`,
+  `PUPPENCLAW_PRINCIPAL_SOCKET_DIR` and `PUPPENCLAW_PRINCIPAL_SOCKET`
+  ([pcp2.md](pcp2.md#binding-a-principal-socket-into-a-sandbox)). It applies the policy before it starts the command.
+- **Stopping.** Cancellation and the wall-time limit send `SIGTERM` to the launcher and `SIGKILL` 5 s later, so the
+  launcher must take the sandboxed process down with it.
 
 ## Measurements
 

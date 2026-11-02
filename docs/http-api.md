@@ -28,6 +28,15 @@ routes and opt-in response shapes on top of them; every route described here is 
 | 503 | `DAEMON_AUTH_REQUIRED`, `OWNER_CLEANUP_INCOMPLETE`, `QUIESCENCE_UNAVAILABLE`, `ACP_CONTROL_TIMEOUT`, `PROVIDER_CONNECTION_FAILED`, `PROVIDER_AUTHENTICATION_BUSY`, `STATE_RECOVERY_REQUIRED` |
 | 500 | any other code |
 
+Codes the table does not list answer 500 even where the request is at fault: `UNSUPPORTED_REASONING_MODE`,
+`UNAVAILABLE_REASONING_MODE`, `MAX_SESSIONS_REACHED` and a replayed `TURN_INTERRUPTED_RESTART`, among others. A body
+that is not valid JSON, or an empty body sent as `content-type: application/json`, answers 500 `INTERNAL_ERROR`. A few
+routes answer in their own shape: `GET /statistics/turns` refuses a bad cursor with 400
+`{"code": "INVALID_STATISTICS_CURSOR", "message": "..."}`, `GET /resources/history` refuses bad parameters with 400
+`INVALID_ARGUMENT`, and the `/v2/*` routes carry the identity envelope and their own codes, such as
+`INVALID_PRINCIPAL`, `PRINCIPAL_NOT_FOUND`, `PRINCIPAL_SOCKET_UNAVAILABLE` and `INVALID_INSTRUMENT_DIGEST`
+([pcp2.md](pcp2.md)).
+
 ## Discovery
 
 - `GET /health` (open): `{ok, sessions, stateRecovery}`; `ok` is false while state needs a reset.
@@ -36,7 +45,8 @@ routes and opt-in response shapes on top of them; every route described here is 
   `providerFailureContracts`, `codexLocalSubagents`, `reasoning` (profiles, modes and aliases), `claudeWorkflows`,
   `advancedOrchestration`, `stateRecovery`, `maxSessions`, `streamOutput` and `defaultAgent`. A client should send an
   optional field only to a daemon that advertises it: the request schemas are strict.
-- `GET /skills`: the skills available to sessions (`skillRoots`).
+- `GET /skills`: the skills available to sessions, those bundled in the package's `skills/` and those under
+  `skillRoots`.
 
 ## Turns
 
@@ -151,7 +161,7 @@ Compact views and the transcript page add `protocol`, `bootId` and `spoolId` to 
 | `POST /session/:name/fork` `{target, model?, effort?}` | Create `target` from this session's transcript. |
 | `DELETE /session/:name` | Stop the session and its running turn. |
 | `POST /session/:name/purge` | Remove the session, its transcript, diagnostics and broker jobs. Statistics stay. |
-| `POST /gc` | Purge sessions past `sessionTtlMinutes`. |
+| `POST /gc` | Purge failed and stopped sessions idle for longer than `sessionTtlMinutes`. |
 
 ### Lifecycle fencing
 
@@ -190,9 +200,12 @@ have no owner (or already belong to this owner), refuses conflicting ownership a
 a named session is gone. Owner claims survive the purge, so a retry can prove a named session was already removed. The
 first cleanup call installs a durable fence against new sessions of the owner. A purge also revokes the owner's run
 principals and erases their broker jobs, and answers `brokerErasuresPending`: the number of the owner's broker jobs
-whose records wait for the event feed acknowledgement. The account's data is erased once that is 0; repeat the purge
-until then. If the daemon cannot prove that every matched runner has ended, it answers `OWNER_CLEANUP_INCOMPLETE` with
-`recoveryRequired: true` and keeps the fence. The owner key is never returned by session or cleanup responses.
+whose records wait for the event feed acknowledgement. Once that is 0, the owner's sessions and broker records are
+erased and its principals are reduced to tombstones ([pcp2.md](pcp2.md#jobs-usage-and-purge)); repeat the purge until
+then. Usage-ledger rows stay, since the ledger is never pruned, and conversation statistics need
+`POST /statistics/chats/:chatId/purge` for each chat. If the daemon cannot prove that every matched runner has ended,
+it answers `OWNER_CLEANUP_INCOMPLETE` with `recoveryRequired: true` and keeps the fence. The owner key is never returned
+by session or cleanup responses.
 
 ## Usage and statistics
 
