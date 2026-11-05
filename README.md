@@ -415,10 +415,12 @@ npm run typecheck
 
 The tests run the real daemon, stores and broker against fake agents (`test/fixtures/fake-acpx*`), mock upstreams and
 temporary data directories; they need no provider account and no OpenClaw gateway. A few opt-in tests are skipped
-unless their environment is present. `test/fixtures/contract/` holds the daemon's session status and output envelopes
-as committed fixtures; `scripts/emit-contract-fixtures.ts` regenerates them and a unit test fails when the emitted shape
-drifts. The scripts in `scripts/measure-*.mts` measure health cost, event-loop lag and bulk throughput against a daemon
-or runtime they start themselves.
+unless their environment is present; `PUPPENCLAW_CLAUDE_CODE_BIN`, for one, names a Claude Code binary that
+`test/unit/claude-code-native-limits.test.ts` runs through the broker against a provider answering with rate limits,
+worth running for every client version a deployment pins. `test/fixtures/contract/` holds the daemon's session status
+and output envelopes as committed fixtures; `scripts/emit-contract-fixtures.ts` regenerates them and a unit test fails
+when the emitted shape drifts. The scripts in `scripts/measure-*.mts` measure health cost, event-loop lag and bulk
+throughput against a daemon or runtime they start themselves.
 
 GitHub Actions runs the commit guard and `npm ci`, build, lint, typecheck and tests on pushes to `main` and `dev` and
 on pull requests. Source layout: `src/daemon` (HTTP server and pcp/2), `src/manager` (agent sessions through acpx and
