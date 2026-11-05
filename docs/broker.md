@@ -138,6 +138,11 @@ reset as `resumeAfter` (a pause that a 401 or 403 sets names none, even after an
 401, one call with a renewed login may pass; its success lifts the pause, and so does a 429 with a reset at most 60 s
 ahead, which only an accepted login receives.
 
+A client that stops retrying ends its turn with its own error text, which names no failure. A broker-routed turn that
+fails while its provider is paused, or right after a 429 or 503 went back to its client (its newest native answer),
+therefore ends `PROVIDER_PAUSED`, and the turn's answer carries the provider's reset as `resumeAfter` when one was
+named.
+
 A bulk call that times out, meets a connection reset or a refused connection, or gets 502, 503 or 504 is retried with
 exponential backoff from `PUPPENCLAW_BULK_RETRY_BASE_MS` (default 1000 ms, ±20 % jitter, at most 30 s), up to
 `PUPPENCLAW_BULK_RETRY_ATTEMPTS` attempts (default 3). Every attempt keeps its own receipt, and the item settles once.

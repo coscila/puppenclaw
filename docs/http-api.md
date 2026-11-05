@@ -113,7 +113,9 @@ as `providerFailureContracts` version 3:
 - `PROVIDER_CONNECTION_FAILED`: retryable;
 - `PROVIDER_AUTHENTICATION_BUSY`: temporary contention while Claude Code refreshes its credentials; retryable, and not a
   sign of an invalid login;
-- `PROVIDER_PAUSED`: the broker paused the provider for this attempt after a rate limit or authentication failure.
+- `PROVIDER_PAUSED`: the broker paused the provider for this attempt after a rate limit or authentication failure, or
+  the agent's client gave up on a 429 or 503 that the broker passed to it; retryable. When the provider named a reset,
+  the turn's answer carries it as `resumeAfter` (ISO time); keyed replays omit it.
 
 `retryable` never replays a dispatched turn automatically, because partial work may already exist.
 

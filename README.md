@@ -288,9 +288,10 @@ fingerprint and digests of the request settings, which reaches the session's sta
 bulk item and each job state change is written, in the same transaction, to an outbox that callers read as the pcp/2
 event feed. Rate limits and authentication failures pause the provider for the turn; a rate limit or 503 on the agent's
 own model call pauses nothing unless its reset lies more than 60 s ahead, because the agent retries that call itself
-and waits at most that long. Bulk calls that fail transiently (502, 503, 504, timeouts, connection resets) are retried
-with backoff, each attempt a new provider request. A provider-wide limiter shares bulk capacity across jobs and
-sessions, and providers that address the same backend can share one capacity group.
+and waits at most that long. A turn that ends on a pause, or on such a limit once the agent stops retrying, fails as
+`PROVIDER_PAUSED` with the provider's reset. Bulk calls that fail transiently (502, 503, 504, timeouts, connection
+resets) are retried with backoff, each attempt a new provider request. A provider-wide limiter shares bulk capacity
+across jobs and sessions, and providers that address the same backend can share one capacity group.
 
 **Run principals** carry bulk authority independent of a chat turn, for example for a study run: the caller grants
 providers, instruments, concurrency, an item cap, a token budget and an expiry, and the daemon opens a socket that only

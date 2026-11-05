@@ -583,10 +583,16 @@ describe("scoped worker broker", () => {
     const claude = kind === "claude-code", path = claude ? "/native/v1/messages" : "/native/v1/responses";
     const body = claude ? { model: "test-model", messages: [] } : { model: "test-model", input: "x" };
     const auth: Record<string, string> = claude ? { authorization: "Bearer subscription-fixture" } : {};
+    const before = Date.now();
     const limited = await nativeHeaders(socket, path, body, auth);
     // The client gets the provider's own answer, reset headers included, and times its retry from them.
     expect(limited.status).toBe(status); expect(limited.headers).toMatchObject(limitHeaders);
+    // Until a later answer, the broker holds the limit the client may give up on, with the reset it named.
+    const limit = runtime.providerLimit("main");
+    if (Object.keys(limitHeaders).length === 0) expect(limit).toEqual({});
+    else expect(Date.parse(limit!.resumeAfter!) - before).toBeGreaterThan(10_000);
     expect((await unix(socket, path, body, auth)).status).toBe(200);
+    expect(runtime.providerLimit("main")).toBeUndefined();
     expect((await unix(socket, path, body, auth)).status).toBe(200);
     expect(calls).toBe(3);
     // Worker jobs of the attempt on the same provider are not paused either.
@@ -612,6 +618,8 @@ describe("scoped worker broker", () => {
     expect(Date.parse(paused.resumeAfter) - before).toBeGreaterThanOrEqual(seconds * 1000);
     expect(Date.parse(paused.resumeAfter)).toBeLessThanOrEqual(Date.now() + seconds * 1000);
     expect((await unix(socket, `/jobs/${job.jobId}?view=summary`)).body.resumeAfter).toBe(paused.resumeAfter);
+    // A controller turn that ends on this pause reports the same reset.
+    expect(runtime.providerLimit("main")).toEqual({ resumeAfter: paused.resumeAfter });
     expect(calls).toBe(1);
   });
   it("pauses on a native Claude 401 whatever reset it names and admits one renewed login", async () => {

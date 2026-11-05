@@ -182,6 +182,8 @@ export class AdvancedRuntime {
   private readonly digester: SubmissionDigester;
   private readonly activeJobs = new Map<string, ActiveJob>();
   private readonly pauseResumeAfter = new Map<string, string>();
+  /** Participants whose newest native answer was a 429 or 503 that went back to the client unpaused, with its reset. */
+  private readonly passedLimits = new Map<string, { resumeAfter?: string }>();
   private readonly pendingContributions = new Map<string, UsageReceipt>();
   private contributionTimer: ReturnType<typeof setTimeout> | undefined;
   /** Run principals (src/advanced/principals.ts); absent means chat-turn attempt authority only. */
@@ -287,6 +289,17 @@ export class AdvancedRuntime {
   metered(name: string): boolean { return this.participants.has(name); }
   parent(name: string): string | undefined { const p = this.participants.get(name); return p?.jobId ? p.parentSessionName : undefined; }
   controller(name: string): boolean { const p = this.participants.get(name); return Boolean(p && !p.jobId && p.admissionOpen); }
+  /**
+   * The provider limit a session's native client may have given up on: the attempt's pause of the session's provider,
+   * or a 429 or 503 that was the session's newest native answer and went back to the client unpaused. It carries the
+   * reset the provider named, if any; undefined when neither holds.
+   */
+  providerLimit(name: string): { resumeAfter?: string } | undefined {
+    const p = this.participants.get(name); if (!p) return undefined;
+    const pauseKey = providerPauseKey(p, p.provider.id);
+    if (this.pausedProviders.has(pauseKey)) { const resumeAfter = this.pauseResumeAfter.get(pauseKey); return resumeAfter ? { resumeAfter } : {}; }
+    return this.passedLimits.get(name);
+  }
   /** Results already returned to the controller do not need another model turn. */
   private observeJobs(p: RuntimeParticipant, jobs: WorkerJobHeader[]): void {
     if (p.jobId) return;
@@ -343,7 +356,7 @@ export class AdvancedRuntime {
       ...(ownerKey ? { ownerKey } : {}), admissionOpen: true };
     if (p.provider.kind === "claude-code") await this.ensureOAuthRelay();
     if (this.closed || (this.admissionEpochs.get(session.name) ?? 0) !== epoch) throw new PuppenclawError("ORCHESTRATION_TURN_CLOSED", "This advanced admission was cancelled.");
-    this.participants.set(session.name, p);
+    this.participants.set(session.name, p); this.passedLimits.delete(session.name);
     await this.listen(session.name);
     this.policy.denyUrl(p.provider.baseUrl ?? "https://api.anthropic.com");
     for (const worker of config.workers) if (worker.modelProvider.baseUrl) this.policy.denyUrl(worker.modelProvider.baseUrl);
@@ -479,7 +492,7 @@ export class AdvancedRuntime {
   }
   private async runAgent(job: WorkerJob, parent: RuntimeParticipant): Promise<void> {
     const child: RuntimeParticipant = { ...parent, sessionName: job.childSessionName!, provider: job.config.modelProvider, jobId: job.jobId, admissionOpen: true };
-    this.requireParticipant(parent.sessionName); if (child.provider.kind === "claude-code") await this.ensureOAuthRelay(); this.requireParticipant(parent.sessionName); this.participants.set(child.sessionName, child); await this.listen(child.sessionName);
+    this.requireParticipant(parent.sessionName); if (child.provider.kind === "claude-code") await this.ensureOAuthRelay(); this.requireParticipant(parent.sessionName); this.participants.set(child.sessionName, child); this.passedLimits.delete(child.sessionName); await this.listen(child.sessionName);
     if (this.store.jobHeader(job.jobId)?.state === "cancelled") return;
     let result: ToolResult;
     try { result = await this.runtimeDriver().start({ name: child.sessionName, agent: job.config.agent, directory: child.directory,
@@ -963,11 +976,16 @@ export class AdvancedRuntime {
         // A rate limit answers only an accepted login, so a short one on the renewed call completes its recovery too.
         completeOAuthRecovery();
       }
+      // The newest answer to a model call tells whether a client that gave up ended on a provider limit (providerLimit).
+      if (!counting) {
+        if (!pause && (response.status === 429 || response.status === 503)) { const resumeAfter = resumeAfterFromHeaders(response.headers); this.passedLimits.set(p.sessionName, resumeAfter ? { resumeAfter } : {}); }
+        else this.passedLimits.delete(p.sessionName);
+      }
       if (!counting) this.publish(receipt); downstream?.end();
       if (!success) throw new Error(response.ok ? "Provider stream did not complete successfully." : `Provider request failed with HTTP ${response.status}.`);
       return { payload, receipt };
     } catch (error) {
-      if (receipt.state === "completed") { completeOAuthRecovery(); parser.finish(true); receipt.usage = parser.usage; if (!counting) this.publish(receipt); downstream?.end(); return { payload, receipt }; }
+      if (receipt.state === "completed") { completeOAuthRecovery(); if (!counting) this.passedLimits.delete(p.sessionName); parser.finish(true); receipt.usage = parser.usage; if (!counting) this.publish(receipt); downstream?.end(); return { payload, receipt }; }
       const failure = error;
       parser.finish(false); receipt.usage = parser.usage; receipt.state = parser.protocolErrorCode ? "failed" : abort.signal.aborted ? "cancelled" : "failed"; receipt.errorCode ??= parser.protocolErrorCode ?? (abort.signal.aborted ? "request_cancelled" : safeErrorCode(object(failure)?.code) ?? safeErrorCode(object(object(failure)?.cause)?.code) ?? "transport_error"); if (!counting) this.publish(receipt); throw failure;
     }
@@ -978,7 +996,7 @@ export class AdvancedRuntime {
     const participant = this.participants.get(name); if (participant?.jobId) await this.cancel(participant.jobId); else await this.closeTurn(name);
     const children = this.store.jobHeaders(name).flatMap((j) => j.childSessionName ? [j.childSessionName] : []);
     for (const child of children) if (this.runtimeDriver().getSession(child)) await this.runtimeDriver().purge?.(child);
-    for (const identity of [name, ...children]) { const server = this.servers.get(identity); if (server) { for (const socket of server.sockets) socket.destroy(); await new Promise<void>((done) => server.server.close(() => done())); await unlink(server.path).catch(() => {}); this.servers.delete(identity); } this.participants.delete(identity); }
+    for (const identity of [name, ...children]) { const server = this.servers.get(identity); if (server) { for (const socket of server.sockets) socket.destroy(); await new Promise<void>((done) => server.server.close(() => done())); await unlink(server.path).catch(() => {}); this.servers.delete(identity); } this.participants.delete(identity); this.passedLimits.delete(identity); }
     this.store.purgeSession(name);
   }
   async purgeOwner(owner: string): Promise<void> { for (const parent of this.store.ownedParents(owner)) await this.purge(parent); }

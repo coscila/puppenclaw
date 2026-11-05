@@ -4,6 +4,8 @@ export type ProviderFailure = {
   code: "PROVIDER_AUTHENTICATION_REQUIRED" | "PROVIDER_CONNECTION_FAILED" | "PROVIDER_AUTHENTICATION_BUSY" | "PROVIDER_PAUSED";
   message: string;
   retryable: boolean;
+  /** When the provider accepts calls again (ISO time), if it named a reset. */
+  resumeAfter?: string;
 };
 
 const CLAUDE_AUTH_MESSAGE =
@@ -29,6 +31,19 @@ function isBrokerPause(code: string, message: string): boolean {
   } catch { return false; }
 }
 
+/**
+ * The retryable failure of a turn that the broker's pause of its provider ended, or a provider limit that its client
+ * stopped retrying; resumeAfter is the reset the provider named.
+ */
+export function brokerPauseFailure(agent: AgentKind, resumeAfter?: string): ProviderFailure {
+  return {
+    code: "PROVIDER_PAUSED",
+    message: agent === "claude" ? CLAUDE_PAUSED_MESSAGE : "The model broker paused this turn after a provider error. Retry after the provider issue is resolved.",
+    retryable: true,
+    ...(resumeAfter !== undefined ? { resumeAfter } : {})
+  };
+}
+
 export function classifyProviderFailure(params: {
   agent: AgentKind;
   code?: string;
@@ -37,13 +52,7 @@ export function classifyProviderFailure(params: {
 }): ProviderFailure | null {
   const code = params.code?.trim().toUpperCase() ?? "";
   const message = params.message.trim();
-  if (isBrokerPause(code, message)) {
-    return {
-      code: "PROVIDER_PAUSED",
-      message: params.agent === "claude" ? CLAUDE_PAUSED_MESSAGE : "The model broker paused this turn after a provider error. Retry after the provider issue is resolved.",
-      retryable: true
-    };
-  }
+  if (isBrokerPause(code, message)) return brokerPauseFailure(params.agent);
   if (params.agent === "claude") {
     const structuredAuth =
       /^(?:PROVIDER_AUTHENTICATION_REQUIRED|INVALID_GRANT|401|403|AUTH(?:ENTICATION)?(?:_ERROR|_FAILED|_REQUIRED)?|OAUTH(?:_ERROR|_EXPIRED|_INVALID)?|UNAUTHENTICATED|UNAUTHORIZED|TOKEN_(?:EXPIRED|INVALID|REVOKED)|CREDENTIALS?_(?:EXPIRED|INVALID|REVOKED))$/u.test(

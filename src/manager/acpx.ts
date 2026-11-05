@@ -24,7 +24,7 @@ import { ensureError, PuppenclawError } from "../shared/errors.js";
 import type { PluginLogger } from "../shared/logger.js";
 import type { OutputRouter } from "../shared/output-router.js";
 import { killProcessTree, killProcessTreeWithEscalation } from "../shared/process-tree.js";
-import { classifyProviderFailure, type ProviderFailure } from "../shared/provider-failures.js";
+import { brokerPauseFailure, classifyProviderFailure, type ProviderFailure } from "../shared/provider-failures.js";
 import {
   acceptedReasoningModes,
   reasoningProfileFor,
@@ -138,6 +138,8 @@ type TurnResult = {
   signals?: TurnSignals;
   failureCode?: string;
   retryable?: boolean;
+  /** The provider's reset (ISO time) when a PROVIDER_PAUSED failure names one. */
+  resumeAfter?: string;
 };
 
 function normalizeProviderError(session: Pick<SessionInfo, "agent">, error: unknown): Error {
@@ -177,7 +179,8 @@ function failedProviderTurn(failure: ProviderFailure): TurnResult {
     transcript: [{ role: "status", text: failure.message, createdAt: nowIso() }],
     state: "failed",
     failureCode: failure.code,
-    retryable: failure.retryable
+    retryable: failure.retryable,
+    ...(failure.resumeAfter != null ? { resumeAfter: failure.resumeAfter } : {})
   };
 }
 
@@ -1875,6 +1878,7 @@ export class AcpxSessionManager implements ISessionManager {
           outputRole: outputRoleForTurn(turn),
           ...(turn.failureCode != null ? { failureCode: turn.failureCode } : {}),
           ...(turn.retryable != null ? { retryable: turn.retryable } : {}),
+          ...(turn.resumeAfter != null ? { resumeAfter: turn.resumeAfter } : {}),
           ...(turn.signals != null ? { turnSignals: turn.signals } : {}),
           contextFiles: context.files,
           skills: installedSkills
@@ -2100,6 +2104,7 @@ export class AcpxSessionManager implements ISessionManager {
         outputRole: outputRoleForTurn(turn),
         ...(turn.failureCode != null ? { failureCode: turn.failureCode } : {}),
         ...(turn.retryable != null ? { retryable: turn.retryable } : {}),
+        ...(turn.resumeAfter != null ? { resumeAfter: turn.resumeAfter } : {}),
         ...(turn.signals != null ? { turnSignals: turn.signals } : {}),
         contextFiles: context.files
       });
@@ -3202,7 +3207,7 @@ export class AcpxSessionManager implements ISessionManager {
     }
 
     try {
-      await run();
+      const live = await run();
       const durableReceipt = this.deps.store.getTurnRequest(name, idempotency.turnKey);
       if (durableReceipt?.state !== "settled" || durableReceipt.outcome == null) {
         throw new PuppenclawError(
@@ -3225,11 +3230,16 @@ export class AcpxSessionManager implements ISessionManager {
         disposition.execution.reject(durableError);
         throw durableError;
       }
-      const accepted = toolResultFromTurnOutcome(
+      const durable = toolResultFromTurnOutcome(
         durableReceipt.outcome,
         idempotency.turnKey,
         "accepted"
       );
+      // The provider's reset reaches only the accepted answer: the durable outcome keeps the
+      // fields every daemon that may load this state accepts, so replays answer without it.
+      const accepted = typeof live.details.resumeAfter === "string"
+        ? { ...durable, details: { ...durable.details, resumeAfter: live.details.resumeAfter } }
+        : durable;
       disposition.execution.resolve(accepted);
       return accepted;
     } catch (error) {
@@ -4811,6 +4821,17 @@ export class AcpxSessionManager implements ISessionManager {
     });
   }
 
+  /**
+   * A broker-routed client that stops retrying a provider limit ends its turn with its own error text, which names no
+   * provider failure. The broker's record of the session's native calls (AdvancedRuntime.providerLimit) types such a
+   * turn PROVIDER_PAUSED, and gives a PROVIDER_PAUSED failure the reset the provider named.
+   */
+  private withBrokerLimit(session: Pick<SessionInfo, "name" | "agent">, failure: ProviderFailure | null): ProviderFailure | null {
+    if (failure != null && failure.code !== "PROVIDER_PAUSED") return failure;
+    const limit = this.deps.advanced?.providerLimit(session.name);
+    return limit === undefined ? failure : brokerPauseFailure(session.agent, limit.resumeAfter);
+  }
+
   private async runTurn(params: {
     session: SessionInfo;
     promptText: string;
@@ -5206,14 +5227,14 @@ export class AcpxSessionManager implements ISessionManager {
       this.deps.logger.warn(
         `ACPX session ${params.session.name} returned error event: ${safeErrorMessage}`
       );
-      const providerFailure = classifyProviderFailure({
+      const providerFailure = this.withBrokerLimit(params.session, classifyProviderFailure({
         agent: params.session.agent,
         ...(errorEvent.code != null ? { code: errorEvent.code } : {}),
         // Classify before redaction can hide an OAuth invalid_grant marker.
         // Only the classifier's fixed public message crosses this boundary.
         message: errorEvent.message,
         ...(errorEvent.retryable != null ? { retryable: errorEvent.retryable } : {})
-      });
+      }));
       if (providerFailure != null) {
         await this.deps.outputRouter.onError(
           params.session.name,
@@ -5263,10 +5284,10 @@ export class AcpxSessionManager implements ISessionManager {
       this.deps.logger.warn(
         `ACPX session ${params.session.name} exited with code ${exitCode ?? "unknown"}: ${message}`
       );
-      const providerFailure = classifyProviderFailure({
+      const providerFailure = this.withBrokerLimit(params.session, classifyProviderFailure({
         agent: params.session.agent,
         message: stderr.trim() || message
-      });
+      }));
       if (providerFailure != null) {
         await this.deps.outputRouter.onError(
           params.session.name,
@@ -5641,10 +5662,10 @@ export class AcpxSessionManager implements ISessionManager {
         .filter((part) => part.trim().length > 0)
         .join("\n");
       this.setActiveTurnOutput(params.session.name, failureOutput);
-      const providerFailure = classifyProviderFailure({
+      const providerFailure = this.withBrokerLimit(params.session, classifyProviderFailure({
         agent: params.session.agent,
         message
-      });
+      }));
       if (providerFailure != null) {
         await this.deps.outputRouter.onError(
           params.session.name,
