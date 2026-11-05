@@ -108,7 +108,7 @@ describe("broker retry policy", () => {
     expect(resumeAfterFromHeaders(headers({ "retry-after": "99999999" }), now)).toBeUndefined();
   });
 
-  it("pauses a native provider on 401 and 403, and on 429 or 503 only for a reset more than five minutes ahead", () => {
+  it("pauses a native provider on 401 and 403, and on 429 or 503 only for a reset more than 60 s ahead", () => {
     const now = new Date("2026-10-25T12:00:00.000Z");
     const headers = (values: Record<string, string> = {}) => new Headers(values);
     expect(nativeProviderPause(401, headers(), now)).toEqual({});
@@ -116,11 +116,13 @@ describe("broker retry policy", () => {
     for (const status of [429, 503]) {
       expect(nativeProviderPause(status, headers(), now)).toBeNull();
       expect(nativeProviderPause(status, headers({ "retry-after": "30" }), now)).toBeNull();
-      expect(nativeProviderPause(status, headers({ "retry-after": "300" }), now)).toBeNull();
-      expect(nativeProviderPause(status, headers({ "retry-after": "301" }), now)).toEqual({ resumeAfter: "2026-10-25T12:05:01.000Z" });
+      expect(nativeProviderPause(status, headers({ "retry-after": "60" }), now)).toBeNull();
+      expect(nativeProviderPause(status, headers({ "retry-after": "61" }), now)).toEqual({ resumeAfter: "2026-10-25T12:01:01.000Z" });
+      expect(nativeProviderPause(status, headers({ "retry-after": "120" }), now)).toEqual({ resumeAfter: "2026-10-25T12:02:00.000Z" });
     }
-    expect(nativeProviderPause(429, headers({ "anthropic-ratelimit-tokens-reset": "2026-10-25T12:04:00Z" }), now)).toBeNull();
-    expect(nativeProviderPause(429, headers({ "anthropic-ratelimit-tokens-reset": "2026-10-25T13:00:00Z" }), now)).toEqual({ resumeAfter: "2026-10-25T13:00:00.000Z" });
+    expect(nativeProviderPause(429, headers({ "anthropic-ratelimit-tokens-reset": "2026-10-25T12:00:45Z" }), now)).toBeNull();
+    expect(nativeProviderPause(429, headers({ "anthropic-ratelimit-tokens-reset": "2026-10-25T12:04:00Z" }), now)).toEqual({ resumeAfter: "2026-10-25T12:04:00.000Z" });
+    expect(nativeProviderPause(503, headers({ "x-ratelimit-reset-requests": "45s" }), now)).toBeNull();
     expect(nativeProviderPause(503, headers({ "x-ratelimit-reset-requests": "6m0s" }), now)).toEqual({ resumeAfter: "2026-10-25T12:06:00.000Z" });
     // Retry-After names when the client may call again, ahead of a later full reset of the provider's budget.
     expect(nativeProviderPause(429, headers({ "retry-after": "30", "anthropic-ratelimit-tokens-reset": "2026-10-25T13:00:00Z" }), now)).toBeNull();

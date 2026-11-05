@@ -9,7 +9,8 @@
  *
  * Native calls (an agent's own model requests) are never retried by the broker:
  * the agent's client retries them itself, so a native 429 or 503 pauses the
- * provider only when its reset lies far enough ahead (nativeProviderPause).
+ * provider only when its reset lies further ahead than the client waits
+ * (nativeProviderPause).
  */
 export type BulkRetryOptions = { attempts: number; baseDelayMs: number; maxDelayMs: number };
 
@@ -101,8 +102,12 @@ export function resumeAfterFromHeaders(headers: HeaderSource, now: Date = new Da
   return candidates.length > 0 ? new Date(Math.max(...candidates)).toISOString() : undefined;
 }
 
-/** A native 429 or 503 whose reset lies at most this far ahead, or that names none, leaves the provider unpaused. */
-export const NATIVE_LIMIT_PASS_THROUGH_MS = 5 * 60_000;
+/**
+ * A native 429 or 503 whose reset lies at most this far ahead, or that names none, leaves the provider unpaused. It is
+ * the longest retry delay Claude Code waits: a Retry-After beyond 60 s ends its call at once unless
+ * CLAUDE_CODE_RETRY_WATCHDOG is set, so a later reset gets no retry within it.
+ */
+export const NATIVE_LIMIT_PASS_THROUGH_MS = 60_000;
 
 /**
  * Whether a native response pauses the provider for the attempt (null when it does not); the response itself always

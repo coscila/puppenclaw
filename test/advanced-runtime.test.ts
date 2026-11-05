@@ -568,7 +568,7 @@ describe("scoped worker broker", () => {
   it.each([
     ["claude-code", 429, "a 30 s reset", { "retry-after": "30", "anthropic-ratelimit-requests-reset": new Date(Date.now() + 30_000).toISOString() }],
     ["claude-code", 429, "no reset", {}],
-    ["claude-code", 503, "a 2 min reset", { "retry-after": "120" }],
+    ["claude-code", 503, "a 60 s reset", { "retry-after": "60" }],
     ["codex-openai-compatible", 429, "a 20 s reset", { "x-ratelimit-reset-requests": "20s" }],
   ] as const)("returns a native %s HTTP %i with %s to the client without pausing the provider, so the client's retry completes", async (kind, status, _reset, limitHeaders) => {
     let calls = 0;
@@ -594,9 +594,9 @@ describe("scoped worker broker", () => {
     expect(await settled(socket, job.jobId)).toMatchObject({ state: "completed" });
     expect(runtime.store.receipts("main", "short-limit").filter((r) => r.role === "main").map((r) => [r.httpStatus, r.state])).toEqual([[status, "failed"], [200, "completed"], [200, "completed"]]);
   });
-  it.each([429, 503])("pauses the provider until the reset after a native Claude HTTP %i whose reset lies more than five minutes ahead", async (status) => {
+  it.each([[429, 61], [503, 120], [429, 3600]] as const)("pauses the provider until the reset after a native Claude HTTP %i whose reset lies %i s ahead, beyond the 60 s the client waits", async (status, seconds) => {
     let calls = 0;
-    const { url } = await upstream((_req, res) => { calls++; res.writeHead(status, { "content-type": "application/json", "retry-after": "3600" }); res.end('{"type":"error","error":{"type":"rate_limit_error"}}'); });
+    const { url } = await upstream((_req, res) => { calls++; res.writeHead(status, { "content-type": "application/json", "retry-after": String(seconds) }); res.end('{"type":"error","error":{"type":"rate_limit_error"}}'); });
     const { runtime, socket, params, session } = await setup(url); await runtime.closeTurn("main");
     const provider = { ...params.modelProvider!, kind: "claude-code" as const };
     await runtime.begin({ ...session, modelProvider: provider }, { ...params, modelProvider: provider, statisticsContext: { version: 1, chatId: "chat", attemptId: "long-limit" } }, "approve-all");
@@ -609,8 +609,8 @@ describe("scoped worker broker", () => {
     const job = (await unix(socket, "/bulk/submit", { configId: "refs", idempotencyKey: "held-by-limit", items: [{ id: "one", input: "Review" }] })).body;
     const paused = await settled(socket, job.jobId);
     expect(paused).toMatchObject({ state: "paused", error: expect.stringContaining(`HTTP ${status}`), results: [{ state: "queued" }] });
-    expect(Date.parse(paused.resumeAfter) - before).toBeGreaterThanOrEqual(3_600_000);
-    expect(Date.parse(paused.resumeAfter)).toBeLessThanOrEqual(Date.now() + 3_600_000);
+    expect(Date.parse(paused.resumeAfter) - before).toBeGreaterThanOrEqual(seconds * 1000);
+    expect(Date.parse(paused.resumeAfter)).toBeLessThanOrEqual(Date.now() + seconds * 1000);
     expect((await unix(socket, `/jobs/${job.jobId}?view=summary`)).body.resumeAfter).toBe(paused.resumeAfter);
     expect(calls).toBe(1);
   });
