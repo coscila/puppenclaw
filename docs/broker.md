@@ -124,10 +124,16 @@ refused. The egress proxy can tell hosts apart but cannot read TLS contents.
 
 ## Provider pauses and retries
 
-HTTP 429 and authentication failures (401, 403) pause the provider for the attempt at once; a 503 does so only after the
-last retry. A paused job carries `resumeAfter` (ISO time) from `Retry-After` or, without it, the latest provider reset
-header (`x-ratelimit-reset-*`, `anthropic-ratelimit-*-reset`, `ratelimit-reset`); job listings and summaries show it.
-Paused and interrupted jobs need an explicit resume, which keeps completed items.
+A bulk call's HTTP 429 or authentication failure (401, 403) pauses the provider for the attempt at once; a 503 does so
+only after the last retry. A paused job carries `resumeAfter` (ISO time) from `Retry-After` or, without it, the latest
+provider reset header (`x-ratelimit-reset-*`, `anthropic-ratelimit-*-reset`, `ratelimit-reset`); job listings and
+summaries show it. Paused and interrupted jobs need an explicit resume, which keeps completed items.
+
+The broker never retries a [native call](#native-model-calls); the agent's client does. A native 429 or 503 therefore
+goes back to the client without pausing the provider, unless its reset, read from the same headers, lies more than five
+minutes ahead. A native 401 or 403, and a 429 or 503 with a later reset, pause the provider for the attempt: the
+attempt's further native calls get `PROVIDER_PAUSED`, and bulk jobs that the pause holds carry that reset as
+`resumeAfter`. After a native Claude 401, one call with a renewed login may pass, and its success lifts the pause.
 
 A bulk call that times out, meets a connection reset or a refused connection, or gets 502, 503 or 504 is retried with
 exponential backoff from `PUPPENCLAW_BULK_RETRY_BASE_MS` (default 1000 ms, ±20 % jitter, at most 30 s), up to

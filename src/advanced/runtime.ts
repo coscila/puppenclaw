@@ -20,7 +20,7 @@ import { responseSchemaForProvider } from "./response-schema.js";
 import { canonicalJson, effectiveSettings, finishReasonOf, serverFingerprint, settingsSha256, sha256Hex } from "./fingerprint.js";
 import { INSTRUMENT_MESSAGE_MISMATCH, instrumentBundleZod, instrumentCall, instrumentMaxTokens, instrumentMessageMode, instrumentSystemPrompt, installedSettingsSha256, storedInstrumentBundle, storedMessageMode, verbatimBundleProblem, verbatimInstrumentCall, type InstrumentBundle } from "./instruments.js";
 import { instrumentDigestOf, outputDigest } from "./outbox.js";
-import { bulkRetryFromEnvironment, failureCodeForStatus, PAUSE_HTTP_STATUS, resumeAfterFromHeaders, retryDelayMs, RETRYABLE_HTTP_STATUS, RETRYABLE_TRANSPORT_CODES, sleep, type BulkRetryOptions } from "./retry.js";
+import { bulkRetryFromEnvironment, failureCodeForStatus, nativeProviderPause, PAUSE_HTTP_STATUS, resumeAfterFromHeaders, retryDelayMs, RETRYABLE_HTTP_STATUS, RETRYABLE_TRANSPORT_CODES, sleep, type BulkRetryOptions } from "./retry.js";
 import { PRINCIPAL_PAUSE_REASONS, principalPauseCode, principalPauseOf, type PrincipalAdmission, type PrincipalHooks, type PrincipalItemKey, type PrincipalPauseReason } from "./principals-schema.js";
 import { agentSubmitZod, bulkSubmitZod, type AgentSubmit, type BulkSubmit, type ItemResult, type JobState, type RuntimeDriver, type RuntimeParticipant, type UsageReceipt, type WorkerConfig, type WorkerJob, type WorkerJobHeader, type JobProgress, type PageOptions } from "./types.js";
 import { stableHash, SubmissionDigester, submissionDigests, type SubmissionDigests } from "./digest.js";
@@ -912,6 +912,7 @@ export class AdvancedRuntime {
     const completeOAuthRecovery = () => {
       if (oauthRecovery && this.nativeOAuthRecovery.get(pauseKey) === oauthRecovery) {
         this.pausedProviders.delete(pauseKey);
+        this.pauseResumeAfter.delete(pauseKey);
         this.nativeOAuthRecovery.delete(pauseKey);
       }
     };
@@ -947,8 +948,11 @@ export class AdvancedRuntime {
       receipt.finishReason = streaming ? null : finishReasonOf(payload);
       if (response.ok && !success) receipt.errorCode = parser.protocolErrorCode ?? "provider_stream_incomplete";
       if (!response.ok) { const providerError = object(object(payload)?.error); receipt.errorCode = safeErrorCode(providerError?.code) ?? safeErrorCode(providerError?.type) ?? "provider_http_error"; }
-      if ([401, 403, 429, 503].includes(response.status)) {
+      // The client retries its own calls, so a 429 or 503 with a short reset, or none, leaves the provider unpaused.
+      const pause = nativeProviderPause(response.status, response.headers);
+      if (pause) {
         this.pausedProviders.set(pauseKey, `Provider ${p.provider.id} requires attention (HTTP ${response.status}); resume explicitly after access or quota recovers.`);
+        if (pause.resumeAfter) this.pauseResumeAfter.set(pauseKey, pause.resumeAfter);
         if (response.status === 401 && nativeOAuthDigest !== undefined) {
           // A second rejection cannot reset this recovery allowance. Concurrent
           // requests using the old credential cannot open another retry either.

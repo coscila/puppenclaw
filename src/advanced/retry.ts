@@ -6,6 +6,10 @@
  * the receipt of the attempt that ended it. Rate limits (429) and
  * authentication failures (401, 403) are never retried: they pause the provider
  * for the attempt, and a 503 that outlasts every attempt does too.
+ *
+ * Native calls (an agent's own model requests) are never retried by the broker:
+ * the agent's client retries them itself, so a native 429 or 503 pauses the
+ * provider only when its reset lies far enough ahead (nativeProviderPause).
  */
 export type BulkRetryOptions = { attempts: number; baseDelayMs: number; maxDelayMs: number };
 
@@ -14,7 +18,7 @@ export const RETRYABLE_TRANSPORT_CODES = new Set([
   "ECONNRESET", "ECONNREFUSED", "EPIPE", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "EAI_AGAIN",
   "UND_ERR_SOCKET", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT", "BULK_RESPONSE_TIMEOUT"
 ]);
-/** HTTP statuses that pause the provider for the attempt (503 only once retries are exhausted). */
+/** HTTP statuses of a bulk call that pause the provider for the attempt (503 only once retries are exhausted). */
 export const PAUSE_HTTP_STATUS = new Set([401, 403, 429, 503]);
 
 const integer = (raw: string | undefined, name: string, fallback: number, min: number, max: number): number => {
@@ -95,4 +99,20 @@ export function resumeAfterFromHeaders(headers: HeaderSource, now: Date = new Da
   const reset = headers.get("ratelimit-reset");
   if (reset && /^\d+$/u.test(reset.trim())) { const value = at(Number(reset.trim()) * 1000); if (value !== null) candidates.push(value); }
   return candidates.length > 0 ? new Date(Math.max(...candidates)).toISOString() : undefined;
+}
+
+/** A native 429 or 503 whose reset lies at most this far ahead, or that names none, leaves the provider unpaused. */
+export const NATIVE_LIMIT_PASS_THROUGH_MS = 5 * 60_000;
+
+/**
+ * Whether a native response pauses the provider for the attempt (null when it does not); the response itself always
+ * goes back to the client. 401 and 403 pause. A 429 or 503 pauses only when its reset (resumeAfterFromHeaders) lies
+ * more than NATIVE_LIMIT_PASS_THROUGH_MS ahead, and the pause carries that reset as resumeAfter; after a shorter limit,
+ * or one that names no reset, the client's own retry reaches the provider.
+ */
+export function nativeProviderPause(status: number, headers: HeaderSource, now: Date = new Date()): { resumeAfter?: string } | null {
+  if (status === 401 || status === 403) return {};
+  if (status !== 429 && status !== 503) return null;
+  const resumeAfter = resumeAfterFromHeaders(headers, now);
+  return resumeAfter !== undefined && Date.parse(resumeAfter) - now.getTime() > NATIVE_LIMIT_PASS_THROUGH_MS ? { resumeAfter } : null;
 }

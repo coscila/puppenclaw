@@ -39,6 +39,9 @@ async function setup(baseUrl: string, mode: "plan" | "execute" = "execute", conc
 function unix(socketPath: string, path: string, value?: unknown, headers: Record<string,string> = {}): Promise<{ status: number; body: any }> {
   return new Promise((resolve, reject) => { const req = request({ socketPath, path, agent: false, method: value === undefined ? "GET" : "POST", headers: { "content-type": "application/json", ...headers } }, (res) => { let text = ""; res.once("aborted", () => reject(new Error("Response aborted"))); res.once("error", reject); res.on("data", (chunk) => { text += chunk; }); res.once("end", () => { let body: unknown; try { body = JSON.parse(text); } catch { body = text; } resolve({ status: res.statusCode!, body }); }); }); req.once("error", reject); req.end(value === undefined ? undefined : JSON.stringify(value)); });
 }
+function nativeHeaders(socketPath: string, path: string, value: unknown, headers: Record<string, string>): Promise<{ status: number; headers: Record<string, string | string[] | undefined> }> {
+  return new Promise((resolve, reject) => { const req = request({ socketPath, path, agent: false, method: "POST", headers: { "content-type": "application/json", ...headers } }, (res) => { res.once("error", reject); res.once("end", () => resolve({ status: res.statusCode!, headers: res.headers })); res.resume(); }); req.once("error", reject); req.end(JSON.stringify(value)); });
+}
 function closeOnCompletion(socketPath: string): Promise<void> {
   return new Promise((resolve, reject) => {
     let completed = false;
@@ -536,8 +539,8 @@ describe("scoped worker broker", () => {
     expect((await send("expired-fixture")).status).toBe(409);
     expect(calls).toBe(2);
   });
-  it.each([403, 429, 503])("keeps native Claude HTTP %s pauses closed despite a changed credential", async (status) => {
-    let calls = 0; const { url } = await upstream((_req, res) => { calls++; res.statusCode = status; res.setHeader("content-type", "application/json"); res.end('{"error":{"type":"provider_error"}}'); });
+  it.each([[403, "30"], [429, "3600"], [503, "3600"]] as const)("keeps native Claude HTTP %i pauses (Retry-After %s) closed despite a changed credential", async (status, retryAfter) => {
+    let calls = 0; const { url } = await upstream((_req, res) => { calls++; res.writeHead(status, { "content-type": "application/json", "retry-after": retryAfter }); res.end('{"error":{"type":"provider_error"}}'); });
     const { runtime, socket, params, session } = await setup(url); await runtime.closeTurn("main");
     const provider = { ...params.modelProvider!, kind: "claude-code" as const };
     await runtime.begin({ ...session, modelProvider: provider }, { ...params, modelProvider: provider, statisticsContext: { version: 1, chatId: "chat", attemptId: `native-${status}` } }, "approve-all");
@@ -561,6 +564,103 @@ describe("scoped worker broker", () => {
     try { expect((await send("another-fixture")).status).toBe(409); expect(calls).toBe(2); }
     finally { release(); }
     expect((await recovery).status).toBe(200);
+  });
+  it.each([
+    ["claude-code", 429, "a 30 s reset", { "retry-after": "30", "anthropic-ratelimit-requests-reset": new Date(Date.now() + 30_000).toISOString() }],
+    ["claude-code", 429, "no reset", {}],
+    ["claude-code", 503, "a 2 min reset", { "retry-after": "120" }],
+    ["codex-openai-compatible", 429, "a 20 s reset", { "x-ratelimit-reset-requests": "20s" }],
+  ] as const)("returns a native %s HTTP %i with %s to the client without pausing the provider, so the client's retry completes", async (kind, status, _reset, limitHeaders) => {
+    let calls = 0;
+    const { url } = await upstream((_req, res) => {
+      calls++;
+      if (calls === 1) { res.writeHead(status, { "content-type": "application/json", ...limitHeaders }); res.end('{"type":"error","error":{"type":"rate_limit_error"}}'); return; }
+      res.setHeader("content-type", "application/json"); res.end('{"model":"test-model","output_text":"ok","usage":{"input_tokens":10,"output_tokens":2}}');
+    });
+    const { runtime, socket, params, session } = await setup(url); await runtime.closeTurn("main");
+    const provider = { ...params.modelProvider!, kind };
+    await runtime.begin({ ...session, modelProvider: provider }, { ...params, modelProvider: provider, statisticsContext: { version: 1, chatId: "chat", attemptId: "short-limit" } }, "approve-all");
+    const claude = kind === "claude-code", path = claude ? "/native/v1/messages" : "/native/v1/responses";
+    const body = claude ? { model: "test-model", messages: [] } : { model: "test-model", input: "x" };
+    const auth: Record<string, string> = claude ? { authorization: "Bearer subscription-fixture" } : {};
+    const limited = await nativeHeaders(socket, path, body, auth);
+    // The client gets the provider's own answer, reset headers included, and times its retry from them.
+    expect(limited.status).toBe(status); expect(limited.headers).toMatchObject(limitHeaders);
+    expect((await unix(socket, path, body, auth)).status).toBe(200);
+    expect((await unix(socket, path, body, auth)).status).toBe(200);
+    expect(calls).toBe(3);
+    // Worker jobs of the attempt on the same provider are not paused either.
+    const job = (await unix(socket, "/bulk/submit", { configId: "refs", idempotencyKey: "after-short-limit", items: [{ id: "one", input: "Review" }] })).body;
+    expect(await settled(socket, job.jobId)).toMatchObject({ state: "completed" });
+    expect(runtime.store.receipts("main", "short-limit").filter((r) => r.role === "main").map((r) => [r.httpStatus, r.state])).toEqual([[status, "failed"], [200, "completed"], [200, "completed"]]);
+  });
+  it.each([429, 503])("pauses the provider until the reset after a native Claude HTTP %i whose reset lies more than five minutes ahead", async (status) => {
+    let calls = 0;
+    const { url } = await upstream((_req, res) => { calls++; res.writeHead(status, { "content-type": "application/json", "retry-after": "3600" }); res.end('{"type":"error","error":{"type":"rate_limit_error"}}'); });
+    const { runtime, socket, params, session } = await setup(url); await runtime.closeTurn("main");
+    const provider = { ...params.modelProvider!, kind: "claude-code" as const };
+    await runtime.begin({ ...session, modelProvider: provider }, { ...params, modelProvider: provider, statisticsContext: { version: 1, chatId: "chat", attemptId: "long-limit" } }, "approve-all");
+    const send = () => unix(socket, "/native/v1/messages", { model: "test-model", messages: [] }, { authorization: "Bearer subscription-fixture" });
+    const before = Date.now();
+    expect((await send()).status).toBe(status);
+    expect(await send()).toMatchObject({ status: 409, body: { code: "PROVIDER_PAUSED" } });
+    expect(calls).toBe(1);
+    // Worker jobs held by the pause report when the provider accepts calls again.
+    const job = (await unix(socket, "/bulk/submit", { configId: "refs", idempotencyKey: "held-by-limit", items: [{ id: "one", input: "Review" }] })).body;
+    const paused = await settled(socket, job.jobId);
+    expect(paused).toMatchObject({ state: "paused", error: expect.stringContaining(`HTTP ${status}`), results: [{ state: "queued" }] });
+    expect(Date.parse(paused.resumeAfter) - before).toBeGreaterThanOrEqual(3_600_000);
+    expect(Date.parse(paused.resumeAfter)).toBeLessThanOrEqual(Date.now() + 3_600_000);
+    expect((await unix(socket, `/jobs/${job.jobId}?view=summary`)).body.resumeAfter).toBe(paused.resumeAfter);
+    expect(calls).toBe(1);
+  });
+  it("pauses on a native Claude 401 whatever reset it names and admits one renewed login", async () => {
+    const tokens: string[] = [];
+    const { url } = await upstream((req, res) => {
+      tokens.push(req.headers.authorization ?? "");
+      if (req.headers.authorization === "Bearer expired-fixture") { res.writeHead(401, { "content-type": "application/json", "retry-after": "30" }); res.end('{"error":{"type":"authentication_error"}}'); }
+      else { res.setHeader("content-type", "application/json"); res.end('{"model":"test-model","usage":{"input_tokens":10,"output_tokens":2}}'); }
+    });
+    const { runtime, socket, params, session } = await setup(url); await runtime.closeTurn("main");
+    const provider = { ...params.modelProvider!, kind: "claude-code" as const };
+    await runtime.begin({ ...session, modelProvider: provider }, { ...params, modelProvider: provider, statisticsContext: { version: 1, chatId: "chat", attemptId: "short-401" } }, "approve-all");
+    const send = (token: string) => unix(socket, "/native/v1/messages", { model: "test-model", messages: [] }, { authorization: `Bearer ${token}` });
+    expect((await send("expired-fixture")).status).toBe(401);
+    expect((await send("expired-fixture")).body.code).toBe("PROVIDER_PAUSED");
+    expect((await send("renewed-fixture")).status).toBe(200);
+    expect((await send("renewed-fixture")).status).toBe(200);
+    expect(tokens).toEqual(["Bearer expired-fixture", "Bearer renewed-fixture", "Bearer renewed-fixture"]);
+  });
+  it("drops a recorded reset together with the pause that a renewed Claude login lifts", async () => {
+    const held: (() => void)[] = []; let calls = 0;
+    const { url } = await upstream((req, res) => {
+      calls++;
+      if (req.headers.authorization === "Bearer renewed-fixture") {
+        res.writeHead(calls === 3 ? 200 : 403, { "content-type": "application/json" });
+        res.end(calls === 3 ? '{"model":"test-model","usage":{"input_tokens":10,"output_tokens":2}}' : '{"error":{"type":"permission_error"}}');
+        return;
+      }
+      // Two calls in flight with the old login, answered in order: a long rate limit, then a rejected login.
+      held.push(held.length === 0
+        ? () => { res.writeHead(429, { "content-type": "application/json", "retry-after": "3600" }); res.end('{"error":{"type":"rate_limit_error"}}'); }
+        : () => { res.writeHead(401, { "content-type": "application/json" }); res.end('{"error":{"type":"authentication_error"}}'); });
+    });
+    const { runtime, socket, params, session } = await setup(url); await runtime.closeTurn("main");
+    const provider = { ...params.modelProvider!, kind: "claude-code" as const };
+    await runtime.begin({ ...session, modelProvider: provider }, { ...params, modelProvider: provider, statisticsContext: { version: 1, chatId: "chat", attemptId: "recovered" } }, "approve-all");
+    const send = (token: string) => unix(socket, "/native/v1/messages", { model: "test-model", messages: [] }, { authorization: `Bearer ${token}` });
+    const inFlight = [send("expired-fixture"), send("expired-fixture")];
+    for (let i = 0; i < 200 && held.length < 2; i++) await new Promise((done) => setTimeout(done, 5));
+    held[0]!(); expect((await Promise.race(inFlight)).status).toBe(429);
+    held[1]!(); expect((await Promise.all(inFlight)).map((r) => r.status).sort()).toEqual([401, 429]);
+    // The renewed login lifts the pause; a later pause of the attempt names no reset of its own.
+    expect((await send("renewed-fixture")).status).toBe(200);
+    expect((await send("renewed-fixture")).status).toBe(403);
+    const job = (await unix(socket, "/bulk/submit", { configId: "refs", idempotencyKey: "after-recovery", items: [{ id: "one", input: "Review" }] })).body;
+    const paused = await settled(socket, job.jobId);
+    expect(paused).toMatchObject({ state: "paused", error: expect.stringContaining("HTTP 403") });
+    expect(paused.resumeAfter).toBeUndefined();
+    expect(calls).toBe(4);
   });
   it("pins native agent workers to parent planning permissions and records actual calls", async () => {
     const { url } = await upstream((_req, res) => { res.setHeader("content-type", "application/json"); res.end('{"model":"actual-test-model","output_text":"ok","usage":{"input_tokens":10,"output_tokens":2}}'); });
