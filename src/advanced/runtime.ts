@@ -958,7 +958,10 @@ export class AdvancedRuntime {
           // requests using the old credential cannot open another retry either.
           if (!this.nativeOAuthRecovery.has(pauseKey)) this.nativeOAuthRecovery.set(pauseKey, { rejectedTokenSha256: nativeOAuthDigest, retryClaimed: false });
         } else this.nativeOAuthRecovery.delete(pauseKey);
-      } else if (success) completeOAuthRecovery();
+      } else if (success || response.status === 429) {
+        // A rate limit answers only an accepted login, so a short one on the renewed call completes its recovery too.
+        completeOAuthRecovery();
+      }
       if (!counting) this.publish(receipt); downstream?.end();
       if (!success) throw new Error(response.ok ? "Provider stream did not complete successfully." : `Provider request failed with HTTP ${response.status}.`);
       return { payload, receipt };

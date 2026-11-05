@@ -631,6 +631,26 @@ describe("scoped worker broker", () => {
     expect((await send("renewed-fixture")).status).toBe(200);
     expect(tokens).toEqual(["Bearer expired-fixture", "Bearer renewed-fixture", "Bearer renewed-fixture"]);
   });
+  it.each([["30", 200], ["3600", 409]] as const)("ends a renewed Claude login's recovery on its first call's 429 with Retry-After %s, so the next call gets HTTP %i", async (retryAfter, next) => {
+    const tokens: string[] = []; let renewed = 0;
+    const { url } = await upstream((req, res) => {
+      tokens.push(req.headers.authorization ?? "");
+      if (req.headers.authorization === "Bearer expired-fixture") { res.writeHead(401, { "content-type": "application/json" }); res.end('{"error":{"type":"authentication_error"}}'); return; }
+      if (renewed++ === 0) { res.writeHead(429, { "content-type": "application/json", "retry-after": retryAfter }); res.end('{"error":{"type":"rate_limit_error"}}'); return; }
+      res.setHeader("content-type", "application/json"); res.end('{"model":"test-model","usage":{"input_tokens":10,"output_tokens":2}}');
+    });
+    const { runtime, socket, params, session } = await setup(url); await runtime.closeTurn("main");
+    const provider = { ...params.modelProvider!, kind: "claude-code" as const };
+    await runtime.begin({ ...session, modelProvider: provider }, { ...params, modelProvider: provider, statisticsContext: { version: 1, chatId: "chat", attemptId: "renewed-limit" } }, "approve-all");
+    const send = (token: string) => unix(socket, "/native/v1/messages", { model: "test-model", messages: [] }, { authorization: `Bearer ${token}` });
+    expect((await send("expired-fixture")).status).toBe(401);
+    expect((await send("renewed-fixture")).status).toBe(429);
+    // A short limit lifts the login pause and leaves the provider unpaused; a long one pauses it until its reset.
+    const after = await send("renewed-fixture");
+    expect(after.status).toBe(next);
+    if (next === 409) expect(after.body).toMatchObject({ code: "PROVIDER_PAUSED", error: expect.stringContaining("HTTP 429") });
+    expect(tokens).toEqual(["Bearer expired-fixture", ...Array<string>(next === 200 ? 2 : 1).fill("Bearer renewed-fixture")]);
+  });
   it("drops a recorded reset together with the pause that a renewed Claude login lifts", async () => {
     const held: (() => void)[] = []; let calls = 0;
     const { url } = await upstream((req, res) => {
