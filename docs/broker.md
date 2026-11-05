@@ -134,8 +134,9 @@ goes back to the client without pausing the provider, unless its reset, read fro
 ahead: Claude Code waits at most 60 s for a retry and ends a call with a later `Retry-After` at once (unless
 `CLAUDE_CODE_RETRY_WATCHDOG` is set). A native 401 or 403, and a 429 or 503 with a later reset, pause the provider for
 the attempt: the attempt's further native calls get `PROVIDER_PAUSED`, and bulk jobs that the pause holds carry that
-reset as `resumeAfter`. After a native Claude 401, one call with a renewed login may pass; its success lifts the pause,
-and so does a 429 with a reset at most 60 s ahead, which only an accepted login receives.
+reset as `resumeAfter` (a pause that a 401 or 403 sets names none, even after an earlier limit). After a native Claude
+401, one call with a renewed login may pass; its success lifts the pause, and so does a 429 with a reset at most 60 s
+ahead, which only an accepted login receives.
 
 A bulk call that times out, meets a connection reset or a refused connection, or gets 502, 503 or 504 is retried with
 exponential backoff from `PUPPENCLAW_BULK_RETRY_BASE_MS` (default 1000 ms, ±20 % jitter, at most 30 s), up to

@@ -952,7 +952,8 @@ export class AdvancedRuntime {
       const pause = nativeProviderPause(response.status, response.headers);
       if (pause) {
         this.pausedProviders.set(pauseKey, `Provider ${p.provider.id} requires attention (HTTP ${response.status}); resume explicitly after access or quota recovers.`);
-        if (pause.resumeAfter) this.pauseResumeAfter.set(pauseKey, pause.resumeAfter);
+        // A pause carries the reset of the answer that set it; a 401 or 403 names none, whatever reset came before.
+        if (pause.resumeAfter) this.pauseResumeAfter.set(pauseKey, pause.resumeAfter); else this.pauseResumeAfter.delete(pauseKey);
         if (response.status === 401 && nativeOAuthDigest !== undefined) {
           // A second rejection cannot reset this recovery allowance. Concurrent
           // requests using the old credential cannot open another retry either.

@@ -651,6 +651,27 @@ describe("scoped worker broker", () => {
     if (next === 409) expect(after.body).toMatchObject({ code: "PROVIDER_PAUSED", error: expect.stringContaining("HTTP 429") });
     expect(tokens).toEqual(["Bearer expired-fixture", ...Array<string>(next === 200 ? 2 : 1).fill("Bearer renewed-fixture")]);
   });
+  it("drops a long limit's reset when a native 403 that lands after it pauses the provider again", async () => {
+    const held: (() => void)[] = [];
+    const { url } = await upstream((_req, res) => {
+      held.push(held.length === 0
+        ? () => { res.writeHead(429, { "content-type": "application/json", "retry-after": "3600" }); res.end('{"error":{"type":"rate_limit_error"}}'); }
+        : () => { res.writeHead(403, { "content-type": "application/json" }); res.end('{"error":{"type":"permission_error"}}'); });
+    });
+    const { runtime, socket, params, session } = await setup(url); await runtime.closeTurn("main");
+    const provider = { ...params.modelProvider!, kind: "claude-code" as const };
+    await runtime.begin({ ...session, modelProvider: provider }, { ...params, modelProvider: provider, statisticsContext: { version: 1, chatId: "chat", attemptId: "limit-then-403" } }, "approve-all");
+    const send = () => unix(socket, "/native/v1/messages", { model: "test-model", messages: [] }, { authorization: "Bearer subscription-fixture" });
+    const inFlight = [send(), send()];
+    for (let i = 0; i < 200 && held.length < 2; i++) await new Promise((done) => setTimeout(done, 5));
+    held[0]!(); expect((await Promise.race(inFlight)).status).toBe(429);
+    held[1]!(); expect((await Promise.all(inFlight)).map((r) => r.status).sort()).toEqual([403, 429]);
+    // The 403 needs restored access, so the pause it leaves names no time at which calls may resume.
+    const job = (await unix(socket, "/bulk/submit", { configId: "refs", idempotencyKey: "after-403", items: [{ id: "one", input: "Review" }] })).body;
+    const paused = await settled(socket, job.jobId);
+    expect(paused).toMatchObject({ state: "paused", error: expect.stringContaining("HTTP 403") });
+    expect(paused.resumeAfter).toBeUndefined();
+  });
   it("drops a recorded reset together with the pause that a renewed Claude login lifts", async () => {
     const held: (() => void)[] = []; let calls = 0;
     const { url } = await upstream((req, res) => {
