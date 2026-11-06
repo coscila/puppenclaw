@@ -270,6 +270,26 @@ describe("scoped worker broker", () => {
     expect((await unix(socket, `/jobs/${a.jobId}?view=summary`)).body.progress).toMatchObject({ total: 3, completed: 3, running: 0 });
     expect(() => runtime.jobResults("another-chat", a.jobId)).toThrow("not in this chat");
   });
+  it("serves a settled job's results from its archive file once the store has archived it", async () => {
+    const { url } = await upstream((_req, res) => { res.setHeader("content-type", "application/json"); res.end('{"model":"test-model","output_text":"verified \\u00e9","usage":{"input_tokens":10,"output_tokens":2}}'); });
+    const { runtime, socket } = await setup(url);
+    const submitted = (await unix(socket, "/bulk/submit?view=summary", { configId: "refs", idempotencyKey: "archived", concurrency: 2, items: [1, 2].map((i) => ({ id: `item-${i}`, input: "Review" })) })).body;
+    await settled(socket, submitted.jobId);
+    const live = (await unix(socket, `/jobs/${submitted.jobId}/results`)).body;
+    expect(live.results.map((result: { output: string }) => result.output)).toEqual(["verified é", "verified é"]);
+    runtime.store.ack(runtime.store.feedId, runtime.store.head());
+    const report = await runtime.store.archive({ before: new Date(Date.now() + 86_400_000) });
+    expect(report.jobs).toBe(1);
+    expect(runtime.store.jobHeader(submitted.jobId)).toBeNull();
+    const archived = await unix(socket, `/jobs/${submitted.jobId}/results`);
+    expect(archived.status).toBe(200);
+    expect(archived.body).toEqual(live);
+    expect(runtime.jobResults("main", submitted.jobId, { after: live.results[0].revision }).results).toHaveLength(1);
+    expect(() => runtime.jobResults("another-chat", submitted.jobId)).toThrow("not in this chat");
+    // Only results: the archived job is no job the controller can read, resume or cancel.
+    expect((await unix(socket, `/jobs/${submitted.jobId}`)).status).not.toBe(200);
+    expect((await unix(socket, `/jobs/${submitted.jobId}/resume`, {})).status).not.toBe(200);
+  });
   it("shares one physical backend across profiles and chats without changing worker snapshots", async () => {
     let active = 0, peak = 0, calls = 0, released = false;
     const pending: (() => void)[] = [];

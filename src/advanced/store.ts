@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { chmod, mkdir } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import type { DatabaseSync as Database, StatementSync } from "node:sqlite";
 
 import {
@@ -23,6 +23,9 @@ type StoredRow = { payload: string; revision: number };
 const states: JobState[] = ["queued", "running", "paused", "completed", "failed", "cancelled", "interrupted"];
 const SETTLED_SQL = `(${SETTLED_ITEM_STATES.map((state) => `'${state}'`).join(",")})`;
 const TERMINAL_JOB_STATES = ["completed", "failed", "cancelled", "interrupted"];
+/** Archive files the store writes (archive): <root>/archive/advanced-archive-<time>-<id>.sqlite. */
+const ARCHIVE_FILE = /^advanced-archive-[A-Za-z0-9-]+\.sqlite$/u;
+const MAX_ARCHIVE_READERS = 16;
 
 /**
  * Storage era of a job row. 0: whole job in the payload (migrated at open);
@@ -127,8 +130,11 @@ export class AdvancedStore {
   readonly stats: StoreStats = { batches: 0, mutations: 0, fallbacks: 0, failedMutations: 0, duplicateSettlements: 0 };
   private recovery: { requeued: string[]; relaunch: string[] } = { requeued: [], relaunch: [] };
   private erasuresPending = 0;
+  /** Read-only connections to archive files, by file name (archived results are read, never written, through them). */
+  private readonly archiveReaders = new Map<string, Database>();
 
-  private constructor(private readonly db: Database, private readonly root: string, options: AdvancedStoreOptions, indexes: AdvancedStore["indexes"]) {
+  private constructor(private readonly db: Database, private readonly root: string, options: AdvancedStoreOptions, indexes: AdvancedStore["indexes"],
+    private readonly openReadOnly: (file: string) => Database) {
     this.commitWindowMs = options.commitWindowMs ?? DEFAULT_COMMIT_WINDOW_MS;
     this.maxBatch = options.maxBatch ?? DEFAULT_MAX_BATCH;
     this.now = options.now ?? (() => new Date());
@@ -184,7 +190,11 @@ export class AdvancedStore {
       CREATE TABLE IF NOT EXISTS erasure_pending (job_id TEXT PRIMARY KEY, session TEXT NOT NULL, owner_key TEXT, requested_at TEXT NOT NULL) WITHOUT ROWID;
       CREATE INDEX IF NOT EXISTS erasure_pending_session ON erasure_pending(session);
       CREATE INDEX IF NOT EXISTS erasure_pending_owner ON erasure_pending(owner_key);
-      CREATE TABLE IF NOT EXISTS instruments (digest TEXT PRIMARY KEY, bundle TEXT NOT NULL, settings_sha256 TEXT NOT NULL, installed_at TEXT NOT NULL) WITHOUT ROWID;`);
+      CREATE TABLE IF NOT EXISTS instruments (digest TEXT PRIMARY KEY, bundle TEXT NOT NULL, settings_sha256 TEXT NOT NULL, installed_at TEXT NOT NULL) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS archived_jobs (job_id TEXT PRIMARY KEY, parent TEXT NOT NULL, child TEXT, owner_key TEXT, file TEXT NOT NULL, sha256 TEXT NOT NULL, archived_at TEXT NOT NULL) WITHOUT ROWID;
+      CREATE INDEX IF NOT EXISTS archived_jobs_parent ON archived_jobs(parent);
+      CREATE INDEX IF NOT EXISTS archived_jobs_child ON archived_jobs(child);
+      CREATE INDEX IF NOT EXISTS archived_jobs_owner ON archived_jobs(owner_key);`);
     // Expression indexes replace the full scans of owner, child and state lookups. SQLite
     // maintains them for writes by older daemons too. A row that is not JSON would make
     // their creation fail; the lookups then fall back to scans instead of refusing to open.
@@ -201,7 +211,7 @@ export class AdvancedStore {
     // outbox are not replayed into the feed.
     db.prepare("INSERT OR IGNORE INTO outbox_meta (id, feed_id, acked, synced_revision) VALUES (1, ?, 0, ?)").run(randomUUID(), sequence());
     options.onConnection?.(db);
-    const store = new AdvancedStore(db, root, options, indexes);
+    const store = new AdvancedStore(db, root, options, indexes, (file) => new DatabaseSync(file, { readOnly: true }));
     store.catchUp();
     // Each migration is atomic. Old idempotency keys and completed results are retained.
     for (const row of db.prepare("SELECT payload FROM jobs WHERE storage_version=0").all() as { payload: string }[]) store.applyNow((batch) => store.writeJob(JSON.parse(row.payload) as WorkerJob, batch, {}));
@@ -568,12 +578,42 @@ export class AdvancedStore {
     const row = this.stmt("SELECT payload,revision FROM jobs WHERE id=?").get(id) as StoredRow | undefined;
     return row ? { job: JSON.parse(row.payload) as WorkerJobHeader, revision: Number(row.revision), progress: this.progress(id) } : null;
   }
+  /** A page of a job's item results, from the archive file that holds the job once it has been archived. */
   resultPage(id: string, options: PageOptions = {}): ResultPage {
     const { after, limit } = pageOptions(options);
     this.flushPending();
-    const rows = this.stmt("SELECT result,revision FROM job_items WHERE job_id=? AND revision>? ORDER BY revision LIMIT ?").all(id, after, limit + 1) as { result: string; revision: number }[];
+    const archive = this.jobExists(id) ? null : this.archiveOf(id);
+    const rows = (archive ? archive.prepare("SELECT result,revision FROM job_items WHERE job_id=? AND revision>? ORDER BY revision LIMIT ?")
+      : this.stmt("SELECT result,revision FROM job_items WHERE job_id=? AND revision>? ORDER BY revision LIMIT ?")).all(id, after, limit + 1) as { result: string; revision: number }[];
     const page = rows.slice(0, limit);
     return { jobId: id, results: page.map((r) => ({ ...JSON.parse(r.result) as ItemResult, revision: Number(r.revision) })), nextCursor: page.length ? Number(page.at(-1)!.revision) : after, hasMore: rows.length > limit };
+  }
+  /**
+   * The header of a job an archive file holds (see archive), or null. An archived job is no longer live: nothing
+   * resumes, cancels or lists it; its results stay readable, read-only (resultPage), until its session or owner is
+   * purged, which removes it from the archive index.
+   */
+  archivedJob(id: string): WorkerJobHeader | null {
+    this.flushPending();
+    const archive = this.jobExists(id) ? null : this.archiveOf(id);
+    const row = archive?.prepare("SELECT payload FROM jobs WHERE id=?").get(id) as { payload: string } | undefined;
+    return row ? JSON.parse(row.payload) as WorkerJobHeader : null;
+  }
+  /** A read-only connection to the archive file the index names for a job, or null when none holds it readably. */
+  private archiveOf(id: string): Database | null {
+    const row = this.stmt("SELECT file FROM archived_jobs WHERE job_id=?").get(id) as { file: string } | undefined;
+    if (!row || !ARCHIVE_FILE.test(row.file)) return null;
+    let reader = this.archiveReaders.get(row.file);
+    if (!reader) {
+      try { reader = this.openReadOnly(join(this.root, "archive", row.file)); }
+      catch (error) { this.warn("ADVANCED_ARCHIVE_UNREADABLE", error); return null; }
+      if (this.archiveReaders.size >= MAX_ARCHIVE_READERS) {
+        const [file, oldest] = this.archiveReaders.entries().next().value as [string, Database];
+        this.archiveReaders.delete(file); oldest.close();
+      }
+      this.archiveReaders.set(row.file, reader);
+    }
+    return reader;
   }
   itemReceipt(jobId: string, itemId: string): UsageReceipt | null {
     this.flushPending();
@@ -684,14 +724,15 @@ export class AdvancedStore {
 
   // ---------------------------------------------------------------- erasure
 
-  /** Parents of jobs and receipts attributed to an owner (indexed; no full scans). */
+  /** Parents of jobs (archived ones included) and receipts attributed to an owner (indexed; no full scans). */
   ownedParents(owner: string): string[] {
     this.flushPending();
+    const archived = (this.stmt("SELECT parent FROM archived_jobs WHERE owner_key=?").all(owner) as { parent: string }[]).map((row) => row.parent);
     if (!this.indexes.owner) {
-      return [...new Set([...this.jobHeaders().filter((j) => j.ownerKey === owner).map((j) => j.parentSessionName), ...this.receipts().filter((r) => r.ownerKey === owner).map((r) => r.parentSessionName)])];
+      return [...new Set([...this.jobHeaders().filter((j) => j.ownerKey === owner).map((j) => j.parentSessionName), ...this.receipts().filter((r) => r.ownerKey === owner).map((r) => r.parentSessionName), ...archived])];
     }
     const rows = this.stmt("SELECT parent FROM jobs WHERE json_extract(payload,'$.ownerKey')=? UNION SELECT parent FROM receipts WHERE json_extract(payload,'$.ownerKey')=?").all(owner, owner) as { parent: string }[];
-    return [...new Set(rows.map((row) => row.parent))];
+    return [...new Set([...rows.map((row) => row.parent), ...archived])];
   }
 
   private jobsOfSession(name: string): string[] {
@@ -707,10 +748,12 @@ export class AdvancedStore {
   /**
    * Permanent session erasure. A job the feed has fully acknowledged goes at once with everything it holds. A job
    * with unacknowledged events loses its content at once (deferErasure); only its receipt rows and unacknowledged
-   * events wait for the feed, since a receipt is never deleted before it reached Postgres.
+   * events wait for the feed, since a receipt is never deleted before it reached Postgres. Archived jobs of the
+   * session leave the archive index, so their results are no longer served.
    */
   purgeSession(name: string): void {
     this.applyNow(() => {
+      this.stmt("DELETE FROM archived_jobs WHERE parent=? OR child=?").run(name, name);
       const ids = this.jobsOfSession(name), deferred = new Set(ids.filter((id) => this.hasUnacknowledgedEvents(id)));
       for (const row of this.stmt("SELECT id, job_id FROM receipts WHERE parent=?").all(name) as { id: string; job_id: string | null }[]) {
         if (row.job_id && (deferred.has(row.job_id) || this.erasurePending(row.job_id))) continue;
@@ -914,7 +957,8 @@ export class AdvancedStore {
    * whose records provably reached the caller qualify: stored with the outbox layout
    * (every change and receipt went to the outbox) with every event acknowledged. Jobs of
    * an earlier layout, jobs of a run principal (runs are what studies reference), jobs with a study
-   * reference and jobs with a pending erasure stay.
+   * reference and jobs with a pending erasure stay. The archive index (archived_jobs) names the file of each archived
+   * job, so its results stay readable, read-only, through resultPage until its session or owner is purged.
    */
   async archive(options: { before: Date; maxJobs?: number }): Promise<ArchiveReport> {
     this.flushPending();
@@ -968,9 +1012,13 @@ export class AdvancedStore {
           throw new Error(`Archive verification failed for job ${id}; the live rows were kept.`);
         }
         archive.prepare("INSERT INTO manifest VALUES (?,?,?,?)").run(id, JSON.stringify(counts), liveDigest, this.timestamp());
-        // Erase only when nothing changed since the copy (the job is terminal, but stay strict).
+        // Erase only when nothing changed since the copy (the job is terminal, but stay strict). The archive index row
+        // goes in with the erasure, so the job's results stay readable from the archive file (resultPage).
         this.applyNow(() => {
           if (archiveDigest(this.archiveRows(id)) !== liveDigest) throw new Error(`Job ${id} changed during its archive; it stays live.`);
+          const header = JSON.parse(live.jobs[0]!.payload) as WorkerJobHeader;
+          this.stmt("INSERT OR REPLACE INTO archived_jobs (job_id,parent,child,owner_key,file,sha256,archived_at) VALUES (?,?,?,?,?,?,?)")
+            .run(id, live.jobs[0]!.parent, header.childSessionName ?? null, header.ownerKey ?? null, basename(file), liveDigest, this.timestamp());
           this.eraseJob(id);
         });
         manifest.push({ jobId: id, counts, sha256: liveDigest });
@@ -1011,6 +1059,8 @@ export class AdvancedStore {
       this.closed = true;
       if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
       this.wakeAll();
+      for (const reader of this.archiveReaders.values()) { try { reader.close(); } catch { /* already closed */ } }
+      this.archiveReaders.clear();
       this.db.close();
     }
   }
