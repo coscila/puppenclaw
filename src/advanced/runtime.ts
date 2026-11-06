@@ -19,7 +19,7 @@ import { noUsage, UsageParser } from "./usage.js";
 import { chatCompletionContent, responseOutputText } from "./responses-output.js";
 import { responseSchemaForProvider } from "./response-schema.js";
 import { canonicalJson, effectiveSettings, finishReasonOf, serverFingerprint, settingsSha256, sha256Hex } from "./fingerprint.js";
-import { INSTRUMENT_MESSAGE_MISMATCH, instrumentBundleZod, instrumentCall, instrumentMaxTokens, instrumentMessageMode, instrumentSystemPrompt, installedSettingsSha256, storedInstrumentBundle, storedMessageMode, verbatimBundleProblem, verbatimInstrumentCall, type InstrumentBundle } from "./instruments.js";
+import { INSTRUMENT_MESSAGE_MISMATCH, instrumentBundleZod, instrumentCall, instrumentMaxTokens, instrumentMessageMode, instrumentSystemPrompt, installedSettingsSha256, storedInstrumentBundle, storedMessageMode, verbatimBundleProblem, verbatimInstrumentCall, type InstrumentBundle, type VerbatimCall } from "./instruments.js";
 import { instrumentDigestOf, outputDigest } from "./outbox.js";
 import { bulkRetryFromEnvironment, failureCodeForStatus, nativeProviderPause, PAUSE_HTTP_STATUS, resumeAfterFromHeaders, retryDelayMs, RETRYABLE_HTTP_STATUS, RETRYABLE_TRANSPORT_CODES, sleep, type BulkRetryOptions } from "./retry.js";
 import { PRINCIPAL_PAUSE_REASONS, principalPauseCode, principalPauseOf, type PrincipalAdmission, type PrincipalHooks, type PrincipalItemKey, type PrincipalPauseReason } from "./principals-schema.js";
@@ -602,9 +602,10 @@ export class AdvancedRuntime {
    * checked against the installed bundle (verbatimInstrumentCall): they are sent unchanged in the chat-completions
    * request of the worker's model and the bundle's settings, as its canonical JSON, with nothing added: no worker
    * policy, no assignment, no response format, no proxy shaping (the namespace proxy forwards chat completions
-   * unchanged as well). Throws when the item may not be sent.
+   * unchanged as well). Throws when the item may not be sent; an item whose messages deviate from the granted
+   * instrument is the participant's own reach outside it and is recorded for `participant` as a broker.refusal event.
    */
-  private buildBulkRequest(job: WorkerJob, item: BulkSubmit["items"][number], instrument: InstrumentBundle | undefined, route: BulkRoute): BuiltBulkRequest {
+  private buildBulkRequest(job: WorkerJob, item: BulkSubmit["items"][number], instrument: InstrumentBundle | undefined, route: BulkRoute, participant: RuntimeParticipant): BuiltBulkRequest {
     const provider = job.config.modelProvider, request = job.request as BulkSubmit;
     // submit() refuses restricted evidence on a provider that is not on premises; a stored job reaching dispatch after
     // the on-premises configuration changed is held to the same rule, per item and without a call.
@@ -612,11 +613,15 @@ export class AdvancedRuntime {
     if (offPremises?.code === PROVIDER_NOT_ON_PREMISES) throw offPremises;
     if (instrument && instrumentMessageMode(instrument) === "verbatim") {
       // submit() refuses other authority; a stored job reaching dispatch some other way is held to the same rule.
-      if (!verbatimAuthority(job)) throw new PuppenclawError("PRINCIPAL_REQUIRED", VERBATIM_PRINCIPAL_REQUIRED, { target: request.instrumentDigest ?? "" });
+      if (!verbatimAuthority(job)) throw new PuppenclawError("PRINCIPAL_REQUIRED", VERBATIM_PRINCIPAL_REQUIRED);
       // installInstrument refuses such a bundle; one stored before that rule is never sent with a format the executor did not build.
       const problem = verbatimBundleProblem(instrument);
-      if (problem) throw new PuppenclawError(INSTRUMENT_MESSAGE_MISMATCH, `Verbatim instrument call refused: ${problem}`, { target: request.instrumentDigest ?? "" });
-      const call = verbatimInstrumentCall(instrument, item.input, provider.model);
+      if (problem) throw new PuppenclawError(INSTRUMENT_MESSAGE_MISMATCH, `Verbatim instrument call refused: ${problem}`);
+      // The checks above follow configuration or records that changed after the job was admitted; this one, the item's
+      // own messages against the granted instrument, is the participant's (one event per job, the rest folded).
+      let call: VerbatimCall;
+      try { call = verbatimInstrumentCall(instrument, item.input, provider.model); }
+      catch (error) { this.recordRefusal(participant, error, { fallbackTarget: request.instrumentDigest ?? provider.id }); throw error; }
       const text = canonicalJson(call.request), digest = sha256Hex(text);
       return { body: Buffer.from(text), model: provider.model, settingsSha256: settingsSha256(effectiveSettings(call.request)), bodySha256: digest, requestSha256: digest, api: "chat" };
     }
@@ -649,11 +654,10 @@ export class AdvancedRuntime {
     const pauseKey = providerPauseKey(p, provider.id), instrumentDigest = instrumentDigestOf(job);
     const route = this.bulkTransport.route(provider, this.bulkConcurrency.poolKey(provider.id), this.bulkConcurrency.limit(provider.id));
     let request: BuiltBulkRequest;
-    try { request = this.buildBulkRequest(job, item, instrument, route); }
+    try { request = this.buildBulkRequest(job, item, instrument, route, participant); }
     catch (error) {
       // Refused before any provider call or principal admission: the item settles failed without a receipt.
       const errorCode = error instanceof PuppenclawError && ITEM_REFUSAL_CODES.has(error.code) ? error.code : "INVALID_REQUEST";
-      if (errorCode !== "INVALID_REQUEST") this.recordRefusal(participant, error, { fallbackTarget: instrumentDigest ?? provider.id });
       this.settleBulkItem(job, base, { state: "failed", error: message(error), errorCode }); return true;
     }
     const verbatim = request.api === "chat";

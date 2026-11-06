@@ -260,6 +260,9 @@ describe("worker policy on the turn socket", () => {
     const done = await settled(runtime, job.jobId);
     expect(done.results.map((result) => [result.id, result.state, result.errorCode ?? null])).toEqual([["one", "completed", null], ["two", "failed", PROVIDER_NOT_ON_PREMISES]]);
     expect(up.calls).toHaveLength(1);
+    // The configuration changed after the job was admitted, so the refused item is no broker.refusal event.
+    await delay(100);
+    expect(runtime.store.events(0, 1000).events.filter((event) => event.type === "broker.refusal")).toEqual([]);
   });
 
   it("starts no agent for evidence-only workers or for run-fixed-programs and code-authoring workers that are not Claude", async () => {

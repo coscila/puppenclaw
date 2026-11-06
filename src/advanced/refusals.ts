@@ -5,10 +5,12 @@ import type { RuntimeParticipant } from "./types.js";
 /**
  * Broker refusals as containment records (brokerOutbox:3, the broker.refusal event). Whenever the broker refuses a
  * participant's request because it reaches outside the participant's boundaries (a network destination the egress
- * proxy denies, work without a grant or for a provider or model not granted, a revoked or expired run principal, an
- * instrument that is not allowed, a credential the participant does not hold), it writes one outbox event naming who
- * asked, what for and the refusal's closed code. Refusals the participant cannot cause by reaching further (a closed
- * turn, an exhausted budget, a daemon shutting down, a malformed request) are not recorded.
+ * proxy denies or a principal socket does not tunnel, work without a grant or for a provider or model not granted, an
+ * instrument that is not allowed or an item that deviates from it, a credential the participant does not hold), it
+ * writes one outbox event naming who asked, what for and the refusal's closed code. Refusals the participant cannot
+ * cause by reaching further are not recorded: a closed turn, an exhausted budget, a run principal the lab revoked,
+ * whose granted time ran out or whose grant it withdrew, a daemon shutting down, a malformed request, and the items
+ * of a stored job refused because configuration changed after the job was admitted.
  *
  * A client that repeats a refused request in a loop must not flood the outbox: the first refusal of a kind of request
  * is written at once, and identical refusals (same participant, job, kind, target and code) within the next
@@ -22,10 +24,9 @@ import type { RuntimeParticipant } from "./types.js";
 export const REFUSAL_KINDS: Readonly<Record<string, BrokerRefusalKind>> = Object.freeze({
   EGRESS_DENIED: "egress",
   // Work without a grant: no principal or approved execution turn, a worker delegating or controlling jobs, a provider
-  // or worker outside the grants or the worker policy.
+  // or worker outside the grants or the worker policy, agent work or a native model route on a principal socket.
   PRINCIPAL_REQUIRED: "grant",
   PROVIDER_NOT_GRANTED: "grant",
-  GRANT_WITHDRAWN: "grant",
   WORKER_DELEGATION_DENIED: "grant",
   WORKER_CONTROL_DENIED: "grant",
   WORKER_CONFIG_NOT_FOUND: "grant",
@@ -39,9 +40,7 @@ export const REFUSAL_KINDS: Readonly<Record<string, BrokerRefusalKind>> = Object
   INSTRUMENT_REQUIRED: "instrument",
   INSTRUMENT_NOT_PINNED: "instrument",
   INSTRUMENT_MESSAGE_MISMATCH: "instrument",
-  // A run principal's socket is its credential; an API key or OAuth exchange the participant does not hold.
-  PRINCIPAL_REVOKED: "credential",
-  PRINCIPAL_EXPIRED: "credential",
+  // An API key or OAuth exchange the participant does not hold.
   PROVIDER_AUTHENTICATION_REQUIRED: "credential",
   OAUTH_ROUTE_DENIED: "credential",
   OAUTH_REFRESH_REFUSED: "credential",

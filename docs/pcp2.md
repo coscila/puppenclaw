@@ -368,7 +368,9 @@ characters of `A-Za-z0-9._:-`.
   principal's grants and usage, `instrumentMode: 1` and `instrumentVerbatim: 1` with the installed instruments it is
   granted, verbatim ones included, and one bulk worker per granted, configured provider, whose `id` is the provider id.
   Its `revision` changes only when that worker list changes, never on budget changes. Agent jobs, native model routes,
-  proxying and `CONNECT` are refused. No header, body field or environment variable names a principal.
+  proxying and `CONNECT` are refused, each as a `broker.refusal` event ([refusals](broker.md#refusals)): agent jobs and
+  native routes as `PRINCIPAL_AGENT_UNSUPPORTED`, a `CONNECT`, an absolute-form request or an upgrade naming a host as
+  `EGRESS_DENIED` with its `host:port`. No header, body field or environment variable names a principal.
 - Principals and sockets persist: a restart reopens each socket at the same path in the same directory, after broker
   recovery has requeued the jobs that were running, so no job can be submitted while recovery would still launch it.
 - Revocation, or a PUT with `socket: false`, removes the socket and its directory, so a bound sandbox then reaches

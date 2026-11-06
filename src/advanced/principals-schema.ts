@@ -95,9 +95,8 @@ const PAUSE_CODES: Record<PrincipalPauseReason, string> = {
   budget_exhausted: "BUDGET_EXHAUSTED",
   daemon_shutdown: "DAEMON_SHUTTING_DOWN"
 };
-/** `target`: what the refused request reached for (a broker.refusal event names it; see src/advanced/refusals.ts). */
-export function principalRefusalError(reason: PrincipalPauseReason, target?: string): PuppenclawError {
-  return new PuppenclawError(PAUSE_CODES[reason], `Principal admission is closed: ${reason}.`, { pause: reason, ...(target !== undefined ? { target } : {}) });
+export function principalRefusalError(reason: PrincipalPauseReason): PuppenclawError {
+  return new PuppenclawError(PAUSE_CODES[reason], `Principal admission is closed: ${reason}.`, { pause: reason });
 }
 /** The closed failure code of a refusal (e.g. BUDGET_EXHAUSTED), as an item that was never dispatched records it. */
 export function principalPauseCode(reason: PrincipalPauseReason): string {

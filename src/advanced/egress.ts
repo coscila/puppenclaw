@@ -15,9 +15,25 @@ export function publicAddress(address: string): boolean {
 }
 function hostName(host: string): string { return host.toLowerCase().replace(/^\[|\]$/gu, "").replace(/\.$/u, ""); }
 /** An EGRESS_DENIED refusal naming the destination asked for (host:port), recorded as a broker.refusal event. */
-function egressDenied(hostname: string, port: number, message: string): PuppenclawError {
+export function egressDenied(hostname: string, port: number, message: string): PuppenclawError {
   const host = hostName(hostname);
   return new PuppenclawError("EGRESS_DENIED", message, { target: `${host.includes(":") ? `[${host}]` : host}:${port}` });
+}
+/**
+ * The network destination a request names: a CONNECT authority (`host:port`, port 443 when absent) or an absolute-form
+ * http(s) or ws(s) URL (its port, else the scheme's); undefined for a path or anything else.
+ */
+export function requestedDestination(url: string, form: "connect" | "absolute"): { hostname: string; port: number } | undefined {
+  try {
+    if (form === "connect") {
+      const target = new URL(`https://${url}`);
+      return target.hostname ? { hostname: target.hostname, port: Number(target.port || 443) } : undefined;
+    }
+    const target = new URL(url);
+    const secure = target.protocol === "https:" || target.protocol === "wss:";
+    if (!secure && target.protocol !== "http:" && target.protocol !== "ws:") return undefined;
+    return target.hostname ? { hostname: target.hostname, port: Number(target.port || (secure ? 443 : 80)) } : undefined;
+  } catch { return undefined; }
 }
 /** Broker owns DNS and pins the address used by the socket; clients cannot select an alternate resolver/address. */
 export class EgressPolicy {
