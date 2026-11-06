@@ -140,9 +140,11 @@ A refusal the participant cannot cause by reaching further is not recorded: a cl
 daemon shutting down, a malformed request. An event carries no request body, header, prompt, output or credential. The
 first refusal of a kind of request is written at once; identical refusals of the same participant and job within the
 next minute are counted and written as one more event whose `repeats` holds their number, so a client that repeats a
-refused request in a loop cannot flood the feed. The counts are written when their minute ends and when the daemon
-closes; a daemon that stops without closing loses at most the last minute's repeats of each request, never its first
-refusal. Purging a session erases its refusal events like its jobs' events.
+refused request in a loop cannot flood the feed. Nor can a client that reaches for many targets: beyond 64 targets with
+an open minute for one participant, job and code, the further ones share one event whose target is `*`. The counts are
+written when their minute ends and when the daemon closes; a daemon that stops without closing loses at most the last
+minute's repeats of each request, never its first refusal. Purging a session erases its refusal events like its jobs'
+events.
 
 ## Provider pauses and retries
 

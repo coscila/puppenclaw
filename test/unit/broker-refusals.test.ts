@@ -10,7 +10,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { EgressPolicy } from "../../src/advanced/egress.js";
 import type { BrokerRefusalPayload } from "../../src/advanced/outbox.js";
 import { PrincipalRegistry } from "../../src/advanced/principals.js";
-import { REFUSAL_KINDS, RefusalRecorder, refusalSubject, refusalTarget } from "../../src/advanced/refusals.js";
+import { REFUSAL_KINDS, REFUSAL_OVERFLOW_TARGET, RefusalRecorder, refusalSubject, refusalTarget } from "../../src/advanced/refusals.js";
 import { AdvancedRuntime } from "../../src/advanced/runtime.js";
 import { startParamsZod } from "../../src/shared/schema.js";
 import type { ModelProviderConfig, SessionInfo } from "../../src/shared/types.js";
@@ -111,6 +111,28 @@ describe("refusal recorder", () => {
     expect(written[1]).toMatchObject({ attemptId: null, principalId: "run:a", kind: "grant" });
     expect(recorder.record(subject, "EGRESS_DENIED", "x:443")).toBe(false);
     expect(recorder.openWindows).toBe(0);
+  });
+
+  it("shares one counted window among the targets beyond the per-code bound, so a scan of hosts cannot flood the feed", () => {
+    let now = 1_000_000;
+    const written: BrokerRefusalPayload[] = [];
+    const recorder = new RefusalRecorder((payload) => written.push(payload), { windowMs: 60_000, targetsPerCode: 2, now: () => now });
+    cleanups.push(() => recorder.close());
+    for (let host = 1; host <= 6; host++) recorder.record(subject, "EGRESS_DENIED", `10.0.0.${host}:443`);
+    // Another code of the same participant has a bound of its own.
+    recorder.record(subject, "MODEL_NOT_CONFIGURED", "other-model");
+    expect(written.map((payload) => [payload.code, payload.target, payload.repeats])).toEqual([
+      ["EGRESS_DENIED", "10.0.0.1:443", 1], ["EGRESS_DENIED", "10.0.0.2:443", 1], ["EGRESS_DENIED", REFUSAL_OVERFLOW_TARGET, 1], ["MODEL_NOT_CONFIGURED", "other-model", 1]
+    ]);
+    now += 60_000;
+    recorder.flush();
+    // The overflow window counts the other targets: every refused request is in some event's repeats.
+    expect(written.at(-1)).toMatchObject({ code: "EGRESS_DENIED", target: REFUSAL_OVERFLOW_TARGET, repeats: 3 });
+    expect(written.filter((payload) => payload.code === "EGRESS_DENIED").reduce((sum, payload) => sum + payload.repeats, 0)).toBe(6);
+    // Once the windows closed, a new target has a window of its own again.
+    recorder.record(subject, "EGRESS_DENIED", "10.0.0.7:443");
+    expect(written.at(-1)).toMatchObject({ target: "10.0.0.7:443", repeats: 1 });
+    expect(refusalTarget(REFUSAL_OVERFLOW_TARGET)).not.toBe(REFUSAL_OVERFLOW_TARGET);
   });
 
   it("bounds open windows and targets", () => {
