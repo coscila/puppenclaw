@@ -549,7 +549,8 @@ export async function createDaemonServer(params: {
       keyedStreaming: 1,
       sseGap: 1,
       eventFeed: 1,
-      // 2: broker.job carries resumedFromJobId, broker.receipt servedModel, systemFingerprint and httpStatus.
+      // 2: broker.job carries resumedFromJobId, broker.receipt servedModel, systemFingerprint and httpStatus;
+      // 3: broker.refusal records each request the broker refused at a participant's boundary.
       brokerOutbox: BROKER_OUTBOX_LEVEL,
       instrumentMode: 1,
       instrumentVerbatim: 1,
