@@ -12,7 +12,12 @@ const MAX_BYTES = 64 * 1024;
 const SCOPES = new Set(["org:create_api_key", "user:profile", "user:inference", "user:sessions:claude_code", "user:mcp_servers", "user:file_upload", "user:plugins", "user:projects:read", "user:projects:write"]);
 type RefreshReply = { status: number; body: Buffer };
 export type OAuthRefreshTransport = (body: Buffer, signal: AbortSignal) => Promise<RefreshReply>;
-type Scope = { id: string; active: () => boolean };
+/**
+ * `refused` hears the relay refuse a request outside the native refresh it carries: another route or host
+ * (OAUTH_ROUTE_DENIED), or a token request for another client, grant or scope (OAUTH_REFRESH_REFUSED). It names the
+ * refusal only, never the request.
+ */
+type Scope = { id: string; active: () => boolean; refused?: (code: "OAUTH_ROUTE_DENIED" | "OAUTH_REFRESH_REFUSED") => void };
 
 // Native Claude remains the credential owner. This transport only restores its
 // fixed OAuth refresh endpoint inside the metered network namespace; it never
@@ -76,6 +81,7 @@ export class ClaudeOAuthRelay {
     if (!scope.active()) { this.reply(res, 409, { error: "oauth_attempt_closed" }); return; }
     if (req.method !== "POST" || req.url !== "/v1/oauth/token" || hosts.length !== 1 || ![CLAUDE_OAUTH_HOST, `${CLAUDE_OAUTH_HOST}:443`].includes(req.headers.host?.toLowerCase() ?? "") ||
       !/^application\/json(?:\s*;\s*charset=utf-8)?$/iu.test(req.headers["content-type"] ?? "") || req.headers["content-encoding"] !== undefined) {
+      scope.refused?.("OAUTH_ROUTE_DENIED");
       this.reply(res, 403, { error: "oauth_route_denied" }); return;
     }
     if (Number(req.headers["content-length"] ?? 0) > MAX_BYTES) { this.reply(res, 413, { error: "invalid_refresh_request" }); return; }
@@ -90,7 +96,7 @@ export class ClaudeOAuthRelay {
     try {
       const bytes = await limited(req, MAX_BYTES);
       let data: unknown; try { data = JSON.parse(bytes.toString("utf8")); } catch { this.reply(res, 400, { error: "invalid_refresh_request" }); return; }
-      if (!validRefresh(data)) { this.reply(res, 400, { error: "invalid_refresh_request" }); return; }
+      if (!validRefresh(data)) { scope.refused?.("OAUTH_REFRESH_REFUSED"); this.reply(res, 400, { error: "invalid_refresh_request" }); return; }
       if (!scope.active() || controller.signal.aborted) { this.reply(res, 409, { error: "oauth_attempt_closed" }); return; }
       const reply = await this.forward(Buffer.from(JSON.stringify(data)), controller.signal);
       if (!scope.active() || controller.signal.aborted) { this.reply(res, 409, { error: "oauth_attempt_closed" }); return; }

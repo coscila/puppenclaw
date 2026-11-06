@@ -328,7 +328,7 @@ describe("worker policy on the daemon", () => {
     const plain = await daemon();
     expect((await plain.inject({ method: "GET", url: "/capabilities" })).json().advancedOrchestration).toMatchObject({ workerPolicy: 1, workerJoinContinuation: true });
     const v2 = (await plain.inject({ method: "GET", url: "/v2/capabilities", headers: AUTH })).json();
-    expect(v2.features).toMatchObject({ workerPolicy: 1, brokerOutbox: 2 });
+    expect(v2.features).toMatchObject({ workerPolicy: 1, brokerOutbox: 3 });
     expect(v2.advancedOrchestration).toEqual({ workerPolicy: 1, evidencePolicies: ["public-literature", "entitled-institutional", "confidential-manuscript"], capabilityProfiles: ["code-authoring", "evidence-only", "run-fixed-programs"], onPremisesProviders: [], identifierOnlyEgress: "coscila" });
     await plain.close();
     const judge = judgeProvider("http://127.0.0.1:18160/v1");

@@ -14,11 +14,16 @@ import type { ItemResult, JobState, UsageReceipt, WorkerJobHeader } from "./type
  * `systemFingerprint` and `httpStatus` on broker.receipt (what the upstream
  * itself answered to the settling call; null when it named none or the daemon
  * did not observe it).
+ *
+ * brokerOutbox:3 adds the broker.refusal event: a request the broker refused
+ * because it reached outside the participant's boundaries (src/advanced/refusals.ts).
+ * Its envelope `jobId` names the job the refusal concerns, or is empty.
  */
-export const BROKER_OUTBOX_LEVEL = 2;
+export const BROKER_OUTBOX_LEVEL = 3;
 export const BROKER_JOB_EVENT = "broker.job";
 export const BROKER_RECEIPT_EVENT = "broker.receipt";
-export type BrokerEventType = typeof BROKER_JOB_EVENT | typeof BROKER_RECEIPT_EVENT;
+export const BROKER_REFUSAL_EVENT = "broker.refusal";
+export type BrokerEventType = typeof BROKER_JOB_EVENT | typeof BROKER_RECEIPT_EVENT | typeof BROKER_REFUSAL_EVENT;
 
 /** A receipt event carries the item output inline only up to this many UTF-8 bytes. */
 export const INLINE_OUTPUT_MAX_BYTES = 16_384;
@@ -95,13 +100,36 @@ export type BrokerReceiptPayload = {
   error: { code: string; retryable: boolean } | null;
 };
 
+/** What a refused request reached for: a network destination, a grant, an instrument, a credential or a model. */
+export type BrokerRefusalKind = "egress" | "grant" | "instrument" | "credential" | "model";
+
+/**
+ * brokerOutbox:3, one refused request or a run of identical ones. It names who asked (the participant's parent
+ * session: a chat's daemon session or `principal:<id>`; the chat attempt, null for a principal; the principal), what
+ * for (`kind` and `target`: host:port, provider, model, instrument digest or credential) and the refusal's closed
+ * `code`. It carries no request body, header, prompt, output or credential value. `repeats` counts the identical
+ * refusals this event stands for (src/advanced/refusals.ts folds a burst into one event); `at` is the time of the
+ * last of them. `jobId` is the job the refusal concerns (a worker agent's job, a resumed or dispatching job), or null.
+ */
+export type BrokerRefusalPayload = {
+  sessionName: string;
+  attemptId: string | null;
+  principalId: string | null;
+  jobId: string | null;
+  kind: BrokerRefusalKind;
+  target: string;
+  code: string;
+  at: string;
+  repeats: number;
+};
+
 export type BrokerEvent = {
   seq: number;
   type: BrokerEventType;
   at: string;
   jobId: string;
   itemId?: string;
-  payload: BrokerJobPayload | BrokerReceiptPayload;
+  payload: BrokerJobPayload | BrokerReceiptPayload | BrokerRefusalPayload;
 };
 
 /** Item states that end an item inside its job; a later completion of the same item is a duplicate. */

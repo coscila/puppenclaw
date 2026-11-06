@@ -359,14 +359,14 @@ export class PrincipalRegistry implements PrincipalHooks {
 
   admitJob(participant: RuntimeParticipant, kind: "agent" | "bulk", request: AgentSubmit | BulkSubmit, config: WorkerConfig): void {
     const entry = this.entryFor(participant);
-    if (kind !== "bulk") throw new PuppenclawError("PRINCIPAL_AGENT_UNSUPPORTED", "Principal sockets carry bulk authority only.");
+    if (kind !== "bulk") throw new PuppenclawError("PRINCIPAL_AGENT_UNSUPPORTED", "Principal sockets carry bulk authority only.", { target: "agent" });
     const lifecycle = this.lifecycleRefusal(entry);
-    if (lifecycle) throw principalRefusalError(lifecycle);
+    if (lifecycle) throw principalRefusalError(lifecycle, entry.record.id);
     const grants = entry.record.grants;
-    if (!grants.providers.includes(config.modelProvider.id)) throw new PuppenclawError("PROVIDER_NOT_GRANTED", "This principal is not granted that provider.");
+    if (!grants.providers.includes(config.modelProvider.id)) throw new PuppenclawError("PROVIDER_NOT_GRANTED", "This principal is not granted that provider.", { target: config.modelProvider.id });
     const digest = jobInstrumentDigest({ request });
-    if (digest !== undefined && !grants.instruments.includes(digest)) throw new PuppenclawError("INSTRUMENT_NOT_GRANTED", "This principal is not granted that instrument.");
-    if (digest === undefined && grants.instruments.length > 0) throw new PuppenclawError("INSTRUMENT_REQUIRED", "This principal may submit only work under one of its granted instruments.");
+    if (digest !== undefined && !grants.instruments.includes(digest)) throw new PuppenclawError("INSTRUMENT_NOT_GRANTED", "This principal is not granted that instrument.", { target: digest });
+    if (digest === undefined && grants.instruments.length > 0) throw new PuppenclawError("INSTRUMENT_REQUIRED", "This principal may submit only work under one of its granted instruments.", { target: config.modelProvider.id });
   }
 
   refusal(participant: RuntimeParticipant, job: Pick<WorkerJobHeader, "config" | "request">, items?: readonly PrincipalItemKey[]): PrincipalPauseReason | undefined {
@@ -654,12 +654,12 @@ export class PrincipalRegistry implements PrincipalHooks {
     };
     try {
       if (!(req.url ?? "").startsWith("/")) throw new PuppenclawError("UNKNOWN_PRINCIPAL_ROUTE", "A principal socket serves only its worker routes.");
-      if (entry.record.revokedAt !== null) throw principalRefusalError(PRINCIPAL_PAUSE_REASONS.revoked);
+      if (entry.record.revokedAt !== null) throw principalRefusalError(PRINCIPAL_PAUSE_REASONS.revoked, entry.record.id);
       const url = new URL(req.url!, "http://principal"), path = url.pathname, summary = url.searchParams.get("view") === "summary";
       const parent = entry.participant.parentSessionName;
       if (req.method === "GET" && (path === "/configs" || path === "/configs/list")) return reply(200, this.catalog(entry));
       if (req.method === "GET" && path === "/jobs") return reply(200, summary ? this.runtime.jobSummaries(parent, queryPage(url)) : { jobs: this.runtime.jobs(parent) });
-      if (req.method === "POST" && path === "/agent/submit") throw new PuppenclawError("PRINCIPAL_AGENT_UNSUPPORTED", "Principal sockets carry bulk authority only.");
+      if (req.method === "POST" && path === "/agent/submit") throw new PuppenclawError("PRINCIPAL_AGENT_UNSUPPORTED", "Principal sockets carry bulk authority only.", { target: "agent" });
       if (req.method === "POST" && path === "/bulk/submit") {
         const raw: unknown = JSON.parse(await readBody(req));
         this.preflight(entry, raw);
@@ -683,6 +683,8 @@ export class PrincipalRegistry implements PrincipalHooks {
       }
       throw new PuppenclawError("UNKNOWN_PRINCIPAL_ROUTE", "A principal socket serves only its worker routes.");
     } catch (error) {
+      // A refusal of a request outside the principal's grants or credential is a broker.refusal event.
+      this.runtime.recordRefusal(entry.participant, error, { fallbackTarget: entry.record.id });
       if (res.headersSent) { res.destroy(); return; }
       const [status, code] = socketStatus(error);
       reply(status, { error: errorText(error), code, ...conflictingJob(error) });
@@ -694,9 +696,9 @@ export class PrincipalRegistry implements PrincipalHooks {
     const body = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
     const grants = entry.record.grants;
     if (typeof body.configId === "string" && this.providers.has(body.configId) && !grants.providers.includes(body.configId))
-      throw new PuppenclawError("PROVIDER_NOT_GRANTED", "This principal is not granted that provider.");
+      throw new PuppenclawError("PROVIDER_NOT_GRANTED", "This principal is not granted that provider.", { target: body.configId });
     if (typeof body.instrumentDigest === "string" && !grants.instruments.includes(body.instrumentDigest))
-      throw new PuppenclawError("INSTRUMENT_NOT_GRANTED", "This principal is not granted that instrument.");
+      throw new PuppenclawError("INSTRUMENT_NOT_GRANTED", "This principal is not granted that instrument.", { target: body.instrumentDigest });
   }
 
   /**
@@ -707,7 +709,12 @@ export class PrincipalRegistry implements PrincipalHooks {
     const lineage = this.runtime.lineageOf(job);
     const items = job.results.filter((result) => result.state !== "completed").map((result) => ({ lineage, itemId: result.id }));
     const refusal = this.refusalFor(entry, job, { newItem: this.anyUncounted(entry, items) });
-    if (refusal) throw principalRefusalError(refusal);
+    if (!refusal) return;
+    // A withdrawn grant names the provider, else the instrument, the job runs under; a closed credential the principal.
+    const digest = jobInstrumentDigest(job);
+    const target = refusal !== PRINCIPAL_PAUSE_REASONS.grant ? entry.record.id
+      : !entry.record.grants.providers.includes(job.config.modelProvider.id) || digest === undefined ? job.config.modelProvider.id : digest;
+    throw principalRefusalError(refusal, target);
   }
 
   private catalog(entry: Entry): Record<string, unknown> {

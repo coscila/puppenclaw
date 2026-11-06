@@ -14,6 +14,11 @@ export function publicAddress(address: string): boolean {
   return !(first === 0 || first === 10 || first === 127 || first >= 224 || first === 169 && second === 254 || first === 172 && second >= 16 && second <= 31 || first === 192 && [0, 168].includes(second) || first === 100 && second >= 64 && second <= 127 || first === 198 && [18, 19, 51].includes(second) || first === 203 && second === 0);
 }
 function hostName(host: string): string { return host.toLowerCase().replace(/^\[|\]$/gu, "").replace(/\.$/u, ""); }
+/** An EGRESS_DENIED refusal naming the destination asked for (host:port), recorded as a broker.refusal event. */
+function egressDenied(hostname: string, port: number, message: string): PuppenclawError {
+  const host = hostName(hostname);
+  return new PuppenclawError("EGRESS_DENIED", message, { target: `${host.includes(":") ? `[${host}]` : host}:${port}` });
+}
 /** Broker owns DNS and pins the address used by the socket; clients cannot select an alternate resolver/address. */
 export class EgressPolicy {
   private readonly hosts = new Set(["api.anthropic.com", "platform.claude.com", "api.openai.com", "chatgpt.com", "api.langdock.com"]);
@@ -21,22 +26,22 @@ export class EgressPolicy {
   denyUrl(raw: string): void { try { this.hosts.add(hostName(new URL(raw).hostname)); } catch { this.hosts.add(hostName(raw)); } }
   async destination(raw: string, port: number): Promise<{ address: string; family: number; hostname: string }> {
     const hostname = hostName(raw);
-    if (![80, 443].includes(port) || isIP(hostname) || this.hosts.has(hostname) || /(^|\.)(localhost|local|internal)$/u.test(hostname)) throw new PuppenclawError("EGRESS_DENIED", "Use the metered broker for model endpoints; only public web destinations are allowed.");
+    if (![80, 443].includes(port) || isIP(hostname) || this.hosts.has(hostname) || /(^|\.)(localhost|local|internal)$/u.test(hostname)) throw egressDenied(hostname, port, "Use the metered broker for model endpoints; only public web destinations are allowed.");
     const aliases = new Set([hostname]); let cursor = hostname;
     for (let i = 0; i < 8; i++) {
       let names: string[] = []; try { names = await resolveCname(cursor); } catch { break; }
       if (!names.length) break;
-      for (const name of names) { const h = hostName(name); if (this.hosts.has(h)) throw new PuppenclawError("EGRESS_DENIED", "Model endpoint aliases require the metered broker."); aliases.add(h); }
+      for (const name of names) { const h = hostName(name); if (this.hosts.has(h)) throw egressDenied(hostname, port, "Model endpoint aliases require the metered broker."); aliases.add(h); }
       cursor = hostName(names[0]!);
     }
     const addresses = await lookup(hostname, { all: true });
-    if (!addresses.length || addresses.some((a) => !publicAddress(a.address))) throw new PuppenclawError("EGRESS_DENIED", "Private or ambiguous web addresses are blocked.");
+    if (!addresses.length || addresses.some((a) => !publicAddress(a.address))) throw egressDenied(hostname, port, "Private or ambiguous web addresses are blocked.");
     const deniedAddresses = new Set<string>();
     for (const h of this.hosts) {
       if (isIP(h)) deniedAddresses.add(h);
       else try { for (const a of await lookup(h, { all: true })) deniedAddresses.add(a.address); } catch { /* An unavailable model host cannot open egress. */ }
     }
-    if (addresses.some((a) => deniedAddresses.has(a.address))) throw new PuppenclawError("EGRESS_DENIED", "Model endpoint address aliases require the metered broker.");
+    if (addresses.some((a) => deniedAddresses.has(a.address))) throw egressDenied(hostname, port, "Model endpoint address aliases require the metered broker.");
     return { ...addresses[0]!, hostname };
   }
 }
@@ -65,18 +70,19 @@ export async function proxyConnect(policy: EgressPolicy, req: IncomingMessage, s
   const failClosed = () => { socket.destroy(); upstream?.destroy(); };
   socket.on("error", failClosed); socket.once("close", () => upstream?.destroy());
   const target = new URL(`https://${req.url}`);
-  const destination = await policy.destination(target.hostname, Number(target.port || 443));
+  const port = Number(target.port || 443);
+  const destination = await policy.destination(target.hostname, port);
   socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
   let hello = head; const readHello = await new Promise<Buffer>((resolve, reject) => {
     const timeout = setTimeout(() => done(new Error("TLS handshake timed out.")), 15_000);
     let settled = false;
     const done = (error?: Error) => { if (settled) return; settled = true; clearTimeout(timeout); socket.removeListener("data", onData); socket.removeListener("error", onError); socket.removeListener("close", onClose); error ? reject(error) : resolve(hello); };
-    const check = () => { try { if (hello.length > 64 * 1024) return done(new Error("TLS ClientHello too large.")); const parsed = clientHelloServerName(hello); if (!parsed.ready) return; if (parsed.encrypted || parsed.name !== destination.hostname) return done(new Error("TLS authority mismatch or encrypted server name.")); socket.pause(); done(); } catch (e) { done(e as Error); } };
+    const check = () => { try { if (hello.length > 64 * 1024) return done(new Error("TLS ClientHello too large.")); const parsed = clientHelloServerName(hello); if (!parsed.ready) return; if (parsed.encrypted || parsed.name !== destination.hostname) return done(egressDenied(destination.hostname, port, "TLS authority mismatch or encrypted server name.")); socket.pause(); done(); } catch (e) { done(e as Error); } };
     const onData = (chunk: Buffer) => { hello = Buffer.concat([hello, chunk]); check(); }, onError = (error: Error) => done(error), onClose = () => done(new Error("Client disconnected."));
     socket.on("data", onData); socket.once("error", onError); socket.once("close", onClose); if (head.length) check();
   });
   if (socket.destroyed) return;
-  const remote = connect({ host: destination.address, port: Number(target.port || 443), family: destination.family }); upstream = remote;
+  const remote = connect({ host: destination.address, port, family: destination.family }); upstream = remote;
   remote.on("error", failClosed); remote.once("close", () => socket.destroy());
   await new Promise<void>((resolve, reject) => { remote.once("connect", resolve); remote.once("error", reject); remote.once("close", () => reject(new Error("Upstream closed during connection."))); });
   if (socket.destroyed || remote.destroyed) { failClosed(); return; }
@@ -84,7 +90,7 @@ export async function proxyConnect(policy: EgressPolicy, req: IncomingMessage, s
 }
 export async function proxyHttp(policy: EgressPolicy, req: IncomingMessage, res: ServerResponse): Promise<void> {
   const target = new URL(req.url!); if (target.protocol !== "http:") throw new Error("Use CONNECT for HTTPS.");
-  if (req.headers.host?.toLowerCase() !== target.host.toLowerCase()) throw new Error("HTTP authority mismatch.");
+  if (req.headers.host?.toLowerCase() !== target.host.toLowerCase()) throw egressDenied(target.hostname, Number(target.port || 80), "HTTP authority mismatch.");
   const destination = await policy.destination(target.hostname, Number(target.port || 80));
   const headers = { ...req.headers }; delete headers["proxy-authorization"]; delete headers["proxy-connection"];
   const upstream = httpRequest(target, { headers, method: req.method,
