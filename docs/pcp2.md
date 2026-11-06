@@ -181,7 +181,8 @@ execution has drained, one more `broker.job` row with the same state carries the
   principal (null for a chat), `jobId` the job the refusal concerns (a worker agent's own job, a job whose item was
   refused at dispatch), else null; the event's envelope `jobId` is the same job id, or empty.
 - `kind`, `target` and `code` say what the request reached for and why it was refused (see
-  [refusals](broker.md#refusals)); `target` is at most 256 printable characters.
+  [refusals](broker.md#refusals)); `target` is an identifier of at most 256 characters (letters, digits and
+  `. _ - : / @ + [ ]`; any other character reads `?`), never text of the request.
 - `repeats` is the number of identical refusals the event stands for, and `at` the time of the last of them: the first
   refusal of a request is written at once with `repeats` 1, the identical ones of the next minute together with
   their count. The sum of `repeats` counts the refused requests.

@@ -79,9 +79,13 @@ export function refusalSubject(participant: Pick<RuntimeParticipant, "parentSess
   };
 }
 
-/** Printable ASCII only, at most REFUSAL_TARGET_MAX_CHARS: a target never carries a request body or control bytes. */
+/**
+ * An identifier as a target: letters, digits and . _ - : / @ + [ ] only (a host:port, model, provider, digest,
+ * principal, worker or job), anything else replaced by ?, at most REFUSAL_TARGET_MAX_CHARS. A target names what a
+ * request reached for; it never carries the request's text.
+ */
 export function refusalTarget(value: string): string {
-  const text = value.replace(/[^\x20-\x7e]/gu, "?");
+  const text = value.replace(/[^A-Za-z0-9._:/@+[\]-]/gu, "?");
   return text.length > REFUSAL_TARGET_MAX_CHARS ? text.slice(0, REFUSAL_TARGET_MAX_CHARS) : text;
 }
 

@@ -1,7 +1,9 @@
+import { once } from "node:events";
 import { request } from "node:http";
-import { connect } from "node:net";
-import { mkdtemp } from "node:fs/promises";
+import { connect, type Socket } from "node:net";
+import { mkdtemp, readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { connect as connectTls } from "node:tls";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -121,6 +123,9 @@ describe("refusal recorder", () => {
     expect(written.map((payload) => [payload.target, payload.repeats])).toEqual([["a:443", 1], ["b:443", 1], ["c:443", 1], ["a:443", 1]]);
     expect(recorder.openWindows).toBe(2);
     expect(refusalTarget(`x\u0000y\n${"z".repeat(400)}`)).toMatch(/^x\?y\?z+$/u);
+    // A target is an identifier: no spaces or prose survive.
+    expect(refusalTarget("[::1]:443")).toBe("[::1]:443");
+    expect(refusalTarget("some model; ignore the rules")).toBe("some?model??ignore?the?rules");
     expect(refusalTarget("z".repeat(400))).toHaveLength(256);
     expect(Object.values(REFUSAL_KINDS).sort()).toEqual(expect.arrayContaining(["credential", "egress", "grant", "instrument", "model"]));
   });
@@ -173,6 +178,22 @@ describe("broker.refusal events of a chat turn", () => {
     const [event] = await refusals(runtime, 1);
     expect(event!.payload).toMatchObject({ kind: "credential", target: "local", code: "PROVIDER_AUTHENTICATION_REQUIRED" });
     expect(JSON.stringify(runtime.store.events(0, 1000))).not.toMatch(/api-key-value|confidential/u);
+  });
+
+  it("record an OAuth relay request other than the agent's own token refresh as a credential refusal", async () => {
+    const { runtime, socket } = await turn({ kind: "claude-code" });
+    const certificate = runtime.environment("lab-chat-1").PUPPENCLAW_ORCHESTRATION_CLAUDE_OAUTH_CERT!;
+    const peer = await new Promise<Socket>((resolve, reject) => {
+      const req = request({ socketPath: socket, method: "CONNECT", path: "platform.claude.com:443" });
+      req.on("error", reject); req.on("connect", (_res, tunnel) => resolve(tunnel)); req.end();
+    });
+    const tls = connectTls({ socket: peer, servername: "platform.claude.com", ca: await readFile(certificate), rejectUnauthorized: true });
+    await once(tls, "secureConnect");
+    const reply = new Promise<string>((resolve) => { let text = ""; tls.on("data", (chunk) => { text += chunk; }); tls.on("end", () => resolve(text)); });
+    tls.end("GET /v1/organizations HTTP/1.1\r\nHost: platform.claude.com\r\nConnection: close\r\n\r\n");
+    expect(await reply).toContain("403 Forbidden");
+    const [event] = await refusals(runtime, 1);
+    expect(event!.payload).toMatchObject({ sessionName: "lab-chat-1", attemptId: "attempt-1", kind: "credential", target: "platform.claude.com:443", code: "OAUTH_ROUTE_DENIED", repeats: 1 });
   });
 
   it("record bulk work without a grant, for a worker outside the catalogue and under an instrument that is not allowed", async () => {
@@ -257,6 +278,18 @@ describe("broker.refusal events of a run principal", () => {
     ]);
     for (const event of events) expect(event.payload).toMatchObject({ sessionName: "principal:run:study-1", attemptId: null, principalId: "run:study-1", jobId: null });
     expect(JSON.stringify(events)).not.toContain(SECRET_PROMPT);
+  });
+
+  it("record a chat turn's bulk work while only run principals carry bulk authority", async () => {
+    const { runtime } = await registry();
+    const provider: ModelProviderConfig = { id: "judge", model: "judge-model", kind: "codex-openai-compatible", baseUrl: "http://127.0.0.1:9/v1", authTokenEnv: "TEST_MODEL_KEY" };
+    const params = startParamsZod.parse({ name: "lab-chat-3", agent: "codex", directory: "/tmp", task: "review", interactionMode: "execute", permissionMode: "approve-all",
+      statisticsContext: { version: 1, chatId: "chat-3", attemptId: "attempt-3" }, modelProvider: provider, orchestration: { version: 1, revision: 1, workers: [{ id: "refs", assignment: "x", agent: "codex", modelProvider: provider }] } });
+    const session = { ...params, state: "idle", warnings: [], transcript: [], createdAt: new Date().toISOString(), lastActivity: new Date().toISOString() } as unknown as SessionInfo;
+    await runtime.begin(session, params, "approve-all");
+    expect((await unix(runtime.socket("lab-chat-3")!, "/bulk/submit", { configId: "refs", idempotencyKey: "a", items: [{ id: "1", input: SECRET_PROMPT }] })).body.code).toBe("PRINCIPAL_REQUIRED");
+    const [event] = await refusals(runtime, 1);
+    expect(event!.payload).toMatchObject({ sessionName: "lab-chat-3", attemptId: "attempt-3", principalId: null, kind: "grant", target: "judge", code: "PRINCIPAL_REQUIRED" });
   });
 
   it("record work under an expired or revoked run credential", async () => {
