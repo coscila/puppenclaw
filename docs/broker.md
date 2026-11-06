@@ -122,6 +122,28 @@ daemon stops. A provider configured only in `PUPPENCLAW_MODEL_PROVIDERS`, for ru
 tunnel must present a ClientHello whose server name matches the `CONNECT` authority; encrypted ClientHellos are
 refused. The egress proxy can tell hosts apart but cannot read TLS contents.
 
+### Refusals
+
+Every request the broker refuses because it reaches outside the participant's boundaries becomes a `broker.refusal`
+event in the feed ([pcp2](pcp2.md#event-payloads)), with the participant, what the request reached for and the
+refusal's code:
+
+| Kind | Refusals | Target |
+| --- | --- | --- |
+| `egress` | `EGRESS_DENIED` (destination, alias, address, TLS or HTTP authority mismatch) | `host:port` |
+| `grant` | `PRINCIPAL_REQUIRED`, `PROVIDER_NOT_GRANTED`, `GRANT_WITHDRAWN`, `WORKER_DELEGATION_DENIED`, `WORKER_CONTROL_DENIED`, `WORKER_CONFIG_NOT_FOUND`, `BULK_EXECUTION_REQUIRED`, `WORKER_PERMISSION_DENIED`, `PRINCIPAL_AGENT_UNSUPPORTED`, `CAPABILITY_PROFILE_DENIED`, `PROVIDER_NOT_ON_PREMISES` | provider, worker, job or instrument |
+| `instrument` | `INSTRUMENT_NOT_ALLOWED`, `INSTRUMENT_NOT_GRANTED`, `INSTRUMENT_REQUIRED`, `INSTRUMENT_NOT_PINNED`, `INSTRUMENT_MESSAGE_MISMATCH` | instrument digest (or the worker) |
+| `credential` | `PRINCIPAL_REVOKED`, `PRINCIPAL_EXPIRED` (a run principal's socket is its credential), `PROVIDER_AUTHENTICATION_REQUIRED` (an API key on a subscription OAuth route), `OAUTH_ROUTE_DENIED`, `OAUTH_REFRESH_REFUSED` (an OAuth relay request other than the agent's own token refresh) | principal, provider or `platform.claude.com:443` |
+| `model` | `MODEL_NOT_CONFIGURED` | the requested model |
+
+A refusal the participant cannot cause by reaching further is not recorded: a closed turn, an exhausted budget, a
+daemon shutting down, a malformed request. An event carries no request body, header, prompt, output or credential. The
+first refusal of a kind of request is written at once; identical refusals of the same participant and job within the
+next minute are counted and written as one more event whose `repeats` holds their number, so a client that repeats a
+refused request in a loop cannot flood the feed. The counts are written when their minute ends and when the daemon
+closes; a daemon that stops without closing loses at most the last minute's repeats of each request, never its first
+refusal. Purging a session erases its refusal events like its jobs' events.
+
 ## Provider pauses and retries
 
 A bulk call's HTTP 429 or authentication failure (401, 403) pauses the provider for the attempt at once; a 503 does so

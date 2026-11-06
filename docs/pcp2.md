@@ -49,7 +49,7 @@ under 1 KB:
 | `keyedStreaming` | 1 | Keyed turns may stream their own output. |
 | `sseGap` | 1 | Slow streams drop progress events and report a `gap`. |
 | `eventFeed` | 1 | `GET /v2/events`, `POST /v2/events/ack`. |
-| `brokerOutbox` | 2 | Payload level of the feed events (see [event payloads](#event-payloads)). |
+| `brokerOutbox` | 3 | Payload level of the feed events (see [event payloads](#event-payloads)); level 3 adds `broker.refusal`. |
 | `instrumentMode` | 1 | `PUT` and `GET /v2/instruments`; bulk jobs that name an instrument. |
 | `instrumentVerbatim` | 1 | Instrument bundles with `transport.messages: "verbatim"`. |
 | `workerPolicy` | 1 | Worker policies are accepted and enforced (absent with `PUPPENCLAW_WORKER_POLICY=off`). |
@@ -114,9 +114,11 @@ Two opt-ins change only the response, never the turn:
 ## Event feed
 
 The broker reports through an acknowledged event feed. `advanced.sqlite` holds an outbox table; every job creation and
-state change writes a `broker.job` row, and every bulk item that settles after a provider call writes one
-`broker.receipt` row (an item refused before a retry is dispatched settles with the receipt of its last call). Each row
-is written in the same transaction as the change itself, so a crash keeps both or loses both. An item gets at most one
+state change writes a `broker.job` row, every bulk item that settles after a provider call writes one
+`broker.receipt` row (an item refused before a retry is dispatched settles with the receipt of its last call), and every
+request the broker refuses at a participant's boundary writes a `broker.refusal` row. Each job and receipt row is
+written in the same transaction as the change itself, so a crash keeps both or loses both; a refusal row is committed
+with the next write batch (within the 50 ms commit window). An item gets at most one
 receipt row per job; a duplicate completion is refused. Sequence numbers only grow and are never reused, also after
 pruning, so gaps can appear only at or below the acknowledged cursor.
 
@@ -168,6 +170,22 @@ execution has drained, one more `broker.job` row with the same state carries the
 - `error.code` comes from a closed set; `PROVIDER_RATE_LIMITED`, `PROVIDER_UNREACHABLE`, `PROVIDER_PAUSED`,
   `TIME_LIMIT`, `NO_FINAL_MESSAGE` and `INTERRUPTED_RESTART` are retryable.
 
+`broker.refusal` (level 3):
+
+```text
+{sessionName, attemptId, principalId, jobId, kind: egress|grant|instrument|credential|model, target, code, at, repeats}
+```
+
+- `sessionName` is the parent session of the participant that made the request: the chat's daemon session (also for
+  its worker agents) or `principal:<id>`. `attemptId` is the chat attempt (null for a principal), `principalId` the
+  principal (null for a chat), `jobId` the job the refusal concerns (a worker agent's own job, a job whose item was
+  refused at dispatch), else null; the event's envelope `jobId` is the same job id, or empty.
+- `kind`, `target` and `code` say what the request reached for and why it was refused (see
+  [refusals](broker.md#refusals)); `target` is at most 256 printable characters.
+- `repeats` is the number of identical refusals the event stands for, and `at` the time of the last of them: the first
+  refusal of a request is written at once with `repeats` 1, the identical ones of the next minute together with
+  their count. The sum of `repeats` counts the refused requests.
+
 ### Receipt provenance
 
 Every broker receipt (bulk call, retried attempt, native controller or agent call) carries `serverFingerprint`: the
@@ -182,7 +200,8 @@ call sends exactly those canonical bytes, so there it is also the digest of the 
 ### Erasure and retention
 
 Erasure never runs ahead of the feed, and contents never wait for it. Purging a session (or an owner) erases a job
-whose events are all acknowledged at once. A job with unacknowledged events loses its header, items, inputs and
+whose events are all acknowledged at once, and the session's acknowledged refusal events; its other refusal events go
+once the acknowledgement covers them. A job with unacknowledged events loses its header, items, inputs and
 acknowledged events at once, and its unacknowledged receipt events lose their inline `output` (`outputDigest` and
 `outputBytes` stay); only its receipt rows and those events wait, and go when the acknowledgement covers them.
 `GET /v2/health` reports how many jobs wait (`backlog.brokerErasures`), and `POST /sessions/owner/purge` answers
