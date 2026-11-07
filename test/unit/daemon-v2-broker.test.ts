@@ -54,7 +54,7 @@ describe("pcp/2 broker routes on the daemon", () => {
       }
       const capabilities = JSON.parse((await app.inject({ method: "GET", url: "/v2/capabilities", headers: auth })).body) as { features: Record<string, number>; limits: Record<string, number> };
       // brokerOutbox 2: broker.job carries resumedFromJobId, broker.receipt servedModel, systemFingerprint and httpStatus.
-      expect(capabilities.features).toMatchObject({ eventFeed: 1, brokerOutbox: 2, instrumentMode: 1 });
+      expect(capabilities.features).toMatchObject({ eventFeed: 1, brokerOutbox: 3, instrumentMode: 1 });
       expect(capabilities.limits).toMatchObject({ eventPageMax: 1000, eventWaitMsMax: 25_000, eventInlineOutputMax: 16_384 });
       const empty = JSON.parse((await app.inject({ method: "GET", url: "/v2/events", headers: auth })).body) as Record<string, unknown>;
       expect(empty).toEqual({ ok: true, ...envelope, feedId: expect.any(String), events: [], next: 0, hasMore: false, head: 0, acked: 0 });

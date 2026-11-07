@@ -6,6 +6,7 @@ import type { DatabaseSync as Database, StatementSync } from "node:sqlite";
 import {
   BROKER_JOB_EVENT,
   BROKER_RECEIPT_EVENT,
+  BROKER_REFUSAL_EVENT,
   brokerJobCounts,
   brokerJobPayload,
   brokerReceiptPayload,
@@ -14,7 +15,8 @@ import {
   type BrokerEvent,
   type BrokerEventType,
   type BrokerJobCounts,
-  type BrokerJobPayload
+  type BrokerJobPayload,
+  type BrokerRefusalPayload
 } from "./outbox.js";
 import { canonicalJson, effectiveSettings, serverFingerprint, settingsSha256, sha256Hex } from "./fingerprint.js";
 import type { WorkerJob, WorkerJobHeader, UsageReceipt, ItemResult, BulkSubmit, JobProgress, JobState, PageOptions, ResultPage } from "./types.js";
@@ -194,7 +196,8 @@ export class AdvancedStore {
       CREATE TABLE IF NOT EXISTS archived_jobs (job_id TEXT PRIMARY KEY, parent TEXT NOT NULL, child TEXT, owner_key TEXT, file TEXT NOT NULL, sha256 TEXT NOT NULL, archived_at TEXT NOT NULL) WITHOUT ROWID;
       CREATE INDEX IF NOT EXISTS archived_jobs_parent ON archived_jobs(parent);
       CREATE INDEX IF NOT EXISTS archived_jobs_child ON archived_jobs(child);
-      CREATE INDEX IF NOT EXISTS archived_jobs_owner ON archived_jobs(owner_key);`);
+      CREATE INDEX IF NOT EXISTS archived_jobs_owner ON archived_jobs(owner_key);
+      CREATE TABLE IF NOT EXISTS refusal_erasure_pending (session TEXT PRIMARY KEY, requested_at TEXT NOT NULL) WITHOUT ROWID;`);
     // Expression indexes replace the full scans of owner, child and state lookups. SQLite
     // maintains them for writes by older daemons too. A row that is not JSON would make
     // their creation fail; the lookups then fall back to scans instead of refusing to open.
@@ -206,6 +209,8 @@ export class AdvancedStore {
       running: index("CREATE INDEX IF NOT EXISTS receipts_running ON receipts(id) WHERE json_extract(payload,'$.state')='running'")
     };
     index("CREATE INDEX IF NOT EXISTS items_truncated ON job_items(job_id,state) WHERE json_extract(result,'$.truncated')=1");
+    // The refusal events of a session, for its erasure; without it the erasure scans the outbox's refusal rows.
+    index(`CREATE INDEX IF NOT EXISTS outbox_refusal_session ON outbox(json_extract(payload,'$.sessionName'),seq) WHERE type='${BROKER_REFUSAL_EVENT}'`);
     const sequence = () => Number((db.prepare("SELECT value FROM change_sequence WHERE id=1").get() as { value: number }).value);
     // A new outbox starts at the current revision: changes made before the store had an
     // outbox are not replayed into the feed.
@@ -513,6 +518,18 @@ export class AdvancedStore {
     void this.enqueue(() => this.writeReceiptRow(entry.receipt, entry.json));
   }
 
+  /**
+   * One broker.refusal event (src/advanced/refusals.ts), group-committed like every other write. Its envelope jobId
+   * is the job the refusal concerns, or empty: a refusal of a request that named no job (a submission, a tunnel).
+   */
+  recordRefusal(payload: BrokerRefusalPayload): Promise<void> {
+    const json = JSON.stringify(payload);
+    return this.enqueue((batch) => {
+      this.stmt("INSERT INTO outbox (type,jobId,itemId,payload,createdAt,receiptId) VALUES (?,?,NULL,?,?,NULL)").run(BROKER_REFUSAL_EVENT, payload.jobId ?? "", json, this.timestamp());
+      batch.events += 1;
+    });
+  }
+
   // ---------------------------------------------------------------- reads
 
   jobHeader(id: string): WorkerJobHeader | null {
@@ -763,6 +780,7 @@ export class AdvancedStore {
         if (deferred.has(id)) this.deferErasure(id);
         else this.eraseJob(id);
       }
+      this.eraseRefusals(name);
       this.countErasuresPending();
     });
     for (const id of [...this.running.keys()]) if (!this.jobExists(id)) this.running.delete(id);
@@ -802,8 +820,20 @@ export class AdvancedStore {
     this.running.delete(id); this.headerTouches.delete(id);
   }
 
+  /**
+   * A purged session's refusal events: the acknowledged ones go now; the others carry no content and go once the feed
+   * acknowledged them (refusal_erasure_pending tracks the session until then).
+   */
+  private eraseRefusals(session: string): void {
+    this.stmt(`DELETE FROM outbox WHERE json_extract(payload,'$.sessionName')=? AND type='${BROKER_REFUSAL_EVENT}' AND seq<=?`).run(session, this.ackedSeq);
+    const remaining = this.stmt(`SELECT 1 FROM outbox WHERE json_extract(payload,'$.sessionName')=? AND type='${BROKER_REFUSAL_EVENT}' AND seq>? LIMIT 1`).get(session, this.ackedSeq) !== undefined;
+    if (remaining) this.stmt("INSERT OR IGNORE INTO refusal_erasure_pending (session, requested_at) VALUES (?,?)").run(session, this.timestamp());
+    else this.stmt("DELETE FROM refusal_erasure_pending WHERE session=?").run(session);
+  }
+
   /** Completes the erasures whose events the feed has now acknowledged: their receipt rows and remaining events go. */
   private completeDeferredPurgesIn(): number {
+    for (const row of this.stmt("SELECT session FROM refusal_erasure_pending").all() as { session: string }[]) this.eraseRefusals(row.session);
     let erased = 0;
     for (const row of this.stmt("SELECT job_id FROM erasure_pending").all() as { job_id: string }[]) {
       if (this.hasUnacknowledgedEvents(row.job_id)) continue;

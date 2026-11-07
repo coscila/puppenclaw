@@ -13,12 +13,13 @@ import { AdvancedStore, commitWindowFromEnvironment, pageOptions, type AdvancedS
 import { BulkConcurrencyLimiter, type BulkCapacityLimits, type BulkConcurrencyOptions } from "./concurrency.js";
 import { BulkResponseTransport, shapeLikeNamespaceProxy, type BulkRequestScope, type BulkRoute } from "./bulk-transport.js";
 import { EgressPolicy, proxyConnect, proxyHttp } from "./egress.js";
-import { ClaudeOAuthRelay } from "./claude-oauth-relay.js";
+import { CLAUDE_OAUTH_HOST, ClaudeOAuthRelay } from "./claude-oauth-relay.js";
+import { RefusalRecorder, refusalSubject, refusalTargetOf, type RefusalRecorderOptions } from "./refusals.js";
 import { noUsage, UsageParser } from "./usage.js";
 import { chatCompletionContent, responseOutputText } from "./responses-output.js";
 import { responseSchemaForProvider } from "./response-schema.js";
 import { canonicalJson, effectiveSettings, finishReasonOf, serverFingerprint, settingsSha256, sha256Hex } from "./fingerprint.js";
-import { INSTRUMENT_MESSAGE_MISMATCH, instrumentBundleZod, instrumentCall, instrumentMaxTokens, instrumentMessageMode, instrumentSystemPrompt, installedSettingsSha256, storedInstrumentBundle, storedMessageMode, verbatimBundleProblem, verbatimInstrumentCall, type InstrumentBundle } from "./instruments.js";
+import { INSTRUMENT_MESSAGE_MISMATCH, instrumentBundleZod, instrumentCall, instrumentMaxTokens, instrumentMessageMode, instrumentSystemPrompt, installedSettingsSha256, storedInstrumentBundle, storedMessageMode, verbatimBundleProblem, verbatimInstrumentCall, type InstrumentBundle, type VerbatimCall } from "./instruments.js";
 import { instrumentDigestOf, outputDigest } from "./outbox.js";
 import { bulkRetryFromEnvironment, failureCodeForStatus, nativeProviderPause, PAUSE_HTTP_STATUS, resumeAfterFromHeaders, retryDelayMs, RETRYABLE_HTTP_STATUS, RETRYABLE_TRANSPORT_CODES, sleep, type BulkRetryOptions } from "./retry.js";
 import { PRINCIPAL_PAUSE_REASONS, principalPauseCode, principalPauseOf, type PrincipalAdmission, type PrincipalHooks, type PrincipalItemKey, type PrincipalPauseReason } from "./principals-schema.js";
@@ -116,7 +117,7 @@ const VERBATIM_PRINCIPAL_REQUIRED = "A verbatim instrument runs only over a run 
 /** Verbatim instruments bypass the worker policy, so only a run principal (one bound to a study run) may run them. */
 const verbatimAuthority = (holder: { principalId?: string; runId?: string }): boolean => holder.principalId !== undefined && holder.runId !== undefined;
 /** `digests.inline`: compute submission digests on the event loop instead of the digest worker (tests and measurements). */
-export type AdvancedRuntimeOptions = { store?: AdvancedStoreOptions; transport?: BulkResponseTransport; retry?: BulkRetryOptions; digests?: { inline?: boolean } };
+export type AdvancedRuntimeOptions = { store?: AdvancedStoreOptions; transport?: BulkResponseTransport; retry?: BulkRetryOptions; digests?: { inline?: boolean }; refusals?: RefusalRecorderOptions };
 /**
  * The bulk capacity a runtime applies (pcp/2 bulkCapacity), numbers and names only: the limiter's limits, the deadline
  * of each attempt (headers and body) and the retries of a transient failure, each attempt with a new deadline.
@@ -190,7 +191,10 @@ export class AdvancedRuntime {
   private principals: PrincipalHooks | undefined;
   /** Worker policy: whether its fields are accepted, and the providers configured as on premises. */
   private workerPolicy: WorkerPolicySettings = DEFAULT_WORKER_POLICY;
+  /** Refused requests as broker.refusal events (src/advanced/refusals.ts). */
+  private readonly refusals: RefusalRecorder;
   private constructor(readonly store: AdvancedStore, root: string, concurrency?: BulkConcurrencyOptions, options: AdvancedRuntimeOptions = {}) {
+    this.refusals = new RefusalRecorder((payload) => { void store.recordRefusal(payload).catch(() => undefined); }, options.refusals);
     this.bulkConcurrency = new BulkConcurrencyLimiter(concurrency);
     this.socketRoot = join("/tmp", `ocsl-model-broker-${process.getuid?.() ?? "user"}-${hash(root).slice(0, 12)}`);
     this.bulkTransport = options.transport ?? new BulkResponseTransport();
@@ -203,6 +207,15 @@ export class AdvancedRuntime {
   }
   attach(driver: RuntimeDriver): void { this.driver = driver; }
   usePrincipals(hooks: PrincipalHooks): void { this.principals = hooks; }
+  /**
+   * Records a refused request of a participant as a broker.refusal event when the error's code is a containment
+   * refusal (src/advanced/refusals.ts); any other error is ignored. The target is the one the error names, else
+   * `fallbackTarget`; `jobId` names the job the refusal concerns when the participant's own job is not it.
+   */
+  recordRefusal(p: Pick<RuntimeParticipant, "parentSessionName" | "attemptId" | "principalId" | "jobId">, error: unknown, options: { fallbackTarget?: string; jobId?: string } = {}): void {
+    if (!(error instanceof PuppenclawError)) return;
+    this.refusals.record(refusalSubject(p, options.jobId), error.code, refusalTargetOf(error) ?? options.fallbackTarget ?? "");
+  }
   /**
    * What bulk dispatch applies, read from the limiter, the transport and the retry settings in use (never parsed again):
    * the limits of `providers` and of every provider the limits name, the per-attempt deadline and the retries.
@@ -283,7 +296,7 @@ export class AdvancedRuntime {
   instruments(): InstrumentRecord[] { return this.store.instruments(); }
   private installedInstrument(digest: string): InstrumentBundle {
     const record = this.store.instrument(digest);
-    if (!record) throw new PuppenclawError("INSTRUMENT_NOT_ALLOWED", "This instrument digest is not installed in the broker.");
+    if (!record) throw new PuppenclawError("INSTRUMENT_NOT_ALLOWED", "This instrument digest is not installed in the broker.", { target: digest });
     return instrumentBundleZod.parse(record.bundle);
   }
   metered(name: string): boolean { return this.participants.has(name); }
@@ -377,14 +390,17 @@ export class AdvancedRuntime {
     if (this.servers.has(name)) return;
     const path = join(this.socketRoot, `${hash(name).slice(0, 24)}.sock`);
     await unlink(path).catch((e) => { if (e.code !== "ENOENT") throw e; });
-    const server = createServer((req, res) => { req.on("error", () => res.destroy()); res.on("error", () => res.destroy()); void this.handle(name, req, res).catch((error) => { if (!res.headersSent) { res.writeHead(socketErrorStatus(error), { "content-type": "application/json" }); res.end(JSON.stringify({ error: message(error), code: error instanceof PuppenclawError ? error.code : "INVALID_REQUEST", ...conflictingJob(error) })); } else res.destroy(); }); });
+    const server = createServer((req, res) => { req.on("error", () => res.destroy()); res.on("error", () => res.destroy()); void this.handle(name, req, res).catch((error) => {
+      const participant = this.participants.get(name); if (participant) this.recordRefusal(participant, error);
+      if (!res.headersSent) { res.writeHead(socketErrorStatus(error), { "content-type": "application/json" }); res.end(JSON.stringify({ error: message(error), code: error instanceof PuppenclawError ? error.code : "INVALID_REQUEST", ...conflictingJob(error) })); } else res.destroy(); }); });
     server.on("connect", (req, socket, head) => {
       let participant: RuntimeParticipant; try { participant = this.requireParticipant(name); } catch { socket.destroy(); return; }
       if (participant.provider.kind === "claude-code" && ClaudeOAuthRelay.accepts(req.url) && this.oauthRelay) {
-        this.oauthRelay.connect(socket, head, { id: JSON.stringify([participant.sessionName, participant.attemptId]), active: () => { try { return this.requireParticipant(name) === participant; } catch { return false; } } });
+        this.oauthRelay.connect(socket, head, { id: JSON.stringify([participant.sessionName, participant.attemptId]), active: () => { try { return this.requireParticipant(name) === participant; } catch { return false; } },
+          refused: (code) => this.refusals.record(refusalSubject(participant), code, `${CLAUDE_OAUTH_HOST}:443`) });
         return;
       }
-      void proxyConnect(this.policy, req, socket, head).catch(() => socket.destroy());
+      void proxyConnect(this.policy, req, socket, head).catch((error) => { this.recordRefusal(participant, error); socket.destroy(); });
     });
     await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(path, () => { server.removeListener("error", reject); resolve(); }); });
     const sockets = new Set<Socket>(); server.on("connection", (socket) => { socket.on("error", () => socket.destroy()); sockets.add(socket); socket.once("close", () => sockets.delete(socket)); });
@@ -405,7 +421,7 @@ export class AdvancedRuntime {
     if (req.method === "POST" && path === "/bulk/submit") { json(await this.submit(p, "bulk", bulkSubmitZod.parse(JSON.parse((await body(req)).toString())), undefined, summary)); return; }
     const route = /^\/jobs\/([a-f0-9-]+)(?:\/(cancel|resume|results))?$/u.exec(path);
     if (route) {
-      if (p.jobId && req.method === "POST" && route[2]) throw new PuppenclawError("WORKER_CONTROL_DENIED", "Only the parent controller can cancel or resume worker jobs.");
+      if (p.jobId && req.method === "POST" && route[2]) throw new PuppenclawError("WORKER_CONTROL_DENIED", "Only the parent controller can cancel or resume worker jobs.", { target: route[1]! });
       if (req.method === "GET" && route[2] === "results") {
         const page = this.jobResults(p.parentSessionName, route[1]!, queryPage(url)); json(page);
         // Status alone is not result integration. Only the end of a result feed
@@ -434,9 +450,9 @@ export class AdvancedRuntime {
     return this.store.resultPage(id, options);
   }
   jobs(parent?: string): Record<string, unknown>[] { return this.store.jobs(parent).map(publicJob); }
-  private worker(p: RuntimeParticipant, configId: string): WorkerConfig { const config = p.config.workers.find((w) => w.id === configId); if (!config) throw new PuppenclawError("WORKER_CONFIG_NOT_FOUND", "Select a configured worker id."); return config; }
+  private worker(p: RuntimeParticipant, configId: string): WorkerConfig { const config = p.config.workers.find((w) => w.id === configId); if (!config) throw new PuppenclawError("WORKER_CONFIG_NOT_FOUND", "Select a configured worker id.", { target: configId }); return config; }
   async submit(p: RuntimeParticipant, kind: "agent" | "bulk", request: AgentSubmit | BulkSubmit, resumedFromJobId?: string, summary = false): Promise<Record<string, unknown>> {
-    const attached = () => { if (this.requireParticipant(p.sessionName).attemptId !== p.attemptId) throw new PuppenclawError("ORCHESTRATION_TURN_CLOSED", "Attempt ownership changed."); if (p.jobId) throw new PuppenclawError("WORKER_DELEGATION_DENIED", "Worker jobs cannot expand the parent's worker allocation."); };
+    const attached = () => { if (this.requireParticipant(p.sessionName).attemptId !== p.attemptId) throw new PuppenclawError("ORCHESTRATION_TURN_CLOSED", "Attempt ownership changed."); if (p.jobId) throw new PuppenclawError("WORKER_DELEGATION_DENIED", "Worker jobs cannot expand the parent's worker allocation.", { target: request.configId }); };
     attached();
     const config = this.worker(p, request.configId);
     // A bulk submission's digests (fingerprint, item digests, input blob keys) are computed on the digest worker, off the
@@ -451,10 +467,10 @@ export class AdvancedRuntime {
     // Bulk authority: a principal's grants (its granted instruments restrict which installed ones it may run),
     // or (PUPPENCLAW_LEGACY_ATTEMPT_AUTHORITY=on) an approved execution turn below.
     if (p.principalId !== undefined) this.principals!.admitJob(p, kind, request, config);
-    else if (kind === "bulk" && this.principals?.legacyAttemptAuthority === false) throw new PuppenclawError("PRINCIPAL_REQUIRED", "Bulk work requires a run principal socket; attempt authority is disabled.");
+    else if (kind === "bulk" && this.principals?.legacyAttemptAuthority === false) throw new PuppenclawError("PRINCIPAL_REQUIRED", "Bulk work requires a run principal socket; attempt authority is disabled.", { target: config.modelProvider.id });
     if (kind === "bulk" && (config.modelProvider.kind !== "codex-openai-compatible" || !config.modelProvider.baseUrl || !config.modelProvider.authTokenEnv)) throw new PuppenclawError("BULK_UNAVAILABLE", "This provider supports native agent workers; no configured direct API bulk adapter is available.");
-    if (kind === "bulk" && (p.interactionMode !== "execute" || p.permissionMode !== "approve-all")) throw new PuppenclawError("BULK_EXECUTION_REQUIRED", "Bulk scientific work requires an approved execution turn.");
-    if (p.permissionMode === "deny-all") throw new PuppenclawError("WORKER_PERMISSION_DENIED", "This parent turn cannot launch worker tools.");
+    if (kind === "bulk" && (p.interactionMode !== "execute" || p.permissionMode !== "approve-all")) throw new PuppenclawError("BULK_EXECUTION_REQUIRED", "Bulk scientific work requires an approved execution turn.", { target: config.modelProvider.id });
+    if (p.permissionMode === "deny-all") throw new PuppenclawError("WORKER_PERMISSION_DENIED", "This parent turn cannot launch worker tools.", { target: config.modelProvider.id });
     if (kind === "bulk" && (request as BulkSubmit).schema) compileSchema((request as BulkSubmit).schema!);
     let instrumentIdentity: { digest: string; instrumentId: string; version: string | number } | undefined;
     if (kind === "bulk" && (request as BulkSubmit).instrumentDigest) {
@@ -462,7 +478,7 @@ export class AdvancedRuntime {
       instrumentIdentity = { digest: (request as BulkSubmit).instrumentDigest!, instrumentId: instrument.instrumentId, version: instrument.version };
       if ((request as BulkSubmit).schema) throw new PuppenclawError("INSTRUMENT_REQUEST_CONFLICT", "An instrument job takes its response schema from the installed instrument.");
       // A verbatim instrument bypasses the worker policy: only a run principal granted its digest (admitJob above) runs it.
-      if (instrumentMessageMode(instrument) === "verbatim" && !verbatimAuthority(p)) throw new PuppenclawError("PRINCIPAL_REQUIRED", VERBATIM_PRINCIPAL_REQUIRED);
+      if (instrumentMessageMode(instrument) === "verbatim" && !verbatimAuthority(p)) throw new PuppenclawError("PRINCIPAL_REQUIRED", VERBATIM_PRINCIPAL_REQUIRED, { target: instrumentIdentity.digest });
     }
     // Worker policy: profiles, on-premises-only evidence and pinned instruments decide what this worker may run.
     const policyRefusal = workerJobRefusal(config, kind, request, this.workerPolicy, instrumentIdentity); if (policyRefusal) throw policyRefusal;
@@ -593,9 +609,10 @@ export class AdvancedRuntime {
    * checked against the installed bundle (verbatimInstrumentCall): they are sent unchanged in the chat-completions
    * request of the worker's model and the bundle's settings, as its canonical JSON, with nothing added: no worker
    * policy, no assignment, no response format, no proxy shaping (the namespace proxy forwards chat completions
-   * unchanged as well). Throws when the item may not be sent.
+   * unchanged as well). Throws when the item may not be sent; an item whose messages deviate from the granted
+   * instrument is the participant's own reach outside it and is recorded for `participant` as a broker.refusal event.
    */
-  private buildBulkRequest(job: WorkerJob, item: BulkSubmit["items"][number], instrument: InstrumentBundle | undefined, route: BulkRoute): BuiltBulkRequest {
+  private buildBulkRequest(job: WorkerJob, item: BulkSubmit["items"][number], instrument: InstrumentBundle | undefined, route: BulkRoute, participant: RuntimeParticipant): BuiltBulkRequest {
     const provider = job.config.modelProvider, request = job.request as BulkSubmit;
     // submit() refuses restricted evidence on a provider that is not on premises; a stored job reaching dispatch after
     // the on-premises configuration changed is held to the same rule, per item and without a call.
@@ -607,7 +624,11 @@ export class AdvancedRuntime {
       // installInstrument refuses such a bundle; one stored before that rule is never sent with a format the executor did not build.
       const problem = verbatimBundleProblem(instrument);
       if (problem) throw new PuppenclawError(INSTRUMENT_MESSAGE_MISMATCH, `Verbatim instrument call refused: ${problem}`);
-      const call = verbatimInstrumentCall(instrument, item.input, provider.model);
+      // The checks above follow configuration or records that changed after the job was admitted; this one, the item's
+      // own messages against the granted instrument, is the participant's (one event per job, the rest folded).
+      let call: VerbatimCall;
+      try { call = verbatimInstrumentCall(instrument, item.input, provider.model); }
+      catch (error) { this.recordRefusal(participant, error, { fallbackTarget: request.instrumentDigest ?? provider.id }); throw error; }
       const text = canonicalJson(call.request), digest = sha256Hex(text);
       return { body: Buffer.from(text), model: provider.model, settingsSha256: settingsSha256(effectiveSettings(call.request)), bodySha256: digest, requestSha256: digest, api: "chat" };
     }
@@ -640,7 +661,7 @@ export class AdvancedRuntime {
     const pauseKey = providerPauseKey(p, provider.id), instrumentDigest = instrumentDigestOf(job);
     const route = this.bulkTransport.route(provider, this.bulkConcurrency.poolKey(provider.id), this.bulkConcurrency.limit(provider.id));
     let request: BuiltBulkRequest;
-    try { request = this.buildBulkRequest(job, item, instrument, route); }
+    try { request = this.buildBulkRequest(job, item, instrument, route, participant); }
     catch (error) {
       // Refused before any provider call or principal admission: the item settles failed without a receipt.
       const errorCode = error instanceof PuppenclawError && ITEM_REFUSAL_CODES.has(error.code) ? error.code : "INVALID_REQUEST";
@@ -903,7 +924,7 @@ export class AdvancedRuntime {
   }
   private async native(p: RuntimeParticipant, req: IncomingMessage, res: ServerResponse): Promise<void> {
     const path = req.url!.slice("/native".length);
-    if (p.provider.kind === "claude-code" && req.headers["x-api-key"] !== undefined) throw new PuppenclawError("PROVIDER_AUTHENTICATION_REQUIRED", "Native Claude calls require subscription OAuth; API-key authentication is disabled.");
+    if (p.provider.kind === "claude-code" && req.headers["x-api-key"] !== undefined) throw new PuppenclawError("PROVIDER_AUTHENTICATION_REQUIRED", "Native Claude calls require subscription OAuth; API-key authentication is disabled.", { target: p.provider.id });
     if (req.method === "HEAD" && path === "/api/hello") { res.writeHead(200); res.end(); return; }
     if (req.method !== "POST" || !/^\/(?:v1\/(messages(?:\/count_tokens)?|responses(?:\/compact)?|chat\/completions)|backend-api\/codex\/responses(?:\/compact)?)(?:\?|$)/u.test(path)) throw new Error("Native model route is not supported.");
     const headers: Record<string, string> = {}; for (const [key, value] of Object.entries(req.headers)) if (typeof value === "string" && !["host", "content-length", "connection", "proxy-authorization"].includes(key)) headers[key] = value;
@@ -915,7 +936,7 @@ export class AdvancedRuntime {
     const parsed = object(JSON.parse(bytes.toString())); if (!parsed) throw new Error("Model payload must be an object.");
     const model = String(parsed.model ?? p.provider.model);
     const allowedModels = [p.provider.model].map(normalizeModel);
-    if (!allowedModels.includes(normalizeModel(model)) && !nativeSafetyClassifier(p, path, model, headers, downstream !== undefined)) throw new PuppenclawError("MODEL_NOT_CONFIGURED", "The requested model is not configured for this attempt.");
+    if (!allowedModels.includes(normalizeModel(model)) && !nativeSafetyClassifier(p, path, model, headers, downstream !== undefined)) throw new PuppenclawError("MODEL_NOT_CONFIGURED", "The requested model is not configured for this attempt.", { target: model });
     const pauseKey = providerPauseKey(p, p.provider.id);
     const nativeOAuthDigest = p.provider.kind === "claude-code" && /^Bearer \S+$/u.test(headers.authorization ?? "")
       ? hash(headers.authorization!) : undefined;
@@ -1004,6 +1025,8 @@ export class AdvancedRuntime {
     const children = this.store.jobHeaders(name).flatMap((j) => j.childSessionName ? [j.childSessionName] : []);
     for (const child of children) if (this.runtimeDriver().getSession(child)) await this.runtimeDriver().purge?.(child);
     for (const identity of [name, ...children]) { const server = this.servers.get(identity); if (server) { for (const socket of server.sockets) socket.destroy(); await new Promise<void>((done) => server.server.close(() => done())); await unlink(server.path).catch(() => {}); this.servers.delete(identity); } this.participants.delete(identity); this.passedLimits.delete(identity); }
+    // Folded refusal counts of the session are dropped with it; its written refusal events go with the purge.
+    this.refusals.discard(name);
     this.store.purgeSession(name);
   }
   async purgeOwner(owner: string): Promise<void> { for (const parent of this.store.ownedParents(owner)) await this.purge(parent); }
@@ -1025,6 +1048,8 @@ export class AdvancedRuntime {
     await this.digester.close();
     await this.oauthRelayOpening?.catch(() => undefined);
     await this.oauthRelay?.close();
+    // Folded refusal counts are written before the store's last commit.
+    this.refusals.close();
     this.store.close();
   }
 }

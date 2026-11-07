@@ -168,12 +168,12 @@ export function workerBulkRefusal(worker: WorkerConfig, settings: WorkerPolicySe
   if (isRestrictedEvidencePolicy(worker.evidencePolicy) && !isOnPremisesProvider(worker.modelProvider, settings.onPremises)) {
     return new PuppenclawError(PROVIDER_NOT_ON_PREMISES,
       `Worker ${worker.id} holds evidence policy ${worker.evidencePolicy}, which goes to on-premises providers only, and this daemon does not configure provider ${worker.modelProvider.id} at that endpoint as on premises (PUPPENCLAW_ONPREM_PROVIDERS).`,
-      { workerId: worker.id, evidencePolicy: worker.evidencePolicy, providerId: worker.modelProvider.id });
+      { workerId: worker.id, evidencePolicy: worker.evidencePolicy, providerId: worker.modelProvider.id, target: worker.modelProvider.id });
   }
   if (worker.capabilityProfile === "run-fixed-programs" && worker.agent !== "claude" && !worker.instruments?.length) {
     return new PuppenclawError(INSTRUMENT_REQUIRED,
       `Worker ${worker.id} runs fixed programs and is not Claude, so it runs only its pinned instruments as bulk calls, and it pins none.`,
-      { workerId: worker.id, capabilityProfile: worker.capabilityProfile });
+      { workerId: worker.id, capabilityProfile: worker.capabilityProfile, target: worker.id });
   }
   return undefined;
 }
@@ -194,7 +194,7 @@ export function workerJobRefusal(worker: WorkerConfig, kind: "agent" | "bulk", r
           : "is not Claude, and only Claude workers author code"
         : undefined;
     return refused === undefined ? undefined : new PuppenclawError(CAPABILITY_PROFILE_DENIED,
-      `Worker ${worker.id} (${profile ?? `evidence policy ${worker.evidencePolicy}`}) ${refused}.`, { workerId: worker.id, kind, ...(profile ? { capabilityProfile: profile } : {}) });
+      `Worker ${worker.id} (${profile ?? `evidence policy ${worker.evidencePolicy}`}) ${refused}.`, { workerId: worker.id, kind, ...(profile ? { capabilityProfile: profile } : {}), target: worker.id });
   }
   const bulk = workerBulkRefusal(worker, settings);
   if (bulk) return bulk;
@@ -202,10 +202,10 @@ export function workerJobRefusal(worker: WorkerConfig, kind: "agent" | "bulk", r
   if (!pins?.length) return undefined;
   const digest = (request as BulkSubmit).instrumentDigest;
   if (digest === undefined || instrument === undefined) {
-    return new PuppenclawError(INSTRUMENT_REQUIRED, `Worker ${worker.id} pins instruments (${pins.map((pin) => pin.id).join(", ")}) and submits bulk work under one of them only.`, { workerId: worker.id });
+    return new PuppenclawError(INSTRUMENT_REQUIRED, `Worker ${worker.id} pins instruments (${pins.map((pin) => pin.id).join(", ")}) and submits bulk work under one of them only.`, { workerId: worker.id, target: digest ?? worker.id });
   }
   if (!instrumentPinned(pins, instrument)) {
-    return new PuppenclawError(INSTRUMENT_NOT_PINNED, `Worker ${worker.id} pins ${pins.map((pin) => pin.id).join(", ")}; the installed instrument ${instrument.instrumentId} (version ${instrument.version}) is none of them.`, { workerId: worker.id, instrumentDigest: digest });
+    return new PuppenclawError(INSTRUMENT_NOT_PINNED, `Worker ${worker.id} pins ${pins.map((pin) => pin.id).join(", ")}; the installed instrument ${instrument.instrumentId} (version ${instrument.version}) is none of them.`, { workerId: worker.id, instrumentDigest: digest, target: digest });
   }
   return undefined;
 }

@@ -229,8 +229,10 @@ describe("principal sockets", () => {
     const service = await upstream();
     const { registry } = await harness({ providers: [provider("judge", service.url)] });
     const socket = (await registry.put("run:a", runBody())).socketPath!;
-    expect((await unix(socket, "/native/v1/responses", { body: { model: "test-model", input: "x" } })).body.code).toBe("UNKNOWN_PRINCIPAL_ROUTE");
-    expect((await unix(socket, "http://example.com/", {})).body.code).toBe("UNKNOWN_PRINCIPAL_ROUTE");
+    // A native model route carries agent authority, a proxy request reaches a host: both refused as such.
+    expect(await unix(socket, "/native/v1/responses", { body: { model: "test-model", input: "x" } })).toMatchObject({ status: 403, body: { code: "PRINCIPAL_AGENT_UNSUPPORTED" } });
+    expect(await unix(socket, "http://example.com/", {})).toMatchObject({ status: 403, body: { code: "EGRESS_DENIED" } });
+    expect((await unix(socket, "/no-such-route", {})).body.code).toBe("UNKNOWN_PRINCIPAL_ROUTE");
     expect(await unix(socket, "/agent/submit", { body: { configId: "judge", idempotencyKey: "a", task: "x" } })).toMatchObject({ status: 403, body: { code: "PRINCIPAL_AGENT_UNSUPPORTED" } });
     const tunnel = await new Promise<string>((resolve) => {
       const client = connect(socket, () => client.write("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"));

@@ -122,6 +122,33 @@ daemon stops. A provider configured only in `PUPPENCLAW_MODEL_PROVIDERS`, for ru
 tunnel must present a ClientHello whose server name matches the `CONNECT` authority; encrypted ClientHellos are
 refused. The egress proxy can tell hosts apart but cannot read TLS contents.
 
+### Refusals
+
+Every request the broker refuses because it reaches outside the participant's boundaries becomes a `broker.refusal`
+event in the feed ([pcp2](pcp2.md#event-payloads)), with the participant, what the request reached for and the
+refusal's code:
+
+| Kind | Refusals | Target |
+| --- | --- | --- |
+| `egress` | `EGRESS_DENIED`: a destination, alias or address the egress proxy denies, a TLS or HTTP authority mismatch, and any `CONNECT`, absolute-form request or upgrade naming a host on a run principal's socket, which tunnels nothing | `host:port` |
+| `grant` | `PRINCIPAL_REQUIRED`, `PROVIDER_NOT_GRANTED`, `WORKER_DELEGATION_DENIED`, `WORKER_CONTROL_DENIED`, `WORKER_CONFIG_NOT_FOUND`, `BULK_EXECUTION_REQUIRED`, `WORKER_PERMISSION_DENIED`, `CAPABILITY_PROFILE_DENIED`, `PROVIDER_NOT_ON_PREMISES`, and `PRINCIPAL_AGENT_UNSUPPORTED` (agent work or a native model route on a run principal's socket) | provider, worker, job or instrument; `agent` or `native` |
+| `instrument` | `INSTRUMENT_NOT_ALLOWED`, `INSTRUMENT_NOT_GRANTED`, `INSTRUMENT_REQUIRED`, `INSTRUMENT_NOT_PINNED`, and `INSTRUMENT_MESSAGE_MISMATCH` (an item whose messages deviate from its verbatim instrument, refused at dispatch) | instrument digest (or the worker) |
+| `credential` | `PROVIDER_AUTHENTICATION_REQUIRED` (an API key on a subscription OAuth route), `OAUTH_ROUTE_DENIED`, `OAUTH_REFRESH_REFUSED` (an OAuth relay request other than the agent's own token refresh) | provider or `platform.claude.com:443` |
+| `model` | `MODEL_NOT_CONFIGURED` | the requested model |
+
+A refusal the participant cannot cause by reaching further is not recorded: a closed turn, an exhausted budget, a run
+principal the lab revoked, whose granted running time ran out or whose grant it withdrew (`PRINCIPAL_REVOKED`,
+`PRINCIPAL_EXPIRED`, `GRANT_WITHDRAWN`), a daemon shutting down, a malformed request, and the items of a stored job
+refused because configuration changed after the job was admitted (a provider no longer configured on premises, a
+bundle stored before the rule it breaks). An event carries no request body, header, prompt, output or credential. The
+first refusal of a kind of request is written at once; identical refusals of the same participant and job within the
+next minute are counted and written as one more event whose `repeats` holds their number, so a client that repeats a
+refused request in a loop cannot flood the feed. Nor can a client that reaches for many targets: beyond 64 targets with
+an open minute for one participant, job and code, the further ones share one event whose target is `*`. The counts are
+written when their minute ends and when the daemon closes; a daemon that stops without closing loses at most the last
+minute's repeats of each request, never its first refusal. Purging a session erases its refusal events like its jobs'
+events.
+
 ## Provider pauses and retries
 
 A bulk call's HTTP 429 or authentication failure (401, 403) pauses the provider for the attempt at once; a 503 does so

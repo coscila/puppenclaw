@@ -27,6 +27,7 @@ import {
   type PrincipalState,
   type PrincipalUsage
 } from "./principals-schema.js";
+import { egressDenied, requestedDestination } from "./egress.js";
 import { INSTRUMENT_MESSAGE_MISMATCH, storedMessageMode } from "./instruments.js";
 import { PrincipalStore, type PrincipalAuditEntry } from "./principals-store.js";
 import { conflictingJob, publicJob, type AdvancedRuntime } from "./runtime.js";
@@ -165,6 +166,7 @@ function socketStatus(error: unknown): [number, string] {
     case "INSTRUMENT_NOT_GRANTED":
     case "INSTRUMENT_REQUIRED":
     case "PRINCIPAL_AGENT_UNSUPPORTED":
+    case "EGRESS_DENIED":
       return [403, error.code];
     case "INSTRUMENT_NOT_ALLOWED":
     case "INSTRUMENT_REQUEST_CONFLICT":
@@ -179,6 +181,22 @@ function socketStatus(error: unknown): [number, string] {
     default:
       return [409, error.code];
   }
+}
+
+/**
+ * A request that reaches outside a principal socket's worker routes: a network destination (a CONNECT tunnel, an
+ * absolute-form proxy request or an upgrade naming a host), refused as EGRESS_DENIED with its host:port, or a native
+ * model route, which carries agent authority a principal does not hold (PRINCIPAL_AGENT_UNSUPPORTED). Undefined for
+ * anything else, which the socket's own routes answer.
+ */
+function outsideRequest(req: IncomingMessage, form: "connect" | "absolute"): PuppenclawError | undefined {
+  const url = req.url ?? "";
+  const destination = form === "connect" || !url.startsWith("/") ? requestedDestination(url, form) : undefined;
+  if (destination) return egressDenied(destination.hostname, destination.port, "A principal socket is no egress proxy and no tunnel.");
+  if (form === "connect") return egressDenied(url, 443, "A principal socket is no egress proxy and no tunnel.");
+  if (url === "/native" || url.startsWith("/native/") || url.startsWith("/native?"))
+    return new PuppenclawError("PRINCIPAL_AGENT_UNSUPPORTED", "Principal sockets carry bulk authority only; they serve no native model route.", { target: "native" });
+  return undefined;
 }
 
 export class PrincipalRegistry implements PrincipalHooks {
@@ -359,14 +377,14 @@ export class PrincipalRegistry implements PrincipalHooks {
 
   admitJob(participant: RuntimeParticipant, kind: "agent" | "bulk", request: AgentSubmit | BulkSubmit, config: WorkerConfig): void {
     const entry = this.entryFor(participant);
-    if (kind !== "bulk") throw new PuppenclawError("PRINCIPAL_AGENT_UNSUPPORTED", "Principal sockets carry bulk authority only.");
+    if (kind !== "bulk") throw new PuppenclawError("PRINCIPAL_AGENT_UNSUPPORTED", "Principal sockets carry bulk authority only.", { target: "agent" });
     const lifecycle = this.lifecycleRefusal(entry);
     if (lifecycle) throw principalRefusalError(lifecycle);
     const grants = entry.record.grants;
-    if (!grants.providers.includes(config.modelProvider.id)) throw new PuppenclawError("PROVIDER_NOT_GRANTED", "This principal is not granted that provider.");
+    if (!grants.providers.includes(config.modelProvider.id)) throw new PuppenclawError("PROVIDER_NOT_GRANTED", "This principal is not granted that provider.", { target: config.modelProvider.id });
     const digest = jobInstrumentDigest({ request });
-    if (digest !== undefined && !grants.instruments.includes(digest)) throw new PuppenclawError("INSTRUMENT_NOT_GRANTED", "This principal is not granted that instrument.");
-    if (digest === undefined && grants.instruments.length > 0) throw new PuppenclawError("INSTRUMENT_REQUIRED", "This principal may submit only work under one of its granted instruments.");
+    if (digest !== undefined && !grants.instruments.includes(digest)) throw new PuppenclawError("INSTRUMENT_NOT_GRANTED", "This principal is not granted that instrument.", { target: digest });
+    if (digest === undefined && grants.instruments.length > 0) throw new PuppenclawError("INSTRUMENT_REQUIRED", "This principal may submit only work under one of its granted instruments.", { target: config.modelProvider.id });
   }
 
   refusal(participant: RuntimeParticipant, job: Pick<WorkerJobHeader, "config" | "request">, items?: readonly PrincipalItemKey[]): PrincipalPauseReason | undefined {
@@ -619,9 +637,10 @@ export class PrincipalRegistry implements PrincipalHooks {
       res.on("error", () => res.destroy());
       void this.handle(entry, req, res);
     });
-    // A principal socket is no egress proxy and no tunnel.
-    server.on("connect", (_req, socket) => socket.destroy());
-    server.on("upgrade", (_req, socket) => socket.destroy());
+    // A principal socket is no egress proxy and no tunnel: a CONNECT, or an upgrade to another host or to a native
+    // model route, is refused like a request that reaches outside the principal's grants (a broker.refusal event).
+    server.on("connect", (req, socket) => { this.refuseOutside(entry, outsideRequest(req, "connect")); socket.destroy(); });
+    server.on("upgrade", (req, socket) => { this.refuseOutside(entry, outsideRequest(req, "absolute")); socket.destroy(); });
     server.on("clientError", (_error, socket) => socket.destroy());
     server.on("connection", (socket: Socket) => {
       socket.on("error", () => socket.destroy());
@@ -653,13 +672,15 @@ export class PrincipalRegistry implements PrincipalHooks {
       res.end(JSON.stringify(value));
     };
     try {
+      const outside = outsideRequest(req, "absolute");
+      if (outside) throw outside;
       if (!(req.url ?? "").startsWith("/")) throw new PuppenclawError("UNKNOWN_PRINCIPAL_ROUTE", "A principal socket serves only its worker routes.");
       if (entry.record.revokedAt !== null) throw principalRefusalError(PRINCIPAL_PAUSE_REASONS.revoked);
       const url = new URL(req.url!, "http://principal"), path = url.pathname, summary = url.searchParams.get("view") === "summary";
       const parent = entry.participant.parentSessionName;
       if (req.method === "GET" && (path === "/configs" || path === "/configs/list")) return reply(200, this.catalog(entry));
       if (req.method === "GET" && path === "/jobs") return reply(200, summary ? this.runtime.jobSummaries(parent, queryPage(url)) : { jobs: this.runtime.jobs(parent) });
-      if (req.method === "POST" && path === "/agent/submit") throw new PuppenclawError("PRINCIPAL_AGENT_UNSUPPORTED", "Principal sockets carry bulk authority only.");
+      if (req.method === "POST" && path === "/agent/submit") throw new PuppenclawError("PRINCIPAL_AGENT_UNSUPPORTED", "Principal sockets carry bulk authority only.", { target: "agent" });
       if (req.method === "POST" && path === "/bulk/submit") {
         const raw: unknown = JSON.parse(await readBody(req));
         this.preflight(entry, raw);
@@ -683,10 +704,17 @@ export class PrincipalRegistry implements PrincipalHooks {
       }
       throw new PuppenclawError("UNKNOWN_PRINCIPAL_ROUTE", "A principal socket serves only its worker routes.");
     } catch (error) {
+      // A refusal of a request outside the principal's grants is a broker.refusal event.
+      this.refuseOutside(entry, error);
       if (res.headersSent) { res.destroy(); return; }
       const [status, code] = socketStatus(error);
       reply(status, { error: errorText(error), code, ...conflictingJob(error) });
     }
+  }
+
+  /** Records a refusal of the principal's request as a broker.refusal event when it is a containment refusal. */
+  private refuseOutside(entry: Entry, error: unknown): void {
+    if (error !== undefined) this.runtime.recordRefusal(entry.participant, error, { fallbackTarget: entry.record.id });
   }
 
   /** Explicit refusals for a provider or instrument outside the grants, before the request is even parsed. */
@@ -694,9 +722,9 @@ export class PrincipalRegistry implements PrincipalHooks {
     const body = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
     const grants = entry.record.grants;
     if (typeof body.configId === "string" && this.providers.has(body.configId) && !grants.providers.includes(body.configId))
-      throw new PuppenclawError("PROVIDER_NOT_GRANTED", "This principal is not granted that provider.");
+      throw new PuppenclawError("PROVIDER_NOT_GRANTED", "This principal is not granted that provider.", { target: body.configId });
     if (typeof body.instrumentDigest === "string" && !grants.instruments.includes(body.instrumentDigest))
-      throw new PuppenclawError("INSTRUMENT_NOT_GRANTED", "This principal is not granted that instrument.");
+      throw new PuppenclawError("INSTRUMENT_NOT_GRANTED", "This principal is not granted that instrument.", { target: body.instrumentDigest });
   }
 
   /**
