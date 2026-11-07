@@ -250,7 +250,8 @@ The broker's jobs, by parent session (see [broker](broker.md)):
 
 - `GET /orchestration/jobs?session=NAME&view=summary&after=0&limit=100`: summaries without prompts or results;
   `metadata-only=true` returns job headers only; without either option, full jobs.
-- `GET /orchestration/jobs/:jobId/results?session=NAME&after=0&limit=100`: the latest state of each changed item.
+- `GET /orchestration/jobs/:jobId/results?session=NAME&after=0&limit=100`: the latest state of each changed item,
+  also of a job the store has archived (read from its archive file until the session or owner is purged).
 - `GET /orchestration/receipts?session=&attempt=`: transport receipts of model calls.
 
 Pages carry a durable numeric `nextCursor` and `hasMore`; limits are 1–1000, and a bad cursor answers 400

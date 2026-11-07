@@ -97,6 +97,9 @@ of earlier daemons (`test/fixtures/legacy/`):
   persisted there, and open `advanced.sqlite`, where a job's stored worker configuration keeps its policy fields. They do
   not enforce them, and resuming such a job under their own configuration is refused with `WORKER_CONFIG_CHANGED`.
 - Daemons without principals never open `principals.sqlite` and read the added job fields unchanged.
+- Daemons without the archive index open `advanced.sqlite` with the `archived_jobs` table and leave it alone: jobs
+  they archive get no index row and their results are not served from the archive, and a purge they run leaves the
+  index rows of the session's archived jobs, so purge such a session or owner again after rolling forward.
 
 ## Archiving broker jobs
 
@@ -108,12 +111,19 @@ the current layout, with every feed event acknowledged. Jobs of a run principal 
 marked with a study reference, jobs from an earlier layout and jobs with unacknowledged events stay; the log line
 `ADVANCED_ARCHIVED` reports what was archived and how many jobs of each kind were kept.
 
+An archived job leaves the live store but not the result routes: the index table `archived_jobs` in
+`advanced.sqlite`, written with the erasure of the live rows, names the archive file of each archived job, and
+`GET /jobs/{id}/results` on its socket and `GET /orchestration/jobs/:jobId/results?session=` read its result pages
+from that file through a read-only connection, unchanged and for its own session only. Nothing lists, resumes or
+cancels an archived job. A purge of its session or owner removes it from the index, so its results are no longer
+served; the archive file keeps its rows.
+
 ## Retention
 
 | Data | Retention |
 | --- | --- |
 | Feed events | Kept; `PUPPENCLAW_EVENT_RETENTION_DAYS` (7–36500) deletes acknowledged events older than that, hourly. Unacknowledged events are never deleted. |
-| Broker jobs | Kept until the session or owner is purged, or archived (see above). |
+| Broker jobs | Kept until the session or owner is purged, or archived (see above; archived results stay readable until the purge). |
 | Sessions | Failed and stopped sessions are purged by garbage collection once idle for longer than `sessionTtlMinutes`; idle, waiting and suspended sessions stay until they are stopped or purged. A purge removes transcript, diagnostics and broker jobs. |
 | Keyed-turn receipts | 64 outcomes and 4,096 keys per session, until the session is purged. |
 | Usage ledger | Never deleted. |

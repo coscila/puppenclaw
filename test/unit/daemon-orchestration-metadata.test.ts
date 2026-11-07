@@ -48,4 +48,28 @@ describe("daemon worker metadata", () => {
       expect(capabilities.json().advancedOrchestration.workerJoinContinuation).toBe(true);
     } finally { await app.close(); }
   });
+
+  it("serves the results of an archived job, read-only, to its own session only", async () => {
+    const dataDir = await createTempDir("puppenclaw-worker-archive-");
+    const store = await AdvancedStore.open(join(dataDir, "advanced"));
+    await store.putJob(job("job-archived", "chat-a"));
+    await store.putJob(job("job-live", "chat-a"));
+    const live = store.resultPage("job-archived");
+    store.ack(store.feedId, store.head());
+    const report = await store.archive({ before: new Date("2026-10-14T00:00:00.000Z"), maxJobs: 1 });
+    expect(report.jobs).toBe(1);
+    store.close();
+    const { app } = await createDaemonServer({ config: makeConfig({ acpxCommand: await resolveFakeAcpxCommand(), daemonAuthToken: "secret-token" }), dataDir });
+    try {
+      const results = await app.inject({ method: "GET", url: "/orchestration/jobs/job-archived/results?session=chat-a", headers: AUTH });
+      expect(results.statusCode).toBe(200);
+      expect(results.json()).toEqual(live);
+      expect(results.json().results[0].output).toBe("PRIVATE OUTPUT");
+      expect((await app.inject({ method: "GET", url: "/orchestration/jobs/job-archived/results?session=chat-b", headers: AUTH })).statusCode).not.toBe(200);
+      expect((await app.inject({ method: "GET", url: "/orchestration/jobs/job-archived/results?session=chat-a&limit=0", headers: AUTH })).statusCode).toBe(400);
+      // Archived jobs are not live: no job list, summary or resume names them.
+      const listed = await app.inject({ method: "GET", url: "/orchestration/jobs?session=chat-a&metadata-only=true", headers: AUTH });
+      expect(listed.json().jobs.map((entry: { jobId: string }) => entry.jobId)).toEqual(["job-live"]);
+    } finally { await app.close(); }
+  });
 });

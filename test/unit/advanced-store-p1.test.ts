@@ -358,4 +358,60 @@ describe("broker outbox and feed", () => {
     expect(count(db(), "SELECT count(*) AS n FROM blobs")).toBe(2);
     await rm(join(dir, "archive"), { recursive: true });
   });
+
+  it("serves an archived job's results read-only from its archive file until its session or owner is purged", async () => {
+    let now = new Date("2026-08-01T00:00:00.000Z");
+    const { store, db } = await open(undefined, { now: () => now });
+    for (const id of ["kept", "other"]) {
+      store.createJob(job(id, ["one", "two", "three"], { idempotencyKey: id, state: "completed", updatedAt: "2026-08-01T00:00:00.000Z", ...(id === "other" ? { parentSessionName: "other-parent", ownerKey: "other-owner-0123456789" } : {}) }));
+      for (const item of ["one", "two", "three"]) await store.settleItem(id, settled(item, item === "two" ? { verdict: "T", "2": [1, 2.5] } : `answer ${item} é`), settlement(id, item));
+    }
+    store.ack(store.feedId, store.head());
+    const live = store.resultPage("kept", { limit: 2 }), rest = store.resultPage("kept", { after: live.nextCursor });
+    now = new Date("2026-10-25T00:00:00.000Z");
+    const report = await store.archive({ before: new Date("2026-09-25T00:00:00.000Z") });
+    expect(report.jobs).toBe(2);
+    expect(store.jobHeader("kept")).toBeNull();
+    expect(store.jobHeaders()).toEqual([]);
+    const archiveFile = report.file!;
+    const before = await readFile(archiveFile);
+    // The same pages, cursors and item results as before the archive, from the archive file.
+    expect(store.archivedJob("kept")).toMatchObject({ jobId: "kept", parentSessionName: "parent", state: "completed" });
+    expect(store.resultPage("kept", { limit: 2 })).toEqual(live);
+    expect(store.resultPage("kept", { after: live.nextCursor })).toEqual(rest);
+    expect(store.resultPage("unknown")).toEqual({ jobId: "unknown", results: [], nextCursor: 0, hasMore: false });
+    expect(store.archivedJob("unknown")).toBeNull();
+    expect(() => store.resultPage("kept", { limit: 0 })).toThrow(RangeError);
+    // Reading never writes: the archive file is unchanged and nothing of the job returns to the live store.
+    expect((await readFile(archiveFile)).equals(before)).toBe(true);
+    expect(count(db(), "SELECT count(*) AS n FROM job_items WHERE job_id='kept'")).toBe(0);
+    expect(store.ownedParents("other-owner-0123456789")).toEqual(["other-parent"]);
+    // A purge of the session (or of the owner, through its parents) takes the job out of the archive index.
+    store.purgeSession("parent");
+    expect(store.archivedJob("kept")).toBeNull();
+    expect(store.resultPage("kept").results).toEqual([]);
+    for (const parent of store.ownedParents("other-owner-0123456789")) store.purgeSession(parent);
+    expect(store.archivedJob("other")).toBeNull();
+    expect(count(db(), "SELECT count(*) AS n FROM archived_jobs")).toBe(0);
+    // An index row that names a missing or foreign file serves nothing.
+    db().exec("INSERT INTO archived_jobs VALUES ('lost','parent',NULL,NULL,'advanced-archive-missing.sqlite','x','t'), ('escape','parent',NULL,NULL,'../advanced.sqlite','x','t')");
+    expect(store.archivedJob("lost")).toBeNull();
+    expect(store.archivedJob("escape")).toBeNull();
+    expect(store.resultPage("escape").results).toEqual([]);
+  });
+
+  it("keeps archived results readable across a reopen", async () => {
+    let now = new Date("2026-08-01T00:00:00.000Z");
+    const { store, dir } = await open(undefined, { now: () => now });
+    store.createJob(job("old", ["one"], { state: "completed", updatedAt: "2026-08-01T00:00:00.000Z" }));
+    await store.settleItem("old", settled("one"), settlement("old", "one"));
+    store.ack(store.feedId, store.head());
+    const page = store.resultPage("old");
+    now = new Date("2026-10-25T00:00:00.000Z");
+    expect((await store.archive({ before: new Date("2026-09-25T00:00:00.000Z") })).jobs).toBe(1);
+    store.close();
+    const reopened = (await open(dir)).store;
+    expect(reopened.resultPage("old")).toEqual(page);
+    expect(reopened.archivedJob("old")?.jobId).toBe("old");
+  });
 });

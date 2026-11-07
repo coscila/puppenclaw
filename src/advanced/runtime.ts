@@ -409,8 +409,10 @@ export class AdvancedRuntime {
       if (req.method === "GET" && route[2] === "results") {
         const page = this.jobResults(p.parentSessionName, route[1]!, queryPage(url)); json(page);
         // Status alone is not result integration. Only the end of a result feed
-        // can acknowledge a settled job; active jobs still need continuation.
-        if (!page.hasMore) this.observeJobs(p, [this.requireHeader(route[1]!, p.parentSessionName)]);
+        // can acknowledge a settled job; active jobs still need continuation. An
+        // archived job (no live header) settled long before and needs none.
+        const live = this.store.jobHeader(route[1]!);
+        if (!page.hasMore && live) this.observeJobs(p, [live]);
         return;
       }
       if (req.method === "GET" && !route[2] && summary) { const job = this.requireHeader(route[1]!, p.parentSessionName); json(this.jobSummary(job.jobId)); return; }
@@ -425,7 +427,12 @@ export class AdvancedRuntime {
   private requireHeader(id: string, parent: string): WorkerJobHeader { const job = this.store.jobHeader(id); if (!job || job.parentSessionName !== parent) throw new PuppenclawError("WORKER_NOT_FOUND", "Worker job is not in this chat."); return job; }
   jobSummaries(parent?: string, options: PageOptions = {}) { const page = this.store.summaries(parent, options); return { ...page, jobs: page.jobs.map(publicSummary) }; }
   jobSummary(id: string): Record<string, unknown> { const job = this.store.summary(id); if (!job) throw new PuppenclawError("WORKER_NOT_FOUND", "Worker job is missing."); return publicSummary(job); }
-  jobResults(parent: string, id: string, options: PageOptions = {}) { this.requireHeader(id, parent); return this.store.resultPage(id, options); }
+  /** A page of a job's item results, also of a job the store has archived (read from its archive file, read-only). */
+  jobResults(parent: string, id: string, options: PageOptions = {}) {
+    const job = this.store.jobHeader(id) ?? this.store.archivedJob(id);
+    if (!job || job.parentSessionName !== parent) throw new PuppenclawError("WORKER_NOT_FOUND", "Worker job is not in this chat.");
+    return this.store.resultPage(id, options);
+  }
   jobs(parent?: string): Record<string, unknown>[] { return this.store.jobs(parent).map(publicJob); }
   private worker(p: RuntimeParticipant, configId: string): WorkerConfig { const config = p.config.workers.find((w) => w.id === configId); if (!config) throw new PuppenclawError("WORKER_CONFIG_NOT_FOUND", "Select a configured worker id."); return config; }
   async submit(p: RuntimeParticipant, kind: "agent" | "bulk", request: AgentSubmit | BulkSubmit, resumedFromJobId?: string, summary = false): Promise<Record<string, unknown>> {

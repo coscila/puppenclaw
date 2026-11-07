@@ -251,7 +251,9 @@ Summary pages omit prompts and results; result pages contain the latest state of
 durable numeric `nextCursor` and `hasMore`, with limits 1–1000. Consumers upsert by job and item id, keep the cursor and
 continue until `hasMore` is false. An item updated between pages can appear again: these pages are a changed-state feed,
 not an event log, so export settled jobs for a complete result set. Reading the final results page of a settled job
-acknowledges it for the controller's continuation; summary reads do not.
+acknowledges it for the controller's continuation; summary reads do not. The result pages of a job the store has
+archived (see [operations](operations.md#archiving-broker-jobs)) are read from its archive file, unchanged and
+read-only, until its session or owner is purged.
 
 ## The broker store
 
